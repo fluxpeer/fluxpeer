@@ -1,0 +1,18 @@
+[package]
+name = "fp-transport-udp"
+version = "2.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+fp-transport = { workspace = true }
+
+bytes = { workspace = true }
+tracing = { workspace = true }
+socket2 = { workspace = true }
+
+futures = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time", "macros"] }
+tokio-util = { workspace = true, features = ["net", "codec"] }

@@ -1,0 +1,37 @@
+[package]
+name = "fp-transport-tcp-bond"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# workspace crates
+fp-transport = { workspace = true }
+
+# async runtime
+tokio = { workspace = true, features = ["net", "rt", "io-util", "sync", "time", "macros"] }
+tokio-util = { workspace = true, features = ["compat"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# multiplexing
+yamux = "0.13"
+
+# networking
+socket2 = { workspace = true }
+
+# serialization
+bytes = { workspace = true }
+
+# misc
+rand = { workspace = true }
+
+# error handling
+thiserror = { workspace = true }
+
+# observability
+tracing = { workspace = true }
+portable-atomic = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tracing-subscriber = { workspace = true }

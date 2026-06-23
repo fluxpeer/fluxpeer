@@ -1,0 +1,65 @@
+[package]
+name = "fp-node-client-sys"
+version = "2.2.5"
+edition = "2024"
+
+[features]
+default = ["enroll"]
+# `fp_enroll` — decode a join token + POST the control-server `/enroll`. Pulls
+# in fluxpeer-sdk (reqwest, rustls-only). Drop with `--no-default-features` for
+# a pure data-plane library.
+enroll = ["dep:fluxpeer-sdk", "dep:base64"]
+debug_log = ["fp-node-core/debug_log"]
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+fp-node-core = { workspace = true }
+fp-crypto = { workspace = true }
+fp-transport = { workspace = true }
+fp-tun = { workspace = true, features = ["async"] }
+
+# Mobile FFI (Track A) builds + registers transports/crypto in-process —
+# the dispatcher has no production consumer otherwise. Mirror node/Cargo.toml.
+fp-transport-tcp = { workspace = true }
+fp-transport-udp = { workspace = true }
+fp-transport-anytls = { workspace = true }
+fp-transport-tcp-bond = { workspace = true }
+fp-crypto-noise = { workspace = true }
+
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+hex = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+rand_core = { workspace = true }
+
+libc = { workspace = true }
+parking_lot = "0.12"
+
+# enroll feature: reuse the canonical SDK enroll client (L1 reuse) + token decode.
+fluxpeer-sdk = { path = "../../../sdk/rust", optional = true }
+base64 = { version = "0.22", optional = true }
+
+futures = { workspace = true }
+crossbeam-channel = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "sync", "time"] }
+arc-swap = { workspace = true }
+tokio-stream = { workspace = true }
+
+# Android JNI shims call into the same `*_impl` cores as the C ABI; the upcall
+# to Kotlin (transport-event callback) needs the JVM handle + GlobalRef.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+# `examples/mobilecli.rs` — headless mesh client (intranet node).
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+# Generate the C header (fp_node_client_sys.h) for the iOS/Android consumers.
+# Needs >=0.28 to parse edition-2024 `#[unsafe(no_mangle)]`.
+cbindgen = "0.29"

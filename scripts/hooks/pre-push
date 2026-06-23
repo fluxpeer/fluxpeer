@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Optional local pre-push gate — fast checks only (clippy + tests), so a bad push
+# is caught before it leaves your machine. Enable it with:
+#
+#   git config core.hooksPath scripts/hooks
+#
+# This intentionally runs ONLY the quick, platform-agnostic stages. The full
+# regression suite (Linux netns real-tunnel e2e, Windows cross-check) lives in
+# scripts/ci.sh — run that on a Linux host for complete coverage.
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+# Non-login shells don't source the profile; pull cargo onto PATH if needed.
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+
+echo "pre-push: clippy + tests (full suite incl netns/windows: scripts/ci.sh)…"
+
+if ! cargo clippy --workspace -- -D warnings; then
+  echo "✗ clippy failed — push aborted (override with: git push --no-verify)"
+  exit 1
+fi
+# fluxpeer-desktop's test bin links GTK/X11 (absent on headless boxes); clippy
+# above still checks it.
+if ! cargo test --workspace --exclude fluxpeer-desktop; then
+  echo "✗ tests failed — push aborted (override with: git push --no-verify)"
+  exit 1
+fi
+
+echo "✓ pre-push checks passed"

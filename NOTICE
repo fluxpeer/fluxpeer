@@ -1,0 +1,26 @@
+fluxpeer
+Copyright (c) 2026 fluxpeer
+Licensed under the BSD 3-Clause License (see LICENSE).
+
+================================================================================
+Third-party code and attributions
+================================================================================
+
+1. WireGuard data-plane engine (engine/crypto/fp-crypto-noise)
+   Derived from BoringTun by Cloudflare, Inc.
+   Copyright (c) 2019 Cloudflare, Inc.
+   Licensed under BSD-3-Clause.
+   The Noise/handshake/session implementation is a vendored derivative; we
+   maintain it in-tree (no upstream dependency). WireGuard is a registered
+   trademark of Jason A. Donenfeld.
+
+2. NAT traversal & relay design (engine + relay-server)
+   The self-implemented NAT traversal (STUN-style endpoint discovery + UDP hole
+   punching) and relay server are designed with reference to:
+     - iroh (https://github.com/n0-computer/iroh), Apache-2.0/MIT
+     - Tailscale DERP design
+   These are studied as reference only; fluxpeer does not depend on or vendor
+   their code unless explicitly noted in the relevant crate.
+
+3. wintun (engine/vendor/wintun, engine/vendor/wintun-c)
+   Windows TUN driver bindings; see the vendored crate's own license headers.

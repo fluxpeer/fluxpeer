@@ -1,0 +1,20 @@
+[package]
+name = "fp-transport"
+version = "2.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libc = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+rand_core = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+tokio-util = { workspace = true, features = ["codec"] }
+tokio-stream = { workspace = true }
+bytes = { workspace = true }

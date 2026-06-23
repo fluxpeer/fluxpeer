@@ -1,0 +1,90 @@
+# Rust build artifacts (workspace + per-crate + tauri)
+target/
+**/target/
+*.rs.bk
+Cargo.lock.bak
+
+# Node / frontend (for apps/desktop and any tooling)
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.vite/
+build/
+**/build/
+
+# Flutter / Dart (defense in depth)
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+
+# Local-only Claude Code guidance (contains internal infra notes — not published)
+CLAUDE.md
+
+# Real-device QA artifacts (join tokens, screenshots) — never published
+qa/
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p8
+*.p12
+*.cer
+*.keystore
+*.jks
+
+# Logs / runtime
+*.log
+logs/
+pids/
+cli-log/
+*.pid
+
+# Local API assets
+api/assets/db/
+api/upload/
+api/pro/main
+
+# Tooling scratch
+tmp/
+*.bak
+*.tmp
+config.toml
+
+# Test artefacts referenced by historical .gitignore
+/migration
+/apple
+
+# Stray cargo build artifacts from misplaced invocation (2026-05-24)
+*.rcgu.o
+*.o
+__.SYMDEF
+__.SYMDEF SORTED
+
+# --- AGPL GUI clients: never commit build artifacts / native blobs ---
+clients/mobile/android/app/src/main/jniLibs/
+**/*.so
+**/*.dylib
+clients/mobile/build/
+clients/mobile/.dart_tool/
+clients/mobile/ios/**/Frameworks/
+clients/desktop/target/

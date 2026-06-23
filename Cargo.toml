@@ -1,0 +1,132 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "fluxpeer-bin",
+    # crypto
+    "engine/crypto/fp-crypto",
+    "engine/crypto/fp-crypto-noise",
+    # transport
+    "engine/transport/fp-transport",
+    "engine/transport/fp-transport-tcp",
+    "engine/transport/fp-transport-udp",
+    "engine/transport/fp-transport-anytls",
+    "engine/transport/fp-transport-tcp-bond",
+    # net
+    "engine/net/fp-tun",
+    "engine/net/fp-conhash",
+    "engine/net/fp-disco",
+    "engine/net/fp-path",
+    "engine/net/fp-netcheck",
+    # core + sys
+    "engine/core/fp-node-core",
+    "engine/sys/fp-node-server-sys",
+    "engine/sys/fp-node-client-sys",
+    # services
+    "control-server",
+    "cli",
+    "relay-server",
+    "node",
+    "sdk/rust",
+]
+
+exclude = [
+    "engine/vendor/wintun",
+    "engine/vendor/wintun-c",
+]
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1", default-features = false }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# error handling
+thiserror = "2"
+anyhow = "1"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# crypto
+x25519-dalek = { version = "2.0.0", features = ["reusable_secrets", "static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+rand_core = { version = "0.6", features = ["getrandom"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+ring = "0.17"
+blake2 = "0.10"
+chacha20poly1305 = "0.10"
+hmac = "0.12"
+
+# networking
+socket2 = { version = "0.5", features = ["all"] }
+bytes = "1"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "zstd"] }
+
+# web framework
+axum = { version = "0.7", default-features = false }
+hyper = "1.1"
+
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tracing-error = "0.2"
+
+# cli
+clap = { version = "4", features = ["derive"] }
+
+# concurrency
+arc-swap = "1"
+crossbeam-channel = "0.5"
+once_cell = { version = "1", default-features = false }
+portable-atomic = "1"
+
+# codec / utils
+tokio-util = { version = "0.7", default-features = false }
+
+# misc
+hex = { version = "0.4", features = ["serde"] }
+chrono = "0.4"
+md-5 = "0.10"
+
+# workspace crates (path dependencies) — fluxpeer engine
+fp-crypto = { path = "engine/crypto/fp-crypto" }
+fp-crypto-noise = { path = "engine/crypto/fp-crypto-noise" }
+fp-transport = { path = "engine/transport/fp-transport" }
+fp-transport-tcp = { path = "engine/transport/fp-transport-tcp" }
+fp-transport-udp = { path = "engine/transport/fp-transport-udp" }
+fp-transport-anytls = { path = "engine/transport/fp-transport-anytls" }
+fp-transport-tcp-bond = { path = "engine/transport/fp-transport-tcp-bond" }
+fp-tun = { path = "engine/net/fp-tun" }
+fp-conhash = { path = "engine/net/fp-conhash" }
+fp-node-core = { path = "engine/core/fp-node-core" }
+fp-node-server-sys = { path = "engine/sys/fp-node-server-sys" }
+fp-node-client-sys = { path = "engine/sys/fp-node-client-sys" }
+wintun = { path = "engine/vendor/wintun" }
+
+[profile.dev]
+codegen-units = 4
+debug = true
+incremental = true
+lto = false
+opt-level = 0
+
+[profile.release]
+codegen-units = 1
+debug = false
+incremental = false
+lto = "thin"
+opt-level = 3
+strip = true

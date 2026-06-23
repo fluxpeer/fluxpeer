@@ -1,0 +1,244 @@
+openapi: 3.1.0
+info:
+  title: fluxpeer control-server API
+  version: "1"
+  description: >
+    Open coordination-plane API. Versioned under /api/v1.
+    No billing — that is the closed fluxpeer.com cloud.
+    This schema covers the core endpoints; some admin/stats routes are omitted.
+  license:
+    name: BSD-3-Clause
+servers:
+  - url: /api/v1
+paths:
+  /health:
+    get:
+      summary: Liveness probe
+      responses:
+        "200": { description: ok }
+  /version:
+    get:
+      summary: API + protocol versions
+      responses:
+        "200":
+          description: version info
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VersionInfo" }
+  /networks:
+    get:
+      summary: List networks
+      responses:
+        "200":
+          description: networks
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Network" } }
+    post:
+      summary: Create a network
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties: { name: { type: string } }
+      responses:
+        "201":
+          description: created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Network" }
+  /networks/{id}/invites:
+    post:
+      summary: Create an enrollment invite
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                max_uses: { type: integer, nullable: true }
+                expires_at: { type: integer, nullable: true, description: unix seconds }
+      responses:
+        "201":
+          description: created
+          content: { application/json: { schema: { $ref: "#/components/schemas/Invite" } } }
+        "404": { description: network not found }
+  /networks/{id}/devices:
+    get:
+      summary: List devices in a network
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: devices
+          content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Device" } } } }
+        "404": { description: network not found }
+  /networks/{id}/relays:
+    get:
+      summary: List relays usable by a network (scoped + shared)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: relays
+          content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/RelayNode" } } } }
+  /networks/{id}/resolve/{name}:
+    get:
+      summary: MagicDNS — resolve a device name to its overlay IP
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: resolved }
+        "404": { description: name not found }
+  /enroll:
+    post:
+      summary: Redeem an invite and enroll a device
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invite_code, name, wg_public_key]
+              properties:
+                invite_code: { type: string }
+                name: { type: string }
+                wg_public_key: { type: string, description: Curve25519 base64 }
+      responses:
+        "201":
+          description: enrolled
+          content: { application/json: { schema: { $ref: "#/components/schemas/Device" } } }
+        "403": { description: invalid/expired/used invite }
+        "409": { description: address pool exhausted }
+  /devices/{id}:
+    delete:
+      summary: Revoke a device
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "204": { description: revoked }
+        "404": { description: device not found }
+  /devices/{id}/config:
+    get:
+      summary: Pull a device's config (peers + allowed-ips)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: config
+          content: { application/json: { schema: { $ref: "#/components/schemas/DeviceConfig" } } }
+        "404": { description: device not found or revoked }
+  /devices/{id}/watch:
+    get:
+      summary: WebSocket — push DeviceConfig on connect and on every epoch change
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "101": { description: switching protocols (websocket) }
+  /devices/{id}/routes:
+    post:
+      summary: Advertise a subnet route from a device (Subnet Router)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prefix]
+              properties: { prefix: { type: string, example: 192.168.1.0/24 } }
+      responses:
+        "201":
+          description: created (unapproved)
+          content: { application/json: { schema: { $ref: "#/components/schemas/Route" } } }
+        "404": { description: device not found }
+  /routes/{id}/approve:
+    post:
+      summary: Approve a subnet route (distributes it in peer allowed-ips)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "204": { description: approved }
+        "404": { description: route not found }
+  /relays:
+    post:
+      summary: Register a relay node (omit network_id for shared/official)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [region, url]
+              properties:
+                region: { type: string }
+                url: { type: string }
+                network_id: { type: string, nullable: true }
+      responses:
+        "201":
+          description: created
+          content: { application/json: { schema: { $ref: "#/components/schemas/RelayNode" } } }
+components:
+  schemas:
+    VersionInfo:
+      type: object
+      properties:
+        server_api_version: { type: string }
+        client_protocol_version: { type: integer }
+        server_protocol_version: { type: integer }
+        relay_protocol_version: { type: integer }
+        min_supported_client_protocol_version: { type: integer }
+        min_supported_server_protocol_version: { type: integer }
+    Network:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        ipv4_pool: { type: string }
+        ipv6_ula: { type: string }
+        config_epoch: { type: integer }
+    Device:
+      type: object
+      properties:
+        id: { type: string }
+        network_id: { type: string }
+        name: { type: string }
+        wg_public_key: { type: string }
+        address_v4: { type: string, nullable: true }
+        address_v6: { type: string, nullable: true }
+        status: { type: string, enum: [active, revoked] }
+    Invite:
+      type: object
+      properties:
+        code: { type: string }
+        network_id: { type: string }
+        expires_at: { type: integer, nullable: true }
+        max_uses: { type: integer, nullable: true }
+        uses: { type: integer }
+    Route:
+      type: object
+      properties:
+        id: { type: string }
+        network_id: { type: string }
+        device_id: { type: string }
+        prefix: { type: string }
+        approved: { type: boolean }
+    RelayNode:
+      type: object
+      properties:
+        id: { type: string }
+        region: { type: string }
+        url: { type: string }
+        network_id: { type: string, nullable: true }
+    PeerConfig:
+      type: object
+      properties:
+        wg_public_key: { type: string }
+        allowed_ips: { type: array, items: { type: string } }
+    DeviceConfig:
+      type: object
+      properties:
+        network_id: { type: string }
+        config_epoch: { type: integer }
+        address_v4: { type: string, nullable: true }
+        address_v6: { type: string, nullable: true }
+        peers: { type: array, items: { $ref: "#/components/schemas/PeerConfig" } }

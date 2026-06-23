@@ -1,0 +1,38 @@
+[package]
+name = "fp-crypto-noise"
+version = "1.0.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+fp-crypto = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+
+thiserror = { workspace = true }
+
+ring = { workspace = true }
+x25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+chacha20poly1305 = { workspace = true }
+aead = "0.5"
+blake2 = { workspace = true }
+hmac = { workspace = true }
+portable-atomic = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.27", default-features = false, features = [
+    "time",
+    "user",
+] }
+
+[dev-dependencies]
+etherparse = "0.13"
+tracing-subscriber = "0.3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "crypto_benches"
+harness = false

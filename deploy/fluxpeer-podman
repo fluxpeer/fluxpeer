@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# fluxpeer-podman — Podman deployment driver for fluxpeer roles.
+#
+# One image (deploy/Containerfile) runs every role; this script orchestrates the
+# container lifecycle: install / up / join / down / restart / rm / status / logs.
+#
+# OCI runtime: crun (override with FLUXPEER_OCI_RUNTIME). Nodes need a TUN device,
+# so they run with --cap-add NET_ADMIN,NET_RAW + --device /dev/net/tun. Rootless
+# Podman cannot give a container a TUN — run node commands as root (or a user with
+# the caps + /dev/net/tun access). control / relay are plain network services.
+set -euo pipefail
+
+IMAGE="${FLUXPEER_IMAGE:-localhost/fluxpeer:latest}"
+RUNTIME="${FLUXPEER_OCI_RUNTIME:-crun}"
+STATE="${FLUXPEER_PODMAN_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/fluxpeer-podman}"
+NODE_PREFIX="fluxpeer-node-"
+
+die() { echo "fluxpeer-podman: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
+
+# Use crun if the local Podman knows it; otherwise fall back to the default runtime
+# (so the script still works where only runc is installed).
+runtime_flag() {
+  if podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null | grep -qiw "$RUNTIME"; then
+    printf -- '--runtime %s' "$RUNTIME"
+  elif podman info 2>/dev/null | grep -qiw "$RUNTIME"; then
+    printf -- '--runtime %s' "$RUNTIME"
+  fi
+}
+
+# Resolve a user-facing name to a container name. 'control'/'relay' are fixed;
+# anything else is a node → ${NODE_PREFIX}<name>.
+container_of() {
+  case "$1" in
+    control) echo "fluxpeer-control" ;;
+    relay)   echo "fluxpeer-relay" ;;
+    *)       echo "${NODE_PREFIX}$1" ;;
+  esac
+}
+
+usage() {
+  cat <<EOF
+fluxpeer-podman — deploy fluxpeer roles as Podman containers (runtime: $RUNTIME)
+
+  install [--no-cache]              build the unified image ($IMAGE) from the repo
+  up control [--port 8080] [--admin-password PW] [--data VOL]
+  up relay   [--port 3478]
+  join  <fp://join/…|token> [name] [--port N] [--exit]
+                                   enroll a node + run it (name default: node)
+  down  <name>                     graceful stop (SIGTERM, lets routes/DNS restore)
+  restart <name>
+  rm    <name>                     stop + remove container (+ delete its config)
+  status [name]                    list fluxpeer containers; with a node name, its peers
+  logs  <name> [-f]
+
+<name> is 'control', 'relay', or a node name. State (node configs incl. private
+keys) lives in: $STATE
+Env: FLUXPEER_IMAGE, FLUXPEER_OCI_RUNTIME (default crun), FLUXPEER_PODMAN_DIR.
+EOF
+}
+
+cmd_install() {
+  need podman
+  local repo_root nocache=""
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  [ "${1:-}" = "--no-cache" ] && nocache="--no-cache"
+  echo "building $IMAGE from $repo_root (this compiles fluxpeer; first build is slow)…"
+  podman build $nocache -t "$IMAGE" -f "$repo_root/deploy/Containerfile" "$repo_root"
+  echo "✓ image $IMAGE ready"
+}
+
+cmd_up_control() {
+  need podman
+  local port=8080 admin="${FLUXPEER_ADMIN_PASSWORD:-}" data="fluxpeer-data" name
+  while [ $# -gt 0 ]; do case "$1" in
+    --port) port="$2"; shift 2 ;;
+    --admin-password) admin="$2"; shift 2 ;;
+    --data) data="$2"; shift 2 ;;
+    *) die "up control: unknown arg $1" ;;
+  esac; done
+  name="$(container_of control)"
+  podman rm -f "$name" >/dev/null 2>&1 || true
+  # No caps/TUN — control is a plain HTTP service; SQLite persists on the volume.
+  # shellcheck disable=SC2046
+  podman run -d --name "$name" $(runtime_flag) \
+    -p "${port}:8080" \
+    -v "${data}:/data" \
+    -e "FLUXPEER_CONTROL_ADDR=0.0.0.0:8080" \
+    ${admin:+-e "FLUXPEER_ADMIN_PASSWORD=$admin"} \
+    --restart unless-stopped \
+    "$IMAGE" control
+  echo "✓ control up on :$port (volume $data)${admin:+ — admin password set}"
+}
+
+cmd_up_relay() {
+  need podman
+  local port=3478 name
+  while [ $# -gt 0 ]; do case "$1" in
+    --port) port="$2"; shift 2 ;;
+    *) die "up relay: unknown arg $1" ;;
+  esac; done
+  name="$(container_of relay)"
+  podman rm -f "$name" >/dev/null 2>&1 || true
+  # shellcheck disable=SC2046
+  podman run -d --name "$name" $(runtime_flag) \
+    -p "${port}:3478/udp" -p "${port}:3478/tcp" \
+    -e "FLUXPEER_RELAY_ADDR=0.0.0.0:3478" \
+    --restart unless-stopped \
+    "$IMAGE" relay
+  echo "✓ relay up on :$port (udp+tcp)"
+}
+
+cmd_up() {
+  case "${1:-}" in
+    control) shift; cmd_up_control "$@" ;;
+    relay)   shift; cmd_up_relay "$@" ;;
+    "" )     die "up: specify 'control' or 'relay' (use 'join' to run a node)" ;;
+    *)       die "up: unknown role '$1' (control|relay; nodes start via 'join')" ;;
+  esac
+}
+
+# Start a node container from an existing $STATE/<name>.json config.
+node_run() {
+  need podman
+  local name="$1" port="$2" exitmode="$3" cname cfg netarg=""
+  cname="$(container_of "$name")"
+  cfg="$STATE/${name}.json"
+  [ -f "$cfg" ] || die "no config for node '$name' at $cfg (run 'join' first)"
+  podman rm -f "$cname" >/dev/null 2>&1 || true
+  # Exit nodes route 0.0.0.0/0 and NAT to the host's iface → host networking gives
+  # a clean egress path; regular nodes use a published UDP port on the bridge.
+  if [ "$exitmode" = "1" ]; then
+    netarg="--network host"
+  else
+    netarg="-p ${port}:${port}/udp"
+  fi
+  # shellcheck disable=SC2046
+  podman run -d --name "$cname" $(runtime_flag) \
+    --cap-add NET_ADMIN --cap-add NET_RAW \
+    --device /dev/net/tun \
+    $netarg \
+    -v "${cfg}:/etc/fluxpeer/node.json:ro" \
+    --restart unless-stopped \
+    --stop-signal SIGTERM \
+    "$IMAGE" node run /etc/fluxpeer/node.json
+  if [ "$exitmode" = "1" ]; then
+    echo "✓ node '$name' up (container $cname, exit-node via host network)"
+  else
+    echo "✓ node '$name' up (container $cname, udp :$port)"
+  fi
+}
+
+cmd_join() {
+  need podman; need python3
+  local token="" name="node" port="" exitmode="0"
+  while [ $# -gt 0 ]; do case "$1" in
+    --port) port="$2"; shift 2 ;;
+    --exit) exitmode="1"; shift ;;
+    -* ) die "join: unknown flag $1" ;;
+    *) if [ -z "$token" ]; then token="$1"; else name="$1"; fi; shift ;;
+  esac; done
+  [ -n "$token" ] || die "join: need a fp://join/… token"
+  mkdir -p "$STATE"
+  local cfg="$STATE/${name}.json"
+  [ -f "$cfg" ] && die "node '$name' already exists ($cfg) — 'rm $name' first"
+  # Enroll with a throwaway, unprivileged container (HTTP only): keygen + enroll +
+  # write the config (private key) to our state dir.
+  # shellcheck disable=SC2046
+  podman run --rm $(runtime_flag) -v "${STATE}:/state" "$IMAGE" \
+    join "$token" --no-run --out "/state/${name}.json" \
+    || die "enroll failed (bad/expired token, or control-server unreachable)"
+  [ -f "$cfg" ] || die "enroll did not produce $cfg"
+  # Apply the per-node tun/port/exit overrides into the config.
+  python3 - "$cfg" "$name" "$port" "$exitmode" <<'PY'
+import json, sys
+path, name, port, exitmode = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+c = json.load(open(path))
+c["tun_name"] = "fp0"  # one node per container → fp0 is always free inside it
+if port:
+    c["listen_port"] = int(port)
+if exitmode == "1":
+    c["exit_node"] = True
+json.dump(c, open(path, "w"), indent=2)
+PY
+  # Default the published port to whatever the config ended up with.
+  [ -n "$port" ] || port="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["listen_port"])' "$cfg")"
+  echo "✓ enrolled node '$name' (config $cfg)"
+  node_run "$name" "$port" "$exitmode"
+}
+
+cmd_down() {
+  need podman
+  local name="${1:?down: need a name}" cname
+  cname="$(container_of "$name")"
+  # SIGTERM first (graceful route/DNS/NAT restore), then Podman's own timeout SIGKILL.
+  podman stop --time 5 "$cname" && echo "✓ $cname stopped"
+}
+
+cmd_restart() {
+  need podman
+  local name="${1:?restart: need a name}" cname
+  cname="$(container_of "$name")"
+  podman restart --time 5 "$cname" && echo "✓ $cname restarted"
+}
+
+cmd_rm() {
+  need podman
+  local name="${1:?rm: need a name}" cname cfg
+  cname="$(container_of "$name")"
+  podman rm -f "$cname" >/dev/null 2>&1 || true
+  cfg="$STATE/${name}.json"
+  if [ -f "$cfg" ]; then
+    rm -f "$cfg"
+    echo "✓ removed container $cname + config $cfg"
+  else
+    echo "✓ removed container $cname"
+  fi
+}
+
+cmd_status() {
+  need podman
+  if [ $# -gt 0 ]; then
+    local cname; cname="$(container_of "$1")"
+    podman ps --filter "name=^${cname}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    # For a node, surface live peer status from inside the container.
+    case "$1" in control|relay) : ;; *)
+      echo "--- fluxpeer show ($cname) ---"
+      podman exec "$cname" fluxpeer show 2>/dev/null || echo "(node not running / no status yet)"
+    ;; esac
+  else
+    podman ps -a --filter "name=fluxpeer-" \
+      --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+  fi
+}
+
+cmd_logs() {
+  need podman
+  local name="${1:?logs: need a name}"; shift || true
+  local cname follow=""
+  cname="$(container_of "$name")"
+  [ "${1:-}" = "-f" ] && follow="-f"
+  podman logs $follow "$cname"
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    install) cmd_install "$@" ;;
+    up)      cmd_up "$@" ;;
+    join)    cmd_join "$@" ;;
+    down)    cmd_down "$@" ;;
+    restart) cmd_restart "$@" ;;
+    rm)      cmd_rm "$@" ;;
+    status)  cmd_status "$@" ;;
+    logs)    cmd_logs "$@" ;;
+    -h|--help|help|"") usage ;;
+    *) die "unknown command '$cmd' (see --help)" ;;
+  esac
+}
+
+main "$@"
