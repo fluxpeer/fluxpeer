@@ -1,0 +1,13 @@
+[package]
+name = "fp-crypto"
+version = "1.0.3"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+thiserror = { workspace = true }
+x25519-dalek = { workspace = true }
+
+[dev-dependencies]
+rand_core = { workspace = true }

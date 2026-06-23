@@ -1,0 +1,28 @@
+[package]
+name = "fluxpeer-control-server"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "control-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true, features = ["json", "http1", "tokio", "ws"] }
+futures-util = { version = "0.3", default-features = false }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = "0.12"
+rand = "0.9"
+argon2 = "0.5"
+thiserror = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "any", "sqlite", "postgres"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio-tungstenite = "0.24"
+futures-util = "0.3"

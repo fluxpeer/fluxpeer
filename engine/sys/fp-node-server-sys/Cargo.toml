@@ -1,0 +1,37 @@
+[package]
+name = "fp-node-server-sys"
+version = "2.2.5"
+edition = "2024"
+
+[features]
+debug_log = ["fp-node-core/debug_log"]
+
+[dependencies]
+fp-node-core = { workspace = true }
+fp-crypto = { workspace = true }
+fp-transport = { workspace = true }
+fp-conhash = { workspace = true }
+fp-tun = { workspace = true, features = ["async"] }
+
+tracing = { workspace = true }
+thiserror = { workspace = true }
+flume = { version = "0.11", default-features = false, features = ["async"] }
+core_affinity = "0.8"
+
+rand_core = { workspace = true }
+x25519-dalek = { workspace = true }
+
+hex = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+
+futures = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "sync"] }
+tokio-stream = { workspace = true }
+
+# `examples/mobilegw.rs` — runnable gateway server for the mobile client protocol.
+[dev-dependencies]
+fp-transport-udp = { workspace = true }
+fp-crypto-noise = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { workspace = true }

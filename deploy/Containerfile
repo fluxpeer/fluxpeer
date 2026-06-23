@@ -1,0 +1,27 @@
+# Unified fluxpeer image — ONE binary, every role (control / relay / node) via a
+# subcommand. Build context = repo root:  podman build -f deploy/Containerfile -t fluxpeer .
+#
+# Used by `deploy/fluxpeer-podman` (the Podman deployment driver). The control-only
+# image stays in deploy/Dockerfile; this one adds iproute2/iptables so the SAME
+# image can also run a mesh node (TUN + routes + exit-node NAT).
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p fluxpeer
+
+FROM debian:bookworm-slim
+# iproute2 + iptables: a node creates a TUN and installs routes / exit-node NAT.
+# ca-certificates: HTTPS to the control-server. iputils-ping: in-container checks.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        iproute2 iptables ca-certificates iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/fluxpeer /usr/local/bin/fluxpeer
+# control-server's embedded SQLite lands here (durable via a volume) when
+# DATABASE_URL is unset; harmless for the relay/node roles.
+WORKDIR /data
+VOLUME ["/data"]
+ENV FLUXPEER_CONTROL_ADDR=0.0.0.0:8080 \
+    FLUXPEER_RELAY_ADDR=0.0.0.0:3478
+# `fluxpeer` is the entrypoint, so `podman run … fluxpeer-img control|relay|node run …`
+# selects the role. (The driver passes the subcommand as the container args.)
+ENTRYPOINT ["/usr/local/bin/fluxpeer"]

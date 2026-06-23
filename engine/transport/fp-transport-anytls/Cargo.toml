@@ -1,0 +1,49 @@
+[package]
+name = "fp-transport-anytls"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# workspace crates
+fp-transport = { workspace = true }
+
+# async runtime
+tokio = { workspace = true, features = ["net", "rt", "io-util", "sync", "time", "macros", "signal"] }
+tokio-util = { workspace = true, features = ["codec", "compat"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# TLS (ring backend — no cmake/aws-lc needed for cross-compilation)
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+
+# multiplexing
+yamux = "0.13"
+
+# crypto / hashing
+sha2 = { workspace = true }
+md5 = "0.7"
+rand = { workspace = true }
+hex = { workspace = true }
+
+# serialization
+bytes = { workspace = true }
+
+# networking
+socket2 = { workspace = true }
+
+# error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# observability
+tracing = { workspace = true }
+portable-atomic = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+rand = { workspace = true }

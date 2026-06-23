@@ -1,0 +1,27 @@
+[Unit]
+Description=fluxpeer mesh daemon
+Documentation=https://fluxpeer.org
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fluxpeer up
+Restart=on-failure
+RestartSec=3
+# Sockets + daemon token live under /run/fluxpeer.
+RuntimeDirectory=fluxpeer
+RuntimeDirectoryMode=0755
+# Runs as root: the TUN device, routes, and DNS need CAP_NET_ADMIN. The config dir
+# (/etc/fluxpeer) holds per-network configs + the daemon token the GUI reads.
+#
+# Optional hardening (uncomment if your setup doesn't manage DNS/resolv.conf):
+#   AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+#   CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+#   NoNewPrivileges=yes
+#   ProtectSystem=strict
+#   ReadWritePaths=/etc/fluxpeer /run/fluxpeer
+#   DeviceAllow=/dev/net/tun rw
+
+[Install]
+WantedBy=multi-user.target

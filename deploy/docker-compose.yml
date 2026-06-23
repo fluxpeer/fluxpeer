@@ -1,0 +1,52 @@
+# fluxpeer self-host stack. Target: `docker compose up -d`.
+#
+# Open-source self-host = ONE service. Storage defaults to an embedded SQLite
+# file on the `fpdata` volume — no database server to run or maintain (ample for
+# a self-hosted mesh, cf. Headscale). admin-lite + relay-server are added as they
+# land. PostgreSQL is NOT part of the open stack; it is opt-in for the
+# commercial/hosted deployment only — see the commented block at the bottom.
+name: fluxpeer
+
+services:
+  control-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      FLUXPEER_CONTROL_ADDR: 0.0.0.0:8080
+      # No DATABASE_URL → embedded SQLite at /data/fluxpeer.db (durable via volume).
+      # For the commercial/hosted deployment, point at PostgreSQL instead:
+      #   DATABASE_URL: postgres://fluxpeer:fluxpeer@postgres:5432/fluxpeer
+    ports:
+      - "8080:8080"
+    volumes:
+      - fpdata:/data
+    restart: unless-stopped
+
+  # admin-lite:   # SvelteKit static, served behind control-server / proxy
+  # relay-server: # self-built DERP-style relay (443/anytls)
+
+volumes:
+  fpdata:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Commercial / hosted only (NOT the open self-host default). To run control-server
+# on PostgreSQL, add the `DATABASE_URL` env above and a postgres service, e.g.:
+#
+#   postgres:
+#     image: postgres:18
+#     environment:
+#       POSTGRES_USER: fluxpeer
+#       POSTGRES_PASSWORD: fluxpeer
+#       POSTGRES_DB: fluxpeer
+#     volumes:
+#       - pgdata:/var/lib/postgresql/data
+#     healthcheck:
+#       test: ["CMD-SHELL", "pg_isready -U fluxpeer"]
+#       interval: 5s
+#       timeout: 3s
+#       retries: 10
+#     restart: unless-stopped
+#
+# and `depends_on: { postgres: { condition: service_healthy } }` on control-server,
+# plus a `pgdata:` named volume.

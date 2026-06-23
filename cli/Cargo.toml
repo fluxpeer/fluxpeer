@@ -1,0 +1,20 @@
+[package]
+name = "fluxpeer-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "fp"
+path = "src/main.rs"
+
+[dependencies]
+fluxpeer-sdk = { path = "../sdk/rust" }
+clap = { workspace = true, features = ["env"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+fluxpeer-control-server = { path = "../control-server" }
+axum = { workspace = true, features = ["json", "http1", "tokio"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

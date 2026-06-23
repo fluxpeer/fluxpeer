@@ -1,0 +1,5 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="fluxpeer mark"><defs><linearGradient id="g" x1="9" y1="9" x2="55" y2="55" gradientUnits="userSpaceOnUse"><stop stop-color="#818cf8"/><stop offset="1" stop-color="#6366f1"/></linearGradient></defs>
+ <path d="M 32.0 9.0 L 48.3 15.7 L 55.0 32.0 L 48.3 48.3 L 32.0 55.0 L 15.7 48.3 L 9.0 32.0 L 15.7 15.7 Z" stroke="url(#g)" stroke-width="2.3" stroke-linejoin="round" opacity="0.55"/>
+ <path d="M 32.0 9.0 L 32.0 55.0 M 48.3 15.7 L 15.7 48.3 M 55.0 32.0 L 9.0 32.0 M 48.3 48.3 L 15.7 15.7 " stroke="url(#g)" stroke-width="2" stroke-linecap="round" opacity="0.4"/>
+ <circle cx="32.0" cy="9.0" r="3.6" fill="url(#g)"/><circle cx="48.3" cy="15.7" r="3.6" fill="url(#g)"/><circle cx="55.0" cy="32.0" r="3.6" fill="url(#g)"/><circle cx="48.3" cy="48.3" r="3.6" fill="url(#g)"/><circle cx="32.0" cy="55.0" r="3.6" fill="url(#g)"/><circle cx="15.7" cy="48.3" r="3.6" fill="url(#g)"/><circle cx="9.0" cy="32.0" r="3.6" fill="url(#g)"/><circle cx="15.7" cy="15.7" r="3.6" fill="url(#g)"/>
+ <circle cx="32" cy="32" r="5" fill="#a5b4fc"/></svg>

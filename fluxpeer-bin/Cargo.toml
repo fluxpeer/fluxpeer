@@ -1,0 +1,18 @@
+[package]
+name = "fluxpeer"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "fluxpeer"
+path = "src/main.rs"
+
+[dependencies]
+fluxpeer-control-server = { path = "../control-server" }
+fluxpeer-relay-server = { path = "../relay-server" }
+fluxpeer-node = { path = "../node" }
+fluxpeer-cli = { path = "../cli" }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }

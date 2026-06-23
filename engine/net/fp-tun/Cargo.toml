@@ -1,0 +1,72 @@
+[package]
+name = "fp-tun"
+version = "0.1.2"
+edition = "2024"
+
+[dependencies]
+libc = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "ios", target_os = "android", target_os = "windows"))'.dependencies]
+tokio = { version = "1", features = ["net", "macros"], optional = true }
+tokio-util = { version = "0.7", features = ["codec"], optional = true }
+bytes = { version = "1", optional = true }
+byteorder = { version = "1", optional = true }
+# This is only for the `ready` macro.
+futures-core = { version = "0.3", optional = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+ioctl = { version = "0.8", package = "ioctl-sys" }
+
+# MARKER BEGIN
+[target.'cfg(target_os = "windows")'.dependencies]
+wintun = { workspace = true }
+packet = "0.1"
+ipconfig = "0.3.0"
+log = "0.4"
+env_logger = "0.10"
+winapi = "0.3"
+subprocess = "0.2"
+widestring = "1"
+# MARKER END
+
+[dev-dependencies]
+packet = "0.1"
+futures = "0.3"
+pcap-file = "1.1"
+
+[features]
+async = ["tokio", "tokio-util", "bytes", "byteorder", "futures-core"]
+examples = []
+
+[[example]]
+name = "read-async"
+required-features = [ "examples", "async", "tokio/rt-multi-thread" ]
+
+[[example]]
+name = "read-async-codec"
+required-features = [ "examples", "async", "tokio/rt-multi-thread" ]
+
+[[example]]
+name = "ping-tun"
+required-features = [ "examples", "async", "tokio/rt-multi-thread" ]
+
+[[example]]
+name = "wintun"
+required-features = ["examples"]
+
+[[example]]
+name = "wireshark"
+required-features = ["examples"]
+
+[[example]]
+name = "tun2udp"
+required-features = [ "examples", "async", "tokio/rt-multi-thread", "tokio/io-util" ]
+
+[[example]]
+name = "tun2tcp-async"
+required-features = [ "examples", "async", "tokio/rt-multi-thread", "tokio/io-util" ]
+
+[[example]]
+name = "tcpsink"
+required-features =  [ "examples", "async", "tokio/rt-multi-thread", "tokio/io-util" ]

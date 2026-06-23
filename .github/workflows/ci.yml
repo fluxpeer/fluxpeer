@@ -1,0 +1,30 @@
+# fluxpeer CI — runs the regression suite (scripts/ci.sh) on push to main + PRs.
+#
+# scripts/ci.sh gates on clippy (zero-warning) + `cargo test --workspace`. The
+# netns real-tunnel e2e stage needs root + /dev/net/tun; it auto-skips where that
+# isn't available. The Windows cross-check runs only if the mingw toolchain is
+# present. See docs/CI.md.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: regression suite
+        run: bash scripts/ci.sh
