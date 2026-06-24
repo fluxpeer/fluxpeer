@@ -291,8 +291,10 @@ async fn set_endpoints(
 async fn sql_set_endpoints(
     State(s): State<Arc<SqlStore>>,
     Path(device_id): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SetEndpointsReq>,
 ) -> Result<StatusCode, StatusCode> {
+    require_device(&s, &headers, &device_id).await?;
     s.set_endpoints(&device_id, &req.endpoints)
         .await
         .map(|_| StatusCode::NO_CONTENT)
@@ -469,14 +471,56 @@ async fn sql_delete_route(State(s): State<Arc<SqlStore>>, Path(route_id): Path<S
     s.delete_route(&route_id).await.map(|_| StatusCode::NO_CONTENT).map_err(sql_status)
 }
 
+/// Enroll response = the device record + the one-time per-device auth token the
+/// device must present on its own `/devices/:id/*` calls.
+#[derive(serde::Serialize)]
+struct EnrollResponse {
+    #[serde(flatten)]
+    device: domain::Device,
+    auth_token: String,
+}
+
 async fn sql_enroll(
     State(s): State<Arc<SqlStore>>,
     Json(req): Json<EnrollReq>,
-) -> Result<(StatusCode, Json<domain::Device>), StatusCode> {
+) -> Result<(StatusCode, Json<EnrollResponse>), StatusCode> {
     s.enroll(&req.invite_code, &req.name, &req.wg_public_key, now_unix())
         .await
-        .map(|d| (StatusCode::CREATED, Json(d)))
+        .map(|(device, auth_token)| (StatusCode::CREATED, Json(EnrollResponse { device, auth_token })))
         .map_err(sql_status)
+}
+
+/// Extract a `Authorization: Bearer <token>` value.
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+/// Constant-time byte compare (don't leak token length-prefix match timing).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Authorize a `/devices/:id/*` request: the caller MUST present the device's
+/// enroll-issued auth token as a bearer. Closes the unauthenticated-IDOR family
+/// (a guessable `dev-N` id is no longer authority). 401 on any mismatch/absence.
+async fn require_device(s: &SqlStore, headers: &axum::http::HeaderMap, device_id: &str) -> Result<(), StatusCode> {
+    let tok = bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    match s.device_token(device_id).await {
+        Ok(Some(stored)) if ct_eq(stored.as_bytes(), tok.as_bytes()) => Ok(()),
+        Ok(_) => Err(StatusCode::UNAUTHORIZED),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn sql_import_devices(
@@ -524,7 +568,9 @@ async fn sql_rename_device(
 async fn sql_device_config(
     State(s): State<Arc<SqlStore>>,
     Path(device_id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<domain::DeviceConfig>, StatusCode> {
+    require_device(&s, &headers, &device_id).await?;
     s.device_config(&device_id).await.map(Json).map_err(sql_status)
 }
 
@@ -532,7 +578,9 @@ async fn sql_device_config(
 async fn sql_device_gateway(
     State(s): State<Arc<SqlStore>>,
     Path(device_id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<GatewayConfig>, StatusCode> {
+    require_device(&s, &headers, &device_id).await?;
     let cfg = s.device_config(&device_id).await.map_err(sql_status)?;
     select_gateway(&cfg).map(Json).ok_or(StatusCode::NOT_FOUND)
 }
@@ -549,8 +597,10 @@ struct StatsReportReq {
 async fn sql_report_stats(
     State(s): State<Arc<SqlStore>>,
     Path(device_id): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<StatsReportReq>,
 ) -> Result<StatusCode, StatusCode> {
+    require_device(&s, &headers, &device_id).await?;
     let peers_json = serde_json::to_string(&req.peers).unwrap_or_else(|_| "[]".to_string());
     s.report_stats(&device_id, req.rx_bytes, req.tx_bytes, &peers_json, now_unix())
         .await
@@ -607,8 +657,10 @@ async fn sql_list_relays(
 async fn sql_watch_device(
     State(s): State<Arc<SqlStore>>,
     Path(device_id): Path<String>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, StatusCode> {
+    require_device(&s, &headers, &device_id).await?;
     let network_id = s
         .network_of(&device_id)
         .await
@@ -661,11 +713,15 @@ pub fn sql_router(store: Arc<SqlStore>) -> Router {
         .route("/devices/:id/endpoints", post(sql_set_endpoints))
         .route("/devices/:id/stats", post(sql_report_stats))
         .route("/devices/:id/watch", get(sql_watch_device))
-        .route("/relays", post(sql_register_relay))
         .route("/networks/:id/relays", get(sql_list_relays))
         .with_state(store.clone());
     // Admin: management routes behind the bearer middleware.
     let admin = Router::new()
+        // Registering a relay is privileged: a network_id=None relay lands in EVERY
+        // network's config and becomes the default STUN responder, so an
+        // unauthenticated caller could poison reflexive endpoints / observe metadata
+        // fleet-wide. Admin-only (audit finding 4).
+        .route("/relays", post(sql_register_relay))
         .route("/networks", post(sql_create_network).get(sql_list_networks))
         .route("/networks/:id/invites", post(sql_create_invite).get(sql_list_invites))
         .route("/networks/:id/devices", get(sql_list_devices))

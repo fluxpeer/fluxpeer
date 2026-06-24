@@ -48,6 +48,9 @@ pub async fn migrate(pool: &AnyPool) -> Result<(), sqlx::Error> {
     // Editable wg settings (JSON: mtu / dns / endpoint override) — wg-quick-ish
     // knobs the node applies. Best-effort add for pre-existing DBs.
     let _ = sqlx::query("ALTER TABLE device ADD COLUMN settings TEXT").execute(pool).await;
+    // Per-device auth token (issued at enroll): the only credential gating a device's
+    // own config read/endpoint writes, so a device_id alone is no longer authority.
+    let _ = sqlx::query("ALTER TABLE device ADD COLUMN auth_token TEXT").execute(pool).await;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS relay (\
             id TEXT PRIMARY KEY, region TEXT NOT NULL, url TEXT NOT NULL, \
@@ -365,6 +368,25 @@ pub async fn insert_device(pool: &AnyPool, d: &Device) -> Result<(), sqlx::Error
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Store a device's enroll-issued auth token.
+pub async fn set_device_token(pool: &AnyPool, device_id: &str, token: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE device SET auth_token = $1 WHERE id = $2")
+        .bind(token)
+        .bind(device_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Fetch a device's auth token (None if the device is unknown or pre-token).
+pub async fn get_device_token(pool: &AnyPool, device_id: &str) -> Result<Option<String>, sqlx::Error> {
+    let row = sqlx::query("SELECT auth_token FROM device WHERE id = $1")
+        .bind(device_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|r| r.get::<Option<String>, _>("auth_token")))
 }
 
 pub async fn list_devices(pool: &AnyPool, network_id: &str) -> Result<Vec<Device>, sqlx::Error> {

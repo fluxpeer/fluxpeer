@@ -867,8 +867,9 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
         let reg = status_reg.clone();
         let control_server = cfg.control_server.clone();
         let device_id = cfg.device_id.clone();
+        let auth_token = cfg.auth_token.clone().unwrap_or_default();
         tokio::spawn(async move {
-            let client = fluxpeer_sdk::Client::new(control_server);
+            let client = fluxpeer_sdk::Client::with_password(control_server, &auth_token);
             // 3 s cadence so the web's realtime rate (Δbytes/Δt) feels live without
             // hammering the control-server.
             let mut iv = tokio::time::interval(Duration::from_secs(3));
@@ -907,7 +908,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
     // relay; revoked peers lose their session regardless). ---
     tokio::spawn(
         Reconciler {
-            client: fluxpeer_sdk::Client::new(cfg.control_server.clone()),
+            client: crate::control::mk_client(&cfg),
             device_id: cfg.device_id.clone(),
             tun_name: dev_name.clone(), // route ops target the real device (utunN on macOS)
             n,

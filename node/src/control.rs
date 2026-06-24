@@ -10,6 +10,13 @@ use tokio::net::UdpSocket;
 use crate::config::Config;
 use crate::util::{DISCO_MAGIC, disco_dgram, hex32};
 
+/// Build an SDK client that carries this device's auth token as the bearer, so the
+/// control-server authorizes its `/devices/:id/*` calls (config pull / endpoints /
+/// routes). Empty token → no header (rejected by a token-enforcing server).
+pub(crate) fn mk_client(cfg: &Config) -> Client {
+    Client::with_password(cfg.control_server.clone(), cfg.auth_token.as_deref().unwrap_or_default())
+}
+
 /// Static info about one peer, resolved from the control-server config-pull.
 #[derive(Clone)]
 pub(crate) struct PeerInfo {
@@ -52,7 +59,7 @@ pub(crate) struct RelayDir {
 /// before STUN, so we can learn the STUN address from it too). Empty on any error
 /// — the node still runs direct-only.
 pub(crate) async fn fetch_relays(cfg: &Config) -> Vec<RelayDir> {
-    let client = Client::new(cfg.control_server.clone());
+    let client = mk_client(cfg);
     let Ok(conf) = client.device_config(&cfg.device_id).await else {
         return Vec::new();
     };
@@ -141,7 +148,7 @@ pub(crate) fn config_epoch(conf: &serde_json::Value) -> u64 {
 /// Returns the resolved peer set plus the `config_epoch` it was pinned at, so the
 /// reconcile loop only re-pulls when the epoch actually advances.
 pub(crate) async fn resolve_from_control(cfg: &Config, advertise: &[String]) -> std::io::Result<(Resolved, u64)> {
-    let client = Client::new(cfg.control_server.clone());
+    let client = mk_client(cfg);
     client
         .set_endpoints(&cfg.device_id, advertise)
         .await

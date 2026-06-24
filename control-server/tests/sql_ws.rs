@@ -16,7 +16,7 @@ async fn persistent_ws_pushes_on_enroll() {
     );
     let net = store.create_network("home").await.unwrap();
     let inv = store.create_invite(&net.id, None, None).await.unwrap();
-    let d1 = store.enroll(&inv.code, "d1", "k1", 1000).await.unwrap();
+    let (d1, d1_token) = store.enroll(&inv.code, "d1", "k1", 1000).await.unwrap();
 
     let app = sql_router(store.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -26,7 +26,12 @@ async fn persistent_ws_pushes_on_enroll() {
     });
 
     let url = format!("ws://{addr}/api/v1/devices/{}/watch", d1.id);
-    let (mut ws, _) = connect_async(&url).await.unwrap();
+    // The watch endpoint is per-device gated; present d1's token on the handshake.
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {d1_token}").parse().unwrap());
+    let (mut ws, _) = connect_async(req).await.unwrap();
 
     // initial snapshot: no peers
     let first = ws.next().await.unwrap().unwrap().into_text().unwrap();

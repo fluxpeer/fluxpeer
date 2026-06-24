@@ -81,6 +81,9 @@ pub(crate) async fn enroll_and_write(
         .as_str()
         .ok_or_else(|| Error::other("enroll response missing device id"))?
         .to_string();
+    // The per-device auth token is returned ONCE at enroll; persist it so the node
+    // can authenticate its control-server calls (config pull / endpoints / routes).
+    let auth_token = dev["auth_token"].as_str().unwrap_or_default().to_string();
     let addr = dev["address_v4"].as_str().unwrap_or("(pending)");
 
     // Multi-network: each membership is its own config in the config dir with a
@@ -93,6 +96,7 @@ pub(crate) async fn enroll_and_write(
         "private_key": priv_hex,
         "device_id": device_id,
         "control_server": ctrl,
+        "auth_token": auth_token,
         "listen_port": listen_port,
         "tun_name": tun_name,
         "prefix_len": 24,
