@@ -1,0 +1,24 @@
+[package]
+name = "fp-node-mobile-sys"
+version = "0.1.0"
+edition = "2024"
+
+# Mobile FFI for the FULL `fluxpeer-node` engine: a phone runs the SAME data plane
+# as desktop/server (disco / relay / multi-peer / exit-as-a-peer), adopting the
+# OS-provided VPN tun fd — a first-class mesh peer, not a thin gateway client. This
+# supersedes the standalone two-phase dispatcher (`fp-node-client-sys`).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+fluxpeer-node = { path = "../../../node" }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros"] }
+parking_lot = "0.12"
+tracing = { workspace = true }
+serde_json = { workspace = true }
+
+# Android JNI: Kotlin `dev.fluxpeer.fluxpeer.FluxpeerNode` calls runNode/stopNode;
+# the engine upcalls `protectSocket(fd)` so VpnService excludes egress sockets.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+tracing-subscriber = { workspace = true }

@@ -53,8 +53,13 @@ pub(crate) struct Config {
     #[serde(default)]
     pub(crate) dns: Vec<String>,
     /// This device acts as an EXIT NODE: enable IP forwarding + NAT masquerade so
-    /// peers routing 0.0.0.0/0 through it actually egress to the internet. (It also
-    /// advertises 0.0.0.0/0 as a route at the control-server.)
+    /// peers routing 0.0.0.0/0 through it actually egress to the internet. This flag
+    /// only sets up the LOCAL forwarding/NAT — for peers to actually route through it,
+    /// an admin must additionally advertise + approve the `0.0.0.0/0` route for this
+    /// device at the control-server (`POST /devices/:id/routes {"prefix":"0.0.0.0/0"}`
+    /// then `POST /routes/:id/approve`, or the equivalent CLI / admin-lite action).
+    /// Declaring a node as everyone's exit is privileged, so it is deliberately NOT
+    /// self-service: the node cannot advertise the route itself (admin-gated).
     #[serde(default)]
     pub(crate) exit_node: bool,
     /// Subnets to EXCLUDE from the tunnel (split-exclude). Only meaningful when a
@@ -64,6 +69,15 @@ pub(crate) struct Config {
     /// exit endpoint, and the local LAN are excluded automatically.
     #[serde(default)]
     pub(crate) exclude_routes: Vec<String>,
+    /// EXTERNAL TUN file descriptor to adopt instead of creating our own device.
+    /// Set on mobile (Android `VpnService` / iOS `NEPacketTunnelProvider`), where the
+    /// app — not the engine — owns the tun: the OS hands us a ready fd whose address,
+    /// routes, MTU and DNS are already configured by the VPN API. When present the
+    /// node runs the SAME data plane as everywhere else (disco/relay/multi-peer/exit
+    /// as a peer) but skips device creation + host route/DNS install (the platform
+    /// owns those), so a phone is a first-class mesh node, not a thin gateway client.
+    #[serde(default)]
+    pub(crate) tun_fd: Option<i32>,
 }
 
 /// Generate a fresh x25519 keypair, returning `(private_hex, public_hex)`. Shared by

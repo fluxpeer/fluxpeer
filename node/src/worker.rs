@@ -105,6 +105,16 @@ pub(crate) enum WorkerMsg {
     /// no longer send (we stop keepalives/data) or receive (no session → decrypt
     /// fails; a fresh init from it is ignored since `accept_init` needs a known peer).
     RemovePeer([u8; 32]),
+    /// Reconcile: a peer re-reported a DIFFERENT endpoint set (it roamed/restarted).
+    /// Update its disco candidates IN PLACE and re-open the hole — but KEEP the live
+    /// wg session + receiver index. Tearing the session down here (the old
+    /// remove+add) discarded our index while the peer kept sending it, so its DATA
+    /// routed to nowhere → silent → relay flap (the multi-peer endpoint-churn bug).
+    /// A genuinely restarted peer re-initiates itself (handled by `accept_init`).
+    UpdateCandidates {
+        pubkey: [u8; 32],
+        candidates: Vec<SocketAddr>,
+    },
 }
 
 /// Route an egress TUN packet to `(owning peer pubkey, worker id)` by destination
@@ -188,6 +198,30 @@ pub(crate) struct WorkerState {
 /// encrypting until the response installs the new one) and record its index so the
 /// peer's response routes back. Shared by the silent→relay fallback and the
 /// proactive session-aging paths. Returns whether an init was actually sent.
+/// Send a keepalive (encrypted empty data) down the peer's current path. A
+/// relay-pinned peer ALSO fires it directly + a disco ping to re-open the hole and
+/// test whether the direct path recovered (both ends do this, so a healed path
+/// delivers each other's direct keepalive). Free fn so the tick loop stays flat.
+async fn keepalive_send(
+    udp: &UdpSocket,
+    ping: &[u8],
+    force_relay: bool,
+    relay_out: &Option<RelayOut>,
+    peer: &Peer,
+    ka: &[u8],
+) {
+    send_to_peer(udp, peer, force_relay, relay_out, ka).await;
+    if peer.relay_pinned && !force_relay {
+        if let Some(addr) = peer.direct_addr {
+            let _ = udp.send_to(ka, addr).await;
+            let _ = udp.send_to(ping, addr).await;
+        }
+        for c in &peer.candidates {
+            let _ = udp.send_to(ping, *c).await;
+        }
+    }
+}
+
 async fn emit_rekey(
     peer: &mut Peer,
     udp: &UdpSocket,
@@ -242,6 +276,10 @@ impl WorkerState {
                 self.on_add_peer(pubkey, candidates, allowed_ips, initiator).await;
             }
             WorkerMsg::RemovePeer(pk) => self.on_remove_peer(pk),
+            WorkerMsg::UpdateCandidates { pubkey, candidates } => {
+                gso.flush(&self.udp).await;
+                self.on_update_candidates(pubkey, candidates).await;
+            }
             // Arms that may themselves send (handshake resp / keepalive) flush the
             // pending egress batch first so wire order stays sane.
             WorkerMsg::Tick => {
@@ -316,35 +354,43 @@ impl WorkerState {
             // the current path — it keeps NAT mappings warm and, being AEAD-
             // authenticated, is the only honest liveness signal: disco Ping/Pong
             // can succeed while the *data* session is crossed/dead.
-            if let Ok(ka) = peer.raw.on_send(&[], ebuf)
-                && ka.first() == Some(&T_DATA)
-            {
-                let ka = ka.to_vec();
-                peer.stat.add_tx(ka.len());
-                send_to_peer(&self.udp, peer, self.force_relay, &self.relay_out, &ka).await;
-                // Re-probe: a relay-pinned peer also fires the keepalive *directly*
-                // + a disco ping, to re-open the hole and test whether the direct
-                // path has recovered (both ends do this, so a healed path delivers
-                // each other's direct keepalive).
-                if peer.relay_pinned && !self.force_relay {
-                    if let Some(addr) = peer.direct_addr {
-                        let _ = self.udp.send_to(&ka, addr).await;
-                        let _ = self.udp.send_to(&self.ping, addr).await;
-                    }
-                    for c in &peer.candidates {
-                        let _ = self.udp.send_to(&self.ping, *c).await;
-                    }
+            if let Ok(out) = peer.raw.on_send(&[], ebuf) {
+                if out.first() == Some(&T_DATA) {
+                    let ka = out.to_vec();
+                    peer.stat.add_tx(ka.len());
+                    keepalive_send(&self.udp, &self.ping, self.force_relay, &self.relay_out, peer, &ka).await;
+                } else if out.first() == Some(&T_HANDSHAKE_INIT)
+                    && self.own_pub.as_bytes() < &peer.pubkey
+                    && let Some(idx) = le_u32(out, 4)
+                {
+                    // The session aged out, so `on_send` emitted a rekey INIT instead
+                    // of a keepalive — which already advanced OUR receiver index. Only
+                    // the designated initiator (own_pub < peer, the same gate
+                    // `emit_rekey`/`on_tun_egress` use so the two ends never
+                    // cross-initiate) registers + sends it. Dropping it (the old
+                    // behaviour) left the index advanced-but-unregistered, so the
+                    // peer's next DATA carried a receiver index this node never put in
+                    // `index_owner` → routed to nowhere → "direct path silent" →
+                    // endless relay flap. The responder discards it and lets the
+                    // initiator drive the rekey. This silently broke multi-peer meshes.
+                    let init = out.to_vec();
+                    self.index_map.insert(idx, peer.pubkey);
+                    send_to_peer(&self.udp, peer, self.force_relay, &self.relay_out, &init).await;
                 }
             }
-            // If the direct path goes silent (no decryptable packet for a while)
-            // the punch died — symmetric NAT remap, crossed sessions, etc. The
+            // If the DIRECT path goes silent (no decryptable packet *over UDP-direct*
+            // for a while) the punch died — symmetric NAT remap, crossed sessions, etc.
+            // Gate on `last_recv_direct`, NOT `last_recv`: the latter is refreshed by
+            // RELAY traffic too, so a node that only hears a peer over the relay would
+            // keep its direct path "alive" forever and keep replying into the dead
+            // direct address — the peer reaches us via relay but we never reply via
+            // relay, a one-way black hole (the mobile inbound-NAT failure). The
             // threshold is RTT-ADAPTIVE (>= 8×RTT, floor LIVENESS_DEAD_SECS) so a
-            // high-latency WAN path isn't declared dead before its 1s keepalives
-            // can arrive.
+            // high-latency WAN path isn't declared dead before its 1s keepalives arrive.
             let dead = peer.rtt.map_or(Duration::from_secs(LIVENESS_DEAD_SECS), |r| {
                 (r * 8).max(Duration::from_secs(LIVENESS_DEAD_SECS))
             });
-            let silent = peer.last_recv.map(|t| now.duration_since(t) >= dead).unwrap_or(true);
+            let silent = peer.last_recv_direct.map(|t| now.duration_since(t) >= dead).unwrap_or(true);
             if silent && !peer.prefer_relay && !self.force_relay && self.relay_out.is_some() {
                 // Move to relay but keep the LIVE session and rekey GAPLESSLY
                 // (rekey_init, not a rebuild): the old session keeps decrypting
@@ -608,6 +654,25 @@ impl WorkerState {
         }
     }
 
+    /// Reconcile: a peer re-reported its endpoint set. Swap its disco candidates and
+    /// re-open the hole toward them, but KEEP the live wg session + receiver index —
+    /// so its in-flight DATA (still carrying the index we assigned) keeps routing,
+    /// and roaming/disco adopts the working endpoint. Replacing the session here (the
+    /// old remove+add) silently desynced the index on every endpoint change.
+    async fn on_update_candidates(&mut self, pubkey: [u8; 32], candidates: Vec<SocketAddr>) {
+        let Some(peer) = self.peers.iter_mut().find(|p| p.pubkey == pubkey) else {
+            return;
+        };
+        peer.candidates = candidates.clone();
+        peer.disco_validated = false; // re-validate against the new endpoints
+        if !self.force_relay {
+            for c in &candidates {
+                let _ = self.udp.send_to(&self.ping, *c).await;
+            }
+        }
+        tracing::info!(peer = %hex::encode(&pubkey[..4]), n = candidates.len(), "peer endpoints updated (reconcile, session kept)");
+    }
+
     async fn on_tun_egress(&mut self, pk: [u8; 32], pkt: &[u8], ebuf: &mut [u8], gso: &mut crate::gso::GsoBatch) {
         let Some(peer) = self.peers.iter_mut().find(|p| p.pubkey == pk && p.handshaked) else {
             return;
@@ -616,14 +681,25 @@ impl WorkerState {
             return;
         };
         // If the session needs (re)keying, encapsulate emits a handshake INIT
-        // instead of data — a different size, not batchable. Record its index so
-        // the peer's response routes back (else the rekey loops) and send it solo.
+        // instead of data — a different size, not batchable. Only the designated
+        // initiator (own_pub < peer, the SAME gate emit_rekey + the keepalive path
+        // use) may drive it: otherwise BOTH ends rekey-init an aged session
+        // (crossed handshakes), and the responder's accept_init rebuilds a FRESH
+        // Cryptor that discards the live session — the peer keeps sending the old
+        // receiver index, which now routes to nowhere → silent → relay flap. That
+        // desync collapses every multi-peer mesh under rekey churn. The responder
+        // drops the init here; its packet stays queued in the crypto layer until
+        // the initiator's gapless rekey lands.
         if enc.first() == Some(&T_HANDSHAKE_INIT) {
-            if let Some(idx) = le_u32(enc, 4) {
-                self.index_map.insert(idx, pk);
+            if self.own_pub.as_bytes() < &peer.pubkey {
+                if let Some(idx) = le_u32(enc, 4) {
+                    self.index_map.insert(idx, pk);
+                }
+                gso.flush(&self.udp).await;
+                send_to_peer(&self.udp, peer, self.force_relay, &self.relay_out, enc).await;
             }
-            gso.flush(&self.udp).await;
-            send_to_peer(&self.udp, peer, self.force_relay, &self.relay_out, enc).await;
+            // Responder: drop the init (the initiator drives rekeys); our packet
+            // stays queued in the crypto layer until the new session lands.
             return;
         }
         // Data packet out — count wire bytes (like wg transfer).

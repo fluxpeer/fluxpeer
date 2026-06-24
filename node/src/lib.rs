@@ -171,12 +171,14 @@ impl Reconciler {
                 let entry = self.known.get(&pi.pubkey).map(|(_, c, a)| (c.clone(), a.clone()));
                 match entry {
                     None => self.add_peer(pi).await,
-                    // Endpoint set changed: re-establish so disco probes the new
-                    // endpoint. Without this a peer that restarts with a new endpoint
-                    // is never reconnected (the set + AllowedIPs are unchanged).
+                    // Endpoint set changed (peer roamed/restarted): update its disco
+                    // candidates IN PLACE so probes reach the new endpoint, but KEEP
+                    // the live wg session + receiver index. The old remove+add tore
+                    // the session down, discarding our index while the peer kept
+                    // sending it → its DATA routed to nowhere → silent → relay flap.
+                    // A genuinely restarted peer re-initiates itself (`accept_init`).
                     Some((cands, _)) if !same_endpoints(&cands, &pi.candidates) => {
-                        self.remove_peer(pi.pubkey).await;
-                        self.add_peer(pi).await;
+                        self.update_candidates(pi).await;
                     }
                     Some((_, aips)) if aips != pi.allowed_ips => self.update_routes(pi),
                     Some(_) => {}
@@ -299,10 +301,56 @@ impl Reconciler {
         tracing::info!(peer = %hex::encode(&pi.pubkey[..4]), "reconcile: peer joined → session added");
         self.known.insert(pi.pubkey, (wid, pi.candidates, pi.allowed_ips));
     }
+
+    /// A known peer re-reported a different endpoint set: re-point its disco
+    /// candidates (routing map + worker) WITHOUT tearing down the wg session, so its
+    /// receiver index stays registered. See `WorkerMsg::UpdateCandidates`.
+    async fn update_candidates(&mut self, pi: control::PeerInfo) {
+        let Some((wid, old_cands, aips)) = self.known.get(&pi.pubkey).cloned() else {
+            return;
+        };
+        {
+            let mut cw = self.cand_to_wid.write();
+            for c in &old_cands {
+                cw.remove(c);
+            }
+            for c in &pi.candidates {
+                cw.insert(*c, wid);
+            }
+        }
+        self.known.insert(pi.pubkey, (wid, pi.candidates.clone(), aips));
+        let _ = self.wtxs[wid]
+            .send(worker::WorkerMsg::UpdateCandidates {
+                pubkey: pi.pubkey,
+                candidates: pi.candidates,
+            })
+            .await;
+        tracing::info!(peer = %hex::encode(&pi.pubkey[..4]), "reconcile: peer endpoints changed → candidates updated (session kept)");
+    }
 }
 
+/// Called with every egress socket fd the engine opens so the host can exclude it
+/// from the tunnel — on Android `VpnService.protect(fd)`, else the engine's own wg
+/// packets would route back INTO the tun (a loop). Desktop/server pass `None`.
+pub type ProtectFn = std::sync::Arc<dyn Fn(std::os::fd::RawFd) + Send + Sync>;
+
+/// Bring up the tunnels from a config FILE (desktop/server: we create the device).
 pub async fn run(cfg_path: &str) -> std::io::Result<()> {
     let cfg: Config = serde_json::from_slice(&std::fs::read(cfg_path)?)?;
+    run_with(cfg, None).await
+}
+
+/// EMBEDDED entry (mobile): run the SAME node engine from an inline config JSON,
+/// adopting the OS-provided tun fd (Android VpnService / iOS NEPacketTunnelProvider)
+/// instead of creating a device. `protect` excludes egress sockets from the VPN.
+/// This is what makes a phone a first-class mesh peer — same data plane as the CLI.
+pub async fn run_embedded(cfg_json: &str, tun_fd: i32, protect: Option<ProtectFn>) -> std::io::Result<()> {
+    let mut cfg: Config = serde_json::from_str(cfg_json).map_err(std::io::Error::other)?;
+    cfg.tun_fd = Some(tun_fd);
+    run_with(cfg, protect).await
+}
+
+async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()> {
     let own_priv = StaticSecret::from(hex32(&cfg.private_key));
     let own_pub = PublicKey::from(&own_priv);
 
@@ -310,6 +358,14 @@ pub async fn run(cfg_path: &str) -> std::io::Result<()> {
     // Arc so the data plane can later share one socket across per-core worker
     // tasks (multicore sharding); `&udp` still deref-coerces to `&UdpSocket`.
     let udp = Arc::new(UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, cfg.listen_port))).await?);
+    // Mobile: exclude our egress socket from the VPN (else wg packets loop into the
+    // tun). No-op on desktop/server (protect = None). Relay/tcp-direct sockets are
+    // protected the same way where they're opened (see relay/tcp_direct).
+    if let Some(p) = &protect {
+        use std::os::fd::AsRawFd;
+        p(udp.as_raw_fd());
+        tracing::info!("protected egress udp socket from VPN");
+    }
 
     // Pull the relay directory from coordination. Local cfg fields, if set, still
     // override it — so a node needs zero relay/STUN config in the common case.
@@ -370,66 +426,87 @@ pub async fn run(cfg_path: &str) -> std::io::Result<()> {
 
     let (r, init_epoch) = resolve_from_control(&cfg, &advertise).await?;
 
-    // --- TUN: address + connected route for the overlay subnet (split-tunnel) ---
-    let mut tun_cfg = fp_tun::configure();
-    tun_cfg.address(r.own_addr).netmask(netmask_v4(cfg.prefix_len)).up();
-    // Linux uses the configured name (fp0); macOS utun names are kernel-assigned
-    // (utunN) and "fp0" is rejected, so there we let it auto-assign + read it back.
-    #[cfg(not(target_os = "macos"))]
-    tun_cfg.name(&cfg.tun_name);
-    // MTU / DNS: a LOCAL config value (desktop "Settings", device sets its own)
-    // overrides what the control-server distributes.
-    let eff_mtu = cfg.mtu.or(r.mtu);
-    let eff_dns: Vec<String> = if cfg.dns.is_empty() { r.dns.clone() } else { cfg.dns.clone() };
-    if let Some(m) = eff_mtu {
-        tun_cfg.mtu(m);
-        tracing::info!(mtu = m, "applying MTU");
+    // --- TUN: adopt an externally-provided fd (mobile VpnService) OR create + address
+    // the device ourselves (desktop/server). With an injected fd the OS already
+    // configured address/routes/MTU/DNS, so we ONLY wrap the fd; the data plane below
+    // is identical either way. ---
+    // EMBEDDED mode = the OS owns the tun (we adopt its fd): true on mobile
+    // (Android `VpnService` / iOS `NEPacketTunnelProvider`), where host-level route /
+    // DNS / NAT APIs are unavailable to a sandboxed app and the VPN framework already
+    // configured the device. `tun_fd` is only ever set on those platforms, so it
+    // doubles as the system-type switch; we also log the concrete OS for diagnosis.
+    let injected_fd = cfg.tun_fd;
+    let embedded = injected_fd.is_some();
+    if embedded {
+        tracing::info!(os = std::env::consts::OS, "node running EMBEDDED (adopting OS-provided tun fd)");
     }
+    let mut tun_cfg = fp_tun::configure();
+    if let Some(fd) = injected_fd {
+        tun_cfg.raw_fd(fd);
+    } else {
+        tun_cfg.address(r.own_addr).netmask(netmask_v4(cfg.prefix_len)).up();
+        // Linux uses the configured name (fp0); macOS utun names are kernel-assigned
+        // (utunN) and "fp0" is rejected, so there we let it auto-assign + read it back.
+        #[cfg(not(target_os = "macos"))]
+        tun_cfg.name(&cfg.tun_name);
+        // MTU: a LOCAL config value (desktop "Settings") overrides the control-server's.
+        if let Some(m) = cfg.mtu.or(r.mtu) {
+            tun_cfg.mtu(m);
+            tracing::info!(mtu = m, "applying MTU");
+        }
+    }
+    let eff_dns: Vec<String> = if cfg.dns.is_empty() { r.dns.clone() } else { cfg.dns.clone() };
     let dev = fp_tun::create_as_async(&tun_cfg).map_err(std::io::Error::other)?;
     // The actual kernel device name — equals cfg.tun_name on Linux, an auto-assigned
     // utunN on macOS. Routes must target THIS; the logical/status name stays tun_name.
     let dev_name = dev.get_ref().name().to_string();
-    apply_dns(&eff_dns, &dev_name);
-    tracing::info!(tun = %cfg.tun_name, dev = %dev_name, addr = %r.own_addr, peers = r.peers.len(), "TUN up");
+    tracing::info!(tun = %cfg.tun_name, dev = %dev_name, addr = %r.own_addr, peers = r.peers.len(), fd = ?injected_fd, "TUN up");
 
-    for p in &r.peers {
-        for cidr in &p.allowed_ips {
-            route_replace(cidr, &dev_name); // 0.0.0.0/0 is skipped — handled below
-        }
-    }
-
-    // Catch-all route for the WHOLE overlay subnet → tun, not just per-peer /32s.
-    // Traffic to an unallocated overlay IP (e.g..1 with no peer) is then dropped by
-    // wg ("no peer matches") instead of LEAKING out the physical default route — these
-    // addresses live in the 100.64/10 CGNAT range, which the ISP may actually answer,
-    // giving a false "connected" ping. Mirrors the Linux wg-quick connected route +
-    // Tailscale "owning" its CGNAT range; macOS utun is point-to-point so it isn't
-    // auto-created. A more-specific peer /32 still wins. Never 0.0.0.0/0 (prefix 0).
-    if cfg.prefix_len > 0 && cfg.prefix_len <= 32 {
-        let mask: u32 = u32::MAX << (32 - cfg.prefix_len);
-        let net = Ipv4Addr::from(u32::from(r.own_addr) & mask);
-        route_replace(&format!("{net}/{}", cfg.prefix_len), &dev_name);
-    }
-
-    // --- Exit node (full-tunnel): if any peer routes 0.0.0.0/0, send the default
-    // over the tun (split-default) + bypass the wg carrier, local LAN, control-
-    // server and user excludes via the physical gateway + DNS = the exit's
-    // overlay (its gateway), per the WireGuard exit-node model. ---
     let control_host = {
         let ch = url_host(&cfg.control_server);
         ch.split(':').next().unwrap_or(&ch).to_string()
     };
     let relay_ips: Vec<String> = relay_targets.iter().map(|rt| rt.addr.ip().to_string()).collect();
-    // Initial pass (an exit peer already present at startup); the Reconciler then
-    // re-applies/tears down live as 0.0.0.0/0 is approved/removed.
-    let exit_state: ExitState = Arc::new(parking_lot::Mutex::new(apply_exit(
-        &r.peers,
-        &dev_name,
-        &control_host,
-        &relay_ips,
-        &cfg.exclude_routes,
-        &eff_dns,
-    )));
+
+    // Host route/DNS/exit setup — ONLY when we own the device. With an injected fd
+    // (mobile VpnService) the OS already installed the address, routes (incl. any
+    // 0.0.0.0/0 full-tunnel), MTU and DNS; touching them from here would fail or
+    // fight the platform. The data plane below is identical — the phone is a full
+    // peer (disco/relay/multi-peer/exit-as-a-peer), just without host-side routing.
+    let exit_state: ExitState = if embedded {
+        tracing::info!("adopted external tun fd (mobile VpnService); platform owns routes/DNS/exit");
+        Arc::new(parking_lot::Mutex::new(None))
+    } else {
+        apply_dns(&eff_dns, &dev_name);
+        for p in &r.peers {
+            for cidr in &p.allowed_ips {
+                route_replace(cidr, &dev_name); // 0.0.0.0/0 is skipped — handled by apply_exit
+            }
+        }
+        // Catch-all route for the WHOLE overlay subnet → tun, not just per-peer /32s.
+        // Traffic to an unallocated overlay IP (e.g..1 with no peer) is then dropped by
+        // wg ("no peer matches") instead of LEAKING out the physical default route — these
+        // addresses live in the 100.64/10 CGNAT range, which the ISP may actually answer,
+        // giving a false "connected" ping. Mirrors the Linux wg-quick connected route +
+        // Tailscale "owning" its CGNAT range; macOS utun is point-to-point so it isn't
+        // auto-created. A more-specific peer /32 still wins. Never 0.0.0.0/0 (prefix 0).
+        if cfg.prefix_len > 0 && cfg.prefix_len <= 32 {
+            let mask: u32 = u32::MAX << (32 - cfg.prefix_len);
+            let net = Ipv4Addr::from(u32::from(r.own_addr) & mask);
+            route_replace(&format!("{net}/{}", cfg.prefix_len), &dev_name);
+        }
+        // Exit node (full-tunnel): if any peer routes 0.0.0.0/0, send the default over
+        // the tun (split-default) + bypass the wg carrier/LAN/control/relay + DNS = the
+        // exit's overlay, per the WireGuard exit-node model. Reconciler re-applies live.
+        Arc::new(parking_lot::Mutex::new(apply_exit(
+            &r.peers,
+            &dev_name,
+            &control_host,
+            &relay_ips,
+            &cfg.exclude_routes,
+            &eff_dns,
+        )))
+    };
     // Exit SIDE: if this device is configured as an exit node, enable IPv4
     // forwarding + NAT masquerade so peers' 0.0.0.0/0 traffic actually egresses.
     let exit_gateway_phys: Option<String> = if cfg.exit_node {

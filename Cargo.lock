@@ -1113,6 +1113,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fp-node-mobile-sys"
+version = "0.1.0"
+dependencies = [
+ "fluxpeer-node",
+ "jni",
+ "parking_lot",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "fp-node-server-sys"
 version = "2.2.5"
 dependencies = [

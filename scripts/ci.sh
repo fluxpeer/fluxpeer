@@ -54,6 +54,10 @@ if [ "$(uname -s)" = "Linux" ]; then
   if [ "$(id -u)" = 0 ] || sudo -n true 2>/dev/null; then
     if cargo build --release -p fluxpeer; then
       FLUXPEER_BIN="$PWD/target/release/fluxpeer" stage "netns e2e regression" scripts/regression-netns.sh
+      # Multi-peer mesh (≥3 nodes, each holds ≥2 peers): the ONLY stage that catches
+      # receiver-index desync across workers / reconcile endpoint churn — invisible
+      # in the 2-node test above.
+      FLUXPEER_BIN="$PWD/target/release/fluxpeer" stage "multi-peer mesh regression (N=5)" scripts/regression-mesh-netns.sh
     else
       stage "netns e2e regression (release build)" false
     fi
