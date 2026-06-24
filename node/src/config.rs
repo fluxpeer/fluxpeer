@@ -12,6 +12,12 @@ pub(crate) struct Config {
     pub(crate) device_id: String,
     /// Control-server base URL, e.g. `http://192.168.31.136:8090`.
     pub(crate) control_server: String,
+    /// Per-device auth token issued at enroll, sent as the bearer on this device's
+    /// control-server calls (config pull / endpoint report / route advertise). The
+    /// server rejects device calls without it, so it must be present for any device
+    /// enrolled after per-device auth landed.
+    #[serde(default)]
+    pub(crate) auth_token: Option<String>,
     /// UDP port to bind for the tunnel (also the advertised endpoint port).
     pub(crate) listen_port: u16,
     /// TUN interface name (e.g. "fp0").

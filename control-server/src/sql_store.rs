@@ -125,7 +125,11 @@ impl SqlStore {
         Ok(invite)
     }
 
-    pub async fn enroll(&self, invite_code: &str, name: &str, wg_public_key: &str, now: i64) -> Result<Device> {
+    /// Redeem an invite and enroll a device. Returns the device AND a freshly-issued
+    /// per-device auth token — the device's only credential for its own config read /
+    /// endpoint writes (so a guessable `dev-N` id is no longer authority). The token
+    /// is returned ONCE here and never echoed by any other endpoint.
+    pub async fn enroll(&self, invite_code: &str, name: &str, wg_public_key: &str, now: i64) -> Result<(Device, String)> {
         let invite = db::get_invite(&self.pool, invite_code)
             .await?
             .ok_or(SqlStoreError::InvalidInvite)?;
@@ -146,10 +150,17 @@ impl SqlStore {
             address_v6: Some(v6.to_string()),
             status: DeviceStatus::Active,
         };
+        let token = crate::auth::random_hex(32);
         db::insert_device(&self.pool, &device).await?;
+        db::set_device_token(&self.pool, &device.id, &token).await?;
         db::incr_invite_uses(&self.pool, invite_code).await?;
         self.bump_and_notify(&net.id).await?;
-        Ok(device)
+        Ok((device, token))
+    }
+
+    /// A device's enroll-issued auth token (None if unknown or pre-token).
+    pub async fn device_token(&self, device_id: &str) -> Result<Option<String>> {
+        Ok(db::get_device_token(&self.pool, device_id).await?)
     }
 
     /// Lowest-free dual-stack address in the device range, derived from the
@@ -548,11 +559,11 @@ mod test {
         let net = s.create_network("home").await.unwrap();
         let inv = s.create_invite(&net.id, None, Some(5)).await.unwrap();
 
-        let d1 = s.enroll(&inv.code, "laptop", "k1", 1000).await.unwrap();
+        let (d1, _) = s.enroll(&inv.code, "laptop", "k1", 1000).await.unwrap();
         assert_eq!(d1.address_v4.as_deref(), Some("100.72.16.100"));
         assert_eq!(d1.address_v6.as_deref(), Some("fd72:15ab:0:1::64"));
 
-        let d2 = s.enroll(&inv.code, "phone", "k2", 1000).await.unwrap();
+        let (d2, _) = s.enroll(&inv.code, "phone", "k2", 1000).await.unwrap();
         assert_eq!(d2.address_v4.as_deref(), Some("100.72.16.101"));
 
         // config of d1 lists d2 as a peer
@@ -564,7 +575,7 @@ mod test {
         // revoke d2 → freed addr reused, d2 cut off
         s.revoke_device(&d2.id).await.unwrap();
         assert!(s.device_config(&d2.id).await.is_err());
-        let d3 = s.enroll(&inv.code, "tablet", "k3", 1000).await.unwrap();
+        let (d3, _) = s.enroll(&inv.code, "tablet", "k3", 1000).await.unwrap();
         assert_eq!(d3.address_v4.as_deref(), Some("100.72.16.101")); // recycled
         assert_eq!(s.list_devices(&net.id).await.unwrap().len(), 3); // soft-delete keeps rows
     }
@@ -576,8 +587,8 @@ mod test {
             .unwrap();
         let net = s.create_network("home").await.unwrap();
         let inv = s.create_invite(&net.id, None, None).await.unwrap();
-        let a = s.enroll(&inv.code, "A", "kA", 1000).await.unwrap();
-        let b = s.enroll(&inv.code, "B", "kB", 1000).await.unwrap();
+        let (a, _) = s.enroll(&inv.code, "A", "kA", 1000).await.unwrap();
+        let (b, _) = s.enroll(&inv.code, "B", "kB", 1000).await.unwrap();
 
         // before B reports, A sees no endpoints for peer B
         let cfg = s.device_config(&a.id).await.unwrap();
@@ -598,7 +609,7 @@ mod test {
             .unwrap();
         let net = s.create_network("home").await.unwrap();
         let inv = s.create_invite(&net.id, None, None).await.unwrap();
-        let a = s.enroll(&inv.code, "A", "kA", 1000).await.unwrap();
+        let (a, _) = s.enroll(&inv.code, "A", "kA", 1000).await.unwrap();
 
         // shared/official relay (anytls, STUN defaults to url) + a network-scoped one
         let shared = s

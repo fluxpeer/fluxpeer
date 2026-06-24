@@ -32,6 +32,16 @@ fn post(uri: &str, body: Value) -> Request<Body> {
         .unwrap()
 }
 
+// A device pulling its own config presents its enroll-issued auth token (NOT the
+// admin password) — the open `/devices/:id/*` routes are now per-device gated.
+fn get_dev(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
 fn del(uri: &str) -> Request<Body> {
     Request::builder()
         .method("DELETE")
@@ -103,17 +113,29 @@ async fn persistent_http_enroll_loop_on_sqlite() {
         ))
         .await
         .unwrap();
-    let d2_id = body_json(resp).await["id"].as_str().unwrap().to_string();
+    let d2 = body_json(resp).await;
+    let d2_id = d2["id"].as_str().unwrap().to_string();
 
-    // config of d1 sees d2 as a peer (read back from DB)
+    // config of d1 sees d2 as a peer (read back from DB) — authed with d1's token
     let resp = app
         .clone()
-        .oneshot(get(&format!("/api/v1/devices/{}/config", d1["id"].as_str().unwrap())))
+        .oneshot(get_dev(
+            &format!("/api/v1/devices/{}/config", d1["id"].as_str().unwrap()),
+            d1["auth_token"].as_str().unwrap(),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let cfg = body_json(resp).await;
     assert_eq!(cfg["peers"].as_array().unwrap().len(), 1);
+
+    // a device pulling config WITHOUT its token is now rejected (the IDOR fix)
+    let resp = app
+        .clone()
+        .oneshot(get(&format!("/api/v1/devices/{}/config", d1["id"].as_str().unwrap())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // revoke d2 → its config is cut off (404)
     let resp = app
@@ -124,7 +146,10 @@ async fn persistent_http_enroll_loop_on_sqlite() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let resp = app
         .clone()
-        .oneshot(get(&format!("/api/v1/devices/{d2_id}/config")))
+        .oneshot(get_dev(
+            &format!("/api/v1/devices/{d2_id}/config"),
+            d2["auth_token"].as_str().unwrap(),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
