@@ -22,6 +22,7 @@ members = [
     "engine/core/fp-node-core",
     "engine/sys/fp-node-server-sys",
     "engine/sys/fp-node-client-sys",
+    "engine/sys/fp-node-mobile-sys",
     # services
     "control-server",
     "cli",

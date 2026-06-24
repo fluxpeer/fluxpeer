@@ -66,8 +66,14 @@ done
 OUT="../fluxpeer-app/android/app/src/main/jniLibs"
 mkdir -p "$OUT"
 
-echo "→ building fp-node-client-sys ($PROFILE) for: $ABIS"
-cargo ndk "${NDK_ARGS[@]}" -o "$OUT" build --manifest-path Cargo.toml $PROFILE_FLAG -p fp-node-client-sys || exit 1
+# fp-node-mobile-sys = the FULL node engine (data plane: disco/relay/multi-peer/exit
+# as a peer); fp-node-client-sys = the legacy two-phase dispatcher, still used for
+# enroll/keygen. Both ship in jniLibs.
+for crate in fp-node-mobile-sys fp-node-client-sys; do
+  echo "→ building $crate ($PROFILE) for: $ABIS"
+  cargo ndk "${NDK_ARGS[@]}" -o "$OUT" build --manifest-path Cargo.toml $PROFILE_FLAG -p "$crate" || exit 1
+done
 
 echo "✓ jniLibs:"
-find "$OUT" -name 'libfp_node_client_sys.so' -exec sh -c 'echo "    $1 ($(du -h "$1" | cut -f1))"' _ {} \;
+find "$OUT" \( -name 'libfp_node_client_sys.so' -o -name 'libfp_node_mobile_sys.so' \) \
+  -exec sh -c 'echo "    $1 ($(du -h "$1" | cut -f1))"' _ {} \;

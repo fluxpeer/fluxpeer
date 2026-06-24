@@ -38,16 +38,23 @@ pub async fn serve_from_env() -> Result<(), Box<dyn std::error::Error>> {
     }
     let server = Arc::new(RelayServer::new(cfg, Arc::new(AllowAll::default())));
 
-    if let Some(stun_addr) = std::env::var("FLUXPEER_RELAY_STUN_ADDR")
+    // The relay DOUBLES AS the STUN responder: the control-server advertises a
+    // relay's URL as its STUN server by default (see `register_relay`,
+    // `stun_url.or(url)`), so the responder must run by default too — else a
+    // happy-path self-host advertises a STUN endpoint that nothing answers, NATed
+    // peers (notably phones) never learn their reflexive address, and they can't be
+    // reached inbound → no stable direct path, permanent relay flap. STUN is UDP and
+    // the relay protocol is TCP, so they coexist on the same `addr`. The env var only
+    // OVERRIDES the bind addr (e.g. to expose STUN on a different port).
+    let stun_addr = std::env::var("FLUXPEER_RELAY_STUN_ADDR")
         .ok()
         .and_then(|s| s.parse::<SocketAddr>().ok())
-    {
-        tokio::spawn(async move {
-            if let Err(e) = crate::stun::serve_stun(stun_addr).await {
-                tracing::error!(error = %e, "STUN responder stopped");
-            }
-        });
-    }
+        .unwrap_or(addr);
+    tokio::spawn(async move {
+        if let Err(e) = crate::stun::serve_stun(stun_addr).await {
+            tracing::error!(error = %e, "STUN responder stopped");
+        }
+    });
     if let Some(tls_addr) = std::env::var("FLUXPEER_RELAY_ANYTLS_ADDR")
         .ok()
         .and_then(|s| s.parse::<SocketAddr>().ok())
