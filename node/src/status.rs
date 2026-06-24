@@ -9,10 +9,11 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
+use portable_atomic::AtomicU64;
 
 // Transport rung (the ladder) — what wg can't express.
 pub(crate) const T_NONE: u8 = 0;

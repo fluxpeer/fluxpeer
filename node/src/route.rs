@@ -6,7 +6,13 @@ use std::process::Command;
 
 /// Normalize a host or CIDR to a CIDR (`1.2.3.4` → `1.2.3.4/32`).
 fn cidr(s: &str) -> String {
-    if s.contains('/') { s.to_string() } else if s.contains(':') { format!("{s}/128") } else { format!("{s}/32") }
+    if s.contains('/') {
+        s.to_string()
+    } else if s.contains(':') {
+        format!("{s}/128")
+    } else {
+        format!("{s}/32")
+    }
 }
 
 /// Connected route for `cidr` over the tun device. A default route (`0.0.0.0/0` /
@@ -19,7 +25,9 @@ pub(crate) fn route_replace(cidr: &str, dev: &str) {
     #[cfg(target_os = "macos")]
     {
         let _ = Command::new("route").args(["-n", "delete", "-net", cidr]).status();
-        let _ = Command::new("route").args(["-n", "add", "-net", cidr, "-interface", dev]).status();
+        let _ = Command::new("route")
+            .args(["-n", "add", "-net", cidr, "-interface", dev])
+            .status();
     }
     #[cfg(not(target_os = "macos"))]
     let _ = Command::new("ip").args(["route", "replace", cidr, "dev", dev]).status();
@@ -52,7 +60,9 @@ pub(crate) fn bypass_add(dst: &str, gateway: &str, phys: &str) {
         let _ = Command::new("route").args(["-n", "add", "-net", &d, gateway]).status();
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = Command::new("ip").args(["route", "replace", &d, "via", gateway, "dev", phys]).status();
+    let _ = Command::new("ip")
+        .args(["route", "replace", &d, "via", gateway, "dev", phys])
+        .status();
 }
 
 pub(crate) fn bypass_del(dst: &str) {
@@ -70,14 +80,19 @@ pub(crate) fn default_gateway() -> Option<String> {
     {
         let out = Command::new("route").args(["-n", "get", "default"]).output().ok()?;
         let s = String::from_utf8_lossy(&out.stdout);
-        s.lines().find_map(|l| l.trim().strip_prefix("gateway:").map(|g| g.trim().to_string()))
+        s.lines()
+            .find_map(|l| l.trim().strip_prefix("gateway:").map(|g| g.trim().to_string()))
     }
     #[cfg(not(target_os = "macos"))]
     {
         let out = Command::new("ip").args(["route", "show", "default"]).output().ok()?;
         let s = String::from_utf8_lossy(&out.stdout);
         let parts: Vec<&str> = s.split_whitespace().collect();
-        parts.iter().position(|w| *w == "via").and_then(|i| parts.get(i + 1)).map(|g| g.to_string())
+        parts
+            .iter()
+            .position(|w| *w == "via")
+            .and_then(|i| parts.get(i + 1))
+            .map(|g| g.to_string())
     }
 }
 
@@ -108,14 +123,19 @@ pub(crate) fn physical_iface() -> Option<String> {
     {
         let out = Command::new("route").args(["-n", "get", "default"]).output().ok()?;
         let s = String::from_utf8_lossy(&out.stdout);
-        s.lines().find_map(|l| l.trim().strip_prefix("interface:").map(|i| i.trim().to_string()))
+        s.lines()
+            .find_map(|l| l.trim().strip_prefix("interface:").map(|i| i.trim().to_string()))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let out = Command::new("ip").args(["route", "show", "default"]).output().ok()?;
         let s = String::from_utf8_lossy(&out.stdout);
         let parts: Vec<&str> = s.split_whitespace().collect();
-        parts.iter().position(|w| *w == "dev").and_then(|i| parts.get(i + 1)).map(|d| d.to_string())
+        parts
+            .iter()
+            .position(|w| *w == "dev")
+            .and_then(|i| parts.get(i + 1))
+            .map(|d| d.to_string())
     }
     #[cfg(target_os = "windows")]
     {
@@ -149,7 +169,14 @@ pub(crate) fn exit_up(dev: &str, gateway: &str, phys: &str, bypass: &[String], d
     if let Some(d) = dns {
         set_dns(dev, d);
     }
-    tracing::info!(dev, gateway, phys, bypass = bypass.len(), dns, "exit-node (full-tunnel) UP");
+    tracing::info!(
+        dev,
+        gateway,
+        phys,
+        bypass = bypass.len(),
+        dns,
+        "exit-node (full-tunnel) UP"
+    );
 }
 
 /// Tear down full-tunnel: remove the split-default + bypass routes + reset DNS.
@@ -164,48 +191,34 @@ pub(crate) fn exit_down(dev: &str, bypass: &[String]) {
     tracing::info!(dev, "exit-node (full-tunnel) DOWN");
 }
 
-/// Exit SIDE: enable IPv4 forwarding + NAT masquerade out `phys` so traffic from
-/// peers routing 0.0.0.0/0 through us reaches the internet. Linux only (the common
-/// exit-node platform); idempotent.
+/// Exit SIDE: enable IPv4+IPv6 forwarding + NAT masquerade out `phys` so traffic from
+/// peers routing 0.0.0.0/0 (or ::/0) through us reaches the internet. Linux only (the
+/// common exit-node platform); idempotent on both stacks.
 pub(crate) fn exit_gateway_up(phys: &str, tun: &str, overlay_cidr: &str) {
     #[cfg(target_os = "linux")]
     {
         let _ = overlay_cidr; // Linux masquerades by egress iface, not by source subnet.
-        let _ = Command::new("sysctl").args(["-w", "net.ipv4.ip_forward=1"]).status();
-        // Append a rule only if not already present (idempotent). `table` is the
-        // optional table flag (must precede the -C/-A command), `rule` the chain+spec.
-        let ensure = |table: &[&str], add_op: &str, rule: &[&str]| {
-            let cmd = |op: &str| {
-                let mut a: Vec<&str> = table.to_vec();
-                a.push(op);
-                a.extend_from_slice(rule);
-                Command::new("iptables").args(&a).status().map(|s| s.success()).unwrap_or(false)
-            };
-            if !cmd("-C") {
-                let _ = cmd(add_op);
-            }
-        };
-        ensure(&["-t", "nat"], "-A", &["POSTROUTING", "-o", phys, "-j", "MASQUERADE"]);
-        // The host FORWARD policy may be DROP with rules ABOVE ours (docker/podman) —
-        // INSERT at the top so the tun's forwarded traffic is accepted both ways,
-        // else peers' 0.0.0.0/0 traffic is dropped.
-        ensure(&[], "-I", &["FORWARD", "-i", tun, "-j", "ACCEPT"]);
-        ensure(&[], "-I", &["FORWARD", "-o", tun, "-j", "ACCEPT"]);
-        tracing::info!(phys, tun, "exit-node GATEWAY up (ip_forward + masquerade + forward)");
+        crate::firewall::detect().up(phys, tun);
     }
     #[cfg(target_os = "windows")]
     {
         let _ = phys; // WinNAT masquerades out the system's default route automatically.
         // Enable IPv4 forwarding so peer traffic transits the box; simplest is to set
         // it on every v4 interface (the tun must forward; the egress iface too).
-        win_ps(&format!("Set-NetIPInterface -InterfaceAlias '{tun}' -Forwarding Enabled -ErrorAction SilentlyContinue"));
-        win_ps("Get-NetIPInterface -AddressFamily IPv4 | Set-NetIPInterface -Forwarding Enabled -ErrorAction SilentlyContinue");
+        win_ps(&format!(
+            "Set-NetIPInterface -InterfaceAlias '{tun}' -Forwarding Enabled -ErrorAction SilentlyContinue"
+        ));
+        win_ps(
+            "Get-NetIPInterface -AddressFamily IPv4 | Set-NetIPInterface -Forwarding Enabled -ErrorAction SilentlyContinue",
+        );
         // WinNAT (Windows 10+ built-in): masquerade the overlay subnet out the default
         // route. The winnat driver service defaults to manual/stopped — start it first.
         // Idempotent: drop any stale instance of our NAT before recreating it.
         win_ps("Start-Service winnat -ErrorAction SilentlyContinue");
         win_ps("Remove-NetNat -Name fluxpeer-exit -Confirm:$false -ErrorAction SilentlyContinue");
-        win_ps(&format!("New-NetNat -Name fluxpeer-exit -InternalIPInterfaceAddressPrefix '{overlay_cidr}' -ErrorAction SilentlyContinue"));
+        win_ps(&format!(
+            "New-NetNat -Name fluxpeer-exit -InternalIPInterfaceAddressPrefix '{overlay_cidr}' -ErrorAction SilentlyContinue"
+        ));
         tracing::info!(tun, overlay_cidr, "exit-node GATEWAY up (WinNAT + forwarding)");
     }
     #[cfg(target_os = "macos")]
@@ -261,7 +274,11 @@ static PF_ENABLED_BY_US: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 #[cfg(target_os = "macos")]
 fn pfctl_load(ruleset: &str) {
     use std::io::Write;
-    if let Ok(mut c) = Command::new("pfctl").args(["-f", "-"]).stdin(std::process::Stdio::piped()).spawn() {
+    if let Ok(mut c) = Command::new("pfctl")
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
         if let Some(si) = c.stdin.as_mut() {
             let _ = si.write_all(ruleset.as_bytes());
         }
@@ -283,9 +300,7 @@ fn win_ps(script: &str) {
 pub(crate) fn exit_gateway_down(phys: &str, tun: &str) {
     #[cfg(target_os = "linux")]
     {
-        let _ = Command::new("iptables").args(["-D", "POSTROUTING", "-t", "nat", "-o", phys, "-j", "MASQUERADE"]).status();
-        let _ = Command::new("iptables").args(["-D", "FORWARD", "-i", tun, "-j", "ACCEPT"]).status();
-        let _ = Command::new("iptables").args(["-D", "FORWARD", "-o", tun, "-j", "ACCEPT"]).status();
+        crate::firewall::detect().down(phys, tun);
     }
     #[cfg(target_os = "windows")]
     {
@@ -296,9 +311,11 @@ pub(crate) fn exit_gateway_down(phys: &str, tun: &str) {
     {
         let _ = (phys, tun);
         // Flush our anchor + restore the system default ruleset (drops our nat-anchor),
-        // then remove the anchor file. Leave pf enabled + ip.forwarding as-is (mirrors
-        // the Linux path, which doesn't reset ip_forward).
-        let _ = Command::new("pfctl").args(["-a", "fluxpeer-exit", "-F", "nat"]).status();
+        // then remove the anchor file. Leave ip.forwarding as-is (macOS is rarely an exit
+        // node); pf itself is turned back off below only if we were the ones to enable it.
+        let _ = Command::new("pfctl")
+            .args(["-a", "fluxpeer-exit", "-F", "nat"])
+            .status();
         let _ = Command::new("pfctl").args(["-f", "/etc/pf.conf"]).status();
         let _ = std::fs::remove_file("/etc/pf.anchors/fluxpeer-exit");
         // If pf was disabled before we turned it on, turn it back off (leave no trace).
@@ -316,9 +333,8 @@ pub(crate) fn exit_gateway_down(phys: &str, tun: &str) {
 fn set_dns(dev: &str, dns: &str) {
     #[cfg(target_os = "macos")]
     {
-        let script = format!(
-            "d.init\nd.add ServerAddresses * {dns}\nset State:/Network/Service/fluxpeer-{dev}/DNS\nquit\n"
-        );
+        let script =
+            format!("d.init\nd.add ServerAddresses * {dns}\nset State:/Network/Service/fluxpeer-{dev}/DNS\nquit\n");
         use std::io::Write;
         if let Ok(mut c) = Command::new("scutil").stdin(std::process::Stdio::piped()).spawn() {
             if let Some(si) = c.stdin.as_mut() {
@@ -329,24 +345,15 @@ fn set_dns(dev: &str, dns: &str) {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let ok = Command::new("resolvectl")
-            .args(["dns", dev, dns])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            let _ = Command::new("resolvectl").args(["domain", dev, "~."]).status();
-            tracing::info!(dev, dns, "exit DNS via resolvectl");
-        } else {
-            let _ = std::fs::write("/etc/resolv.conf", format!("# fluxpeer exit-node\nnameserver {dns}\n"));
-            tracing::info!(dns, "exit DNS via /etc/resolv.conf");
-        }
+        crate::dns::detect_for_iface(Some(dev)).set(dns);
     }
     #[cfg(windows)]
     {
         // Point the tun adapter's DNS at the exit gateway. The low interface metric
         // set during route setup makes Windows prefer this adapter's resolver.
-        win_ps(&format!("Set-DnsClientServerAddress -InterfaceAlias '{dev}' -ServerAddresses '{dns}' -ErrorAction SilentlyContinue"));
+        win_ps(&format!(
+            "Set-DnsClientServerAddress -InterfaceAlias '{dev}' -ServerAddresses '{dns}' -ErrorAction SilentlyContinue"
+        ));
         tracing::info!(dev, dns, "exit DNS via Set-DnsClientServerAddress");
     }
 }
@@ -363,6 +370,10 @@ fn reset_dns(dev: &str) {
             let _ = c.wait();
         }
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = Command::new("resolvectl").args(["revert", dev]).status();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    crate::dns::detect_for_iface(Some(dev)).clear();
+    #[cfg(windows)]
+    win_ps(&format!(
+        "Set-DnsClientServerAddress -InterfaceAlias '{dev}' -ResetServerAddresses -ErrorAction SilentlyContinue"
+    ));
 }

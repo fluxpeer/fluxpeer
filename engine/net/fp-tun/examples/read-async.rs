@@ -35,9 +35,7 @@ async fn main() {
             Ok(pkt) => {
                 // std::io::copy(&mut pkt.get_bytes(),&mut buf );
                 let buf = pkt.get_bytes();
-                // println!("pkt: {:#?}", buf);
                 println!("pkt: {:#?}", Packet::unchecked(buf));
-                // println!("pkt: len {}",buf.len());
             }
             Err(err) => panic!("Error: {:?}", err),
         }

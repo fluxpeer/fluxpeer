@@ -23,14 +23,12 @@ struct JoinToken {
 
 /// Decode `fp://join/<b64url>` (or a bare base64url blob) into its `(ctrl, code)`.
 fn decode_token(token: &str) -> std::io::Result<JoinToken> {
-    let blob = token
-        .trim()
-        .strip_prefix("fp://join/")
-        .unwrap_or_else(|| token.trim());
+    let blob = token.trim().strip_prefix("fp://join/").unwrap_or_else(|| token.trim());
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(blob.trim_end_matches('='))
         .map_err(|e| Error::other(format!("invalid join token (base64): {e}")))?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| Error::other(format!("invalid join token (json): {e}")))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| Error::other(format!("invalid join token (json): {e}")))?;
     let ctrl = v["ctrl"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -71,10 +69,11 @@ pub(crate) async fn enroll_and_write(
     let JoinToken { ctrl, code } = decode_token(token)?;
     let name = name.unwrap_or_else(default_name);
 
-    let (priv_hex, pub_hex) = keypair();
+    // enroll derives the public key + ECDH proof-of-possession from the private key.
+    let (priv_hex, _pub_hex) = keypair();
     let client = Client::new(ctrl.clone());
     let dev = client
-        .enroll(&code, &name, &pub_hex)
+        .enroll(&code, &name, &priv_hex)
         .await
         .map_err(|e| Error::other(format!("enroll failed: {e:#}")))?;
     let device_id = dev["id"]
@@ -108,12 +107,19 @@ pub(crate) async fn enroll_and_write(
         Ok(()) => path,
         Err(e) => {
             let alt = PathBuf::from("fluxpeer-node.json");
-            eprintln!("! could not write {} ({e}); falling back to {}", path.display(), alt.display());
+            eprintln!(
+                "! could not write {} ({e}); falling back to {}",
+                path.display(),
+                alt.display()
+            );
             write_config(&alt, &cfg)?;
             alt
         }
     };
-    println!("✓ enrolled as \"{name}\" — device {device_id}, overlay {addr}; config {}", path.display());
+    println!(
+        "✓ enrolled as \"{name}\" — device {device_id}, overlay {addr}; config {}",
+        path.display()
+    );
     Ok((path, tun_name))
 }
 
@@ -125,7 +131,10 @@ pub async fn join(token: &str, name: Option<String>, out: Option<String>, no_run
 
     // bring the tunnel up (default), unless asked not to.
     if no_run {
-        println!("Config ready. Run this network:  sudo fluxpeer node run {}", path.display());
+        println!(
+            "Config ready. Run this network:  sudo fluxpeer node run {}",
+            path.display()
+        );
         println!("Or run ALL your networks at once:  sudo fluxpeer up");
         return Ok(());
     }
@@ -152,7 +161,10 @@ pub(crate) fn assign_slot(dir: &std::path::Path) -> (PathBuf, String, u16) {
         for e in rd.flatten() {
             if let Ok(s) = std::fs::read_to_string(e.path())
                 && let Ok(v) = serde_json::from_str::<serde_json::Value>(&s)
-                && let Some(n) = v["tun_name"].as_str().and_then(|t| t.strip_prefix("fp")).and_then(|x| x.parse::<u32>().ok())
+                && let Some(n) = v["tun_name"]
+                    .as_str()
+                    .and_then(|t| t.strip_prefix("fp"))
+                    .and_then(|x| x.parse::<u32>().ok())
             {
                 used.insert(n);
             }

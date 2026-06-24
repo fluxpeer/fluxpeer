@@ -4,20 +4,20 @@
 //! kernel netlink). We expose the same idea at `/run/fluxpeer/<iface>.sock`:
 //!
 //! - `get=1\n\n` → the **wg UAPI** get format (hex keys, rx/tx/handshake), so the
-//! stock `wg` tool works against a fluxpeer iface;
+//!   stock `wg` tool works against a fluxpeer iface;
 //! - anything else → richer **fluxpeer JSON** (adds transport rung + rtt), which
-//! `fluxpeer show` formats.
+//!   `fluxpeer show` formats.
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
-use tokio::net::UnixListener;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(windows)]
 use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 
 use crate::status::{self, StatusRegistry};
 
@@ -25,9 +25,16 @@ use crate::status::{self, StatusRegistry};
 /// (`/run/fluxpeer`, `/tmp` fallback); Windows uses `%LOCALAPPDATA%\fluxpeer`.
 pub(crate) fn status_dir() -> PathBuf {
     #[cfg(unix)]
-    return PathBuf::from(if std::path::Path::new("/run").is_dir() { "/run/fluxpeer" } else { "/tmp/fluxpeer" });
+    return PathBuf::from(if std::path::Path::new("/run").is_dir() {
+        "/run/fluxpeer"
+    } else {
+        "/tmp/fluxpeer"
+    });
     #[cfg(windows)]
-    return std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("fluxpeer");
+    return std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("fluxpeer");
 }
 
 /// Per-interface status endpoint. Unix: a `<iface>.sock` unix socket (wg's UAPI
@@ -71,7 +78,19 @@ pub(crate) async fn serve(
         tracing::info!(path = %sock_path.display(), "status socket up (fluxpeer show / wg-uapi)");
         loop {
             match listener.accept().await {
-                Ok((stream, _)) => handle(stream, &reg, &own_priv_hex, &own_pub_hex, &iface, listen_port, address, &control_server).await,
+                Ok((stream, _)) => {
+                    handle(
+                        stream,
+                        &reg,
+                        &own_priv_hex,
+                        &own_pub_hex,
+                        &iface,
+                        listen_port,
+                        address,
+                        &control_server,
+                    )
+                    .await
+                }
                 Err(_) => continue,
             }
         }
@@ -92,7 +111,19 @@ pub(crate) async fn serve(
         tracing::info!(path = %sock_path.display(), port, "status listener up (fluxpeer show / wg-uapi)");
         loop {
             match listener.accept().await {
-                Ok((stream, _)) => handle(stream, &reg, &own_priv_hex, &own_pub_hex, &iface, listen_port, address, &control_server).await,
+                Ok((stream, _)) => {
+                    handle(
+                        stream,
+                        &reg,
+                        &own_priv_hex,
+                        &own_pub_hex,
+                        &iface,
+                        listen_port,
+                        address,
+                        &control_server,
+                    )
+                    .await
+                }
                 Err(_) => continue,
             }
         }

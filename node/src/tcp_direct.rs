@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 /// TCP-direct channel facts the main loop needs: inbound `(peer pubkey, wg)` and
@@ -103,7 +103,7 @@ pub(crate) async fn tcp_direct_manager(
     in_tx: mpsc::Sender<([u8; 32], Vec<u8>)>,
     conn_tx: TcpConnTx,
 ) {
-    let gctr = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let gctr = std::sync::Arc::new(portable_atomic::AtomicU64::new(1));
     // Accept loop: a peer dialed us; read its pubkey, then pump.
     if let Ok(listener) = TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, listen_port))).await {
         let (in_tx, conn_tx, gctr) = (in_tx.clone(), conn_tx.clone(), gctr.clone());
@@ -112,6 +112,13 @@ pub(crate) async fn tcp_direct_manager(
                 let Ok((mut stream, _)) = listener.accept().await else {
                     continue;
                 };
+                // Mobile: exclude this accepted socket from the VPN tun so our
+                // replies egress the real interface (no-op off mobile).
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd;
+                    fp_transport::protect_fd(stream.as_raw_fd());
+                }
                 let (in_tx, conn_tx, gctr) = (in_tx.clone(), conn_tx.clone(), gctr.clone());
                 tokio::spawn(async move {
                     let mut pk = [0u8; 32];
@@ -141,7 +148,9 @@ pub(crate) async fn tcp_direct_manager(
             loop {
                 let mut connected = false;
                 for cand in &cands {
-                    let dial = tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(cand)).await;
+                    // Protect-before-connect (mobile): the direct egress socket must
+                    // leave on the real interface, not loop into the tun.
+                    let dial = tokio::time::timeout(Duration::from_secs(4), fp_transport::connect_tcp(*cand)).await;
                     let Ok(Ok(mut stream)) = dial else { continue };
                     if stream.write_all(&own_pub).await.is_err() {
                         continue;

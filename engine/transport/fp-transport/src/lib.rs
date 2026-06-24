@@ -7,6 +7,11 @@ pub use connector::{AcceptResponse, Connector, Listener, SenderAndReceiver, Tran
 mod raw_connector;
 pub use raw_connector::RawConnector;
 
+mod protect;
+pub use protect::{connect_tcp, protect_fd};
+#[cfg(unix)]
+pub use protect::{ProtectFn, set_protect};
+
 pub enum Event {
     Send(Vec<u8>),
     Close,

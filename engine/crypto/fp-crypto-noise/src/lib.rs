@@ -3,6 +3,20 @@
 pub mod crypto;
 pub use crypto::{Cryptor, peek_init_pubkey};
 
+/// Domain-separation label so the disco MAC subkey can never collide with the
+/// Noise handshake's own use of the same static-static DH secret.
+const DISCO_MAC_LABEL: &[u8] = b"fluxpeer-disco-mac-v1";
+
+/// Authenticate a fluxpeer disco datagram (a NAT-traversal ping/pong), which is
+/// exchanged BEFORE the wg session exists. Keyed by the two peers' static-static DH
+/// secret — symmetric and available as soon as both static public keys are known —
+/// so an off-path attacker can't forge a disco message that redirects a peer's path.
+/// Returns a 16-byte tag. Both peers derive the same key, hence the same tag.
+pub fn disco_mac(static_shared: &[u8; 32], data: &[u8]) -> [u8; 16] {
+    let subkey = handshake::b2s_hmac(static_shared, DISCO_MAC_LABEL);
+    handshake::b2s_keyed_mac_16(&subkey, data)
+}
+
 pub(crate) mod noise;
 use noise::{HandshakeInit, HandshakeResponse, Noise, NoiseResult, Packet, PacketData};
 

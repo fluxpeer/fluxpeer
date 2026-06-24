@@ -58,6 +58,10 @@ if [ "$(uname -s)" = "Linux" ]; then
       # receiver-index desync across workers / reconcile endpoint churn — invisible
       # in the 2-node test above.
       FLUXPEER_BIN="$PWD/target/release/fluxpeer" stage "multi-peer mesh regression (N=5)" scripts/regression-mesh-netns.sh
+      # Exit-node ↔ intranet reachability across every client-selected carrier
+      # (direct UDP, plain-TCP / AnyTLS-443 / bonded-TCP relay) — proves the exit
+      # forwarding path holds regardless of which transport the mesh hop picks.
+      FLUXPEER_BIN="$PWD/target/release/fluxpeer" stage "exit-node × transport e2e" scripts/e2e-exit-transport.sh
     else
       stage "netns e2e regression (release build)" false
     fi

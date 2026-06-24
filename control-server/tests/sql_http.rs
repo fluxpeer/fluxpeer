@@ -56,6 +56,46 @@ async fn body_json(resp: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+/// Deterministic wg keypair (hex public key) for a test seed.
+fn keypair(seed: u8) -> (fp_crypto::x25519::StaticSecret, String) {
+    use fp_crypto::x25519::{PublicKey, StaticSecret};
+    let sk = StaticSecret::from([seed; 32]);
+    (sk.clone(), hex::encode(PublicKey::from(&sk).to_bytes()))
+}
+
+/// Run enroll round-1 (challenge) and return the proof-of-possession fields the
+/// client sends in round-2: `(challenge_id, proof)`.
+async fn pop_fields(app: &axum::Router, sk: &fp_crypto::x25519::StaticSecret, pub_hex: &str) -> (String, String) {
+    use fp_crypto::x25519::PublicKey;
+    let resp = app
+        .clone()
+        .oneshot(post("/api/v1/enroll/challenge", json!({ "wg_public_key": pub_hex })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "challenge should succeed for a valid key");
+    let chal = body_json(resp).await;
+    let cid = chal["challenge_id"].as_str().unwrap().to_string();
+    let server_pub: [u8; 32] = hex::decode(chal["server_pub"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let proof = hex::encode(sk.diffie_hellman(&PublicKey::from(server_pub)).to_bytes());
+    (cid, proof)
+}
+
+/// Full two-round enroll with proof-of-possession; returns the HTTP response.
+async fn enroll_pop(app: &axum::Router, code: &str, name: &str, seed: u8) -> axum::response::Response {
+    let (sk, pub_hex) = keypair(seed);
+    let (cid, proof) = pop_fields(app, &sk, &pub_hex).await;
+    app.clone()
+        .oneshot(post(
+            "/api/v1/enroll",
+            json!({"invite_code": code, "name": name, "wg_public_key": pub_hex, "challenge_id": cid, "proof": proof}),
+        ))
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn persistent_http_enroll_loop_on_sqlite() {
     // Management routes are admin-gated; set the master bearer the helpers send.
@@ -92,27 +132,37 @@ async fn persistent_http_enroll_loop_on_sqlite() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let code = body_json(resp).await["code"].as_str().unwrap().to_string();
 
-    // enroll two devices (persisted; IP allocated from DB state)
+    // enroll without proof-of-possession is rejected (audit #11)
     let resp = app
         .clone()
         .oneshot(post(
             "/api/v1/enroll",
-            json!({"invite_code": code, "name": "a", "wg_public_key": "k1"}),
+            json!({"invite_code": code, "name": "a", "wg_public_key": keypair(1).1}),
         ))
         .await
         .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "enroll without PoP must be 401");
+
+    // a forged proof (right key, wrong DH) is rejected
+    let (sk1, pub1) = keypair(1);
+    let (cid, _good) = pop_fields(&app, &sk1, &pub1).await;
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/enroll",
+            json!({"invite_code": code, "name": "a", "wg_public_key": pub1, "challenge_id": cid, "proof": "00".repeat(32)}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "enroll with a forged proof must be 401");
+
+    // enroll two devices with valid proof-of-possession (persisted; IP from DB state)
+    let resp = enroll_pop(&app, &code, "a", 1).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let d1 = body_json(resp).await;
     assert_eq!(d1["address_v4"], "100.72.16.100");
 
-    let resp = app
-        .clone()
-        .oneshot(post(
-            "/api/v1/enroll",
-            json!({"invite_code": code, "name": "b", "wg_public_key": "k2"}),
-        ))
-        .await
-        .unwrap();
+    let resp = enroll_pop(&app, &code, "b", 2).await;
     let d2 = body_json(resp).await;
     let d2_id = d2["id"].as_str().unwrap().to_string();
 
@@ -129,13 +179,25 @@ async fn persistent_http_enroll_loop_on_sqlite() {
     let cfg = body_json(resp).await;
     assert_eq!(cfg["peers"].as_array().unwrap().len(), 1);
 
-    // a device pulling config WITHOUT its token is now rejected (the IDOR fix)
+    // a caller with NEITHER the device's token NOR admin creds is rejected (IDOR fix)
+    let resp = app
+        .clone()
+        .oneshot(get_dev(
+            &format!("/api/v1/devices/{}/config", d1["id"].as_str().unwrap()),
+            "not-the-right-token",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // an admin automation bearer (master key) MAY read any device's config — admins
+    // already see everything; only the unauthenticated-IDOR caller is the threat.
     let resp = app
         .clone()
         .oneshot(get(&format!("/api/v1/devices/{}/config", d1["id"].as_str().unwrap())))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), StatusCode::OK);
 
     // revoke d2 → its config is cut off (404)
     let resp = app
@@ -154,11 +216,13 @@ async fn persistent_http_enroll_loop_on_sqlite() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    // bad invite → 403
+    // bad invite → 403 (PoP passes, but the invite is rejected)
+    let (sk3, pub3) = keypair(3);
+    let (cid3, proof3) = pop_fields(&app, &sk3, &pub3).await;
     let resp = app
         .oneshot(post(
             "/api/v1/enroll",
-            json!({"invite_code": "nope", "name": "x", "wg_public_key": "k"}),
+            json!({"invite_code": "nope", "name": "x", "wg_public_key": pub3, "challenge_id": cid3, "proof": proof3}),
         ))
         .await
         .unwrap();

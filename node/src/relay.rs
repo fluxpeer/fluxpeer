@@ -7,7 +7,6 @@ use fluxpeer_relay_server::proto::Frame as RelayFrame;
 use fluxpeer_relay_server::server::RELAY_PROTOCOL_VERSION;
 use fp_transport::{TransportReceiver, TransportSender};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 /// Relay channels are keyed by peer pubkey so ONE relay connection multiplexes
@@ -37,7 +36,10 @@ where
     // `vec![0u8; len]` below would let it force a multi-GiB allocation (client OOM)
     // before any read. Mirror the server's own MAX_PACKET_SIZE+key cap.
     if len > fluxpeer_relay_server::proto::MAX_PACKET_SIZE + 64 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "relay ServerInfo frame too large"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "relay ServerInfo frame too large",
+        ));
     }
     rd.read_exact(&mut vec![0u8; len]).await?;
 
@@ -213,7 +215,9 @@ pub(crate) async fn dial_relay(t: &RelayTarget, own_pub: [u8; 32]) -> std::io::R
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             connect_relay_bonded(sender, receiver, own_pub).await
         } else {
-            let s = TcpStream::connect(t.addr).await?;
+            // Protect-before-connect (mobile): the relay egress socket must leave
+            // on the real interface, not loop into the VPN tun. No-op off mobile.
+            let s = fp_transport::connect_tcp(t.addr).await?;
             s.set_nodelay(true).ok();
             connect_relay(s, own_pub).await
         }

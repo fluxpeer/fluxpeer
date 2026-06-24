@@ -5,7 +5,7 @@
 //! standalone `control-server` / `relay-server` / `fp-node` / `fp` bins remain as
 //! thin wrappers over the same libs.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "fluxpeer", version, about = "fluxpeer — self-hosted mesh VPN, one binary")]
@@ -69,6 +69,18 @@ enum Cmd {
         #[arg(long)]
         no_run: bool,
     },
+    /// Hidden firewall backend self-test hook for task/e2e validation.
+    #[command(hide = true)]
+    FwSelftest {
+        #[command(subcommand)]
+        cmd: FwSelftestCmd,
+    },
+    /// Hidden DNS backend self-test hook for task/e2e validation.
+    #[command(hide = true)]
+    DnsSelftest {
+        #[command(subcommand)]
+        cmd: DnsSelftestCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -77,6 +89,68 @@ enum NodeCmd {
     Run { config: String },
     /// Print a fresh hex keypair.
     Keygen,
+    /// Set exit-node mode in all configs under a config directory.
+    SetExit {
+        state: ExitState,
+        #[arg(long)]
+        config_dir: String,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ExitState {
+    On,
+    Off,
+}
+
+impl ExitState {
+    fn enabled(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+#[derive(Subcommand)]
+enum FwSelftestCmd {
+    Detect,
+    Up {
+        #[arg(long)]
+        phys: String,
+        #[arg(long)]
+        tun: String,
+    },
+    Down {
+        #[arg(long)]
+        phys: String,
+        #[arg(long)]
+        tun: String,
+    },
+    Killswitch {
+        #[command(subcommand)]
+        cmd: KillswitchCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum KillswitchCmd {
+    On {
+        #[arg(long)]
+        phys: String,
+        #[arg(long)]
+        tun: String,
+    },
+    Off {
+        #[arg(long)]
+        phys: String,
+        #[arg(long)]
+        tun: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DnsSelftestCmd {
+    Detect,
+    Set { dns: String },
+    Clear,
 }
 
 #[tokio::main]
@@ -99,6 +173,13 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Node { cmd } => match cmd {
             NodeCmd::Run { config } => fluxpeer_node::run(&config).await?,
             NodeCmd::Keygen => fluxpeer_node::keygen(),
+            NodeCmd::SetExit { state, config_dir } => {
+                let updated = fluxpeer_node::set_exit(&config_dir, state.enabled())?;
+                println!(
+                    "exit_node={} updated {updated} config(s)",
+                    if state.enabled() { "on" } else { "off" }
+                );
+            }
         },
         Cmd::Ctl { args } => {
             let cli = fluxpeer_cli::Cli::parse_from(std::iter::once("fluxpeer-ctl".to_string()).chain(args));
@@ -117,6 +198,20 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Networks { config_dir } => {
             fluxpeer_node::list_networks(&config_dir.unwrap_or_else(fluxpeer_node::config_dir))?
         }
+        Cmd::FwSelftest { cmd } => match cmd {
+            FwSelftestCmd::Detect => fluxpeer_node::fw_selftest("detect", "", "")?,
+            FwSelftestCmd::Up { phys, tun } => fluxpeer_node::fw_selftest("up", &phys, &tun)?,
+            FwSelftestCmd::Down { phys, tun } => fluxpeer_node::fw_selftest("down", &phys, &tun)?,
+            FwSelftestCmd::Killswitch { cmd } => match cmd {
+                KillswitchCmd::On { phys, tun } => fluxpeer_node::fw_selftest("killswitch-on", &phys, &tun)?,
+                KillswitchCmd::Off { phys, tun } => fluxpeer_node::fw_selftest("killswitch-off", &phys, &tun)?,
+            },
+        },
+        Cmd::DnsSelftest { cmd } => match cmd {
+            DnsSelftestCmd::Detect => fluxpeer_node::dns_selftest("detect", None)?,
+            DnsSelftestCmd::Set { dns } => fluxpeer_node::dns_selftest("set", Some(&dns))?,
+            DnsSelftestCmd::Clear => fluxpeer_node::dns_selftest("clear", None)?,
+        },
     }
     Ok(())
 }
