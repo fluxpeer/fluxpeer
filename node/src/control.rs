@@ -14,7 +14,10 @@ use crate::util::{DISCO_MAGIC, disco_dgram, hex32};
 /// control-server authorizes its `/devices/:id/*` calls (config pull / endpoints /
 /// routes). Empty token → no header (rejected by a token-enforcing server).
 pub(crate) fn mk_client(cfg: &Config) -> Client {
-    Client::with_password(cfg.control_server.clone(), cfg.auth_token.as_deref().unwrap_or_default())
+    Client::with_password(
+        cfg.control_server.clone(),
+        cfg.auth_token.as_deref().unwrap_or_default(),
+    )
 }
 
 /// Static info about one peer, resolved from the control-server config-pull.
@@ -177,7 +180,15 @@ pub(crate) async fn resolve_from_control(cfg: &Config, advertise: &[String]) -> 
                     let (mtu, dns) = parse_settings(&conf);
                     let peers: Vec<PeerInfo> = parse_peers(&conf);
                     tracing::info!(peer_count = peers.len(), "resolved from control-server");
-                    return Ok((Resolved { own_addr: oa, peers, mtu, dns }, last_epoch));
+                    return Ok((
+                        Resolved {
+                            own_addr: oa,
+                            peers,
+                            mtu,
+                            dns,
+                        },
+                        last_epoch,
+                    ));
                 }
                 // Enrolled but no overlay address yet — retry briefly.
             }

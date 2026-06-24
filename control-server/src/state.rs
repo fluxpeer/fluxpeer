@@ -9,10 +9,11 @@
 use crate::domain::{Device, DeviceConfig, DeviceStatus, ImportDevice, ImportResult, Invite, Network, PeerConfig, RelayNode, Route};
 use crate::ipam::{Ipam, IpamError};
 use parking_lot::Mutex;
+use portable_atomic::AtomicU64;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

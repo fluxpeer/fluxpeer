@@ -16,6 +16,9 @@ serde_json = { workspace = true }
 parking_lot = "0.12"
 rand = "0.9"
 argon2 = "0.5"
+fp-crypto = { workspace = true }
+hex = { workspace = true }
+portable-atomic = { workspace = true }
 thiserror = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "any", "sqlite", "postgres"] }
 tracing = { workspace = true }
@@ -26,3 +29,5 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+fp-crypto = { workspace = true }
+hex = { workspace = true }

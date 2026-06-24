@@ -15,10 +15,10 @@
 # where a node holds ≥2 peers. Default N=5; set N=8 for a denser mesh.
 #
 # Requires root (netns/veth/TUN) and a built `fluxpeer` binary. Run on a Linux host:
-#   N=5 FLUXPEER_BIN=~/fpbuild/target/release/fluxpeer scripts/regression-mesh-netns.sh
+#   N=5 FLUXPEER_BIN=./target/release/fluxpeer scripts/regression-mesh-netns.sh
 set -u
 N=${N:-5}
-B=${FLUXPEER_BIN:-$HOME/fpbuild/target/release/fluxpeer}
+B=${FLUXPEER_BIN:-./target/release/fluxpeer}
 D=${FLUXPEER_REG_DIR:-/tmp/fp-mesh-reg}
 CPORT=18091            # control-server, bound on the bridge IP (reachable from every ns)
 BR=10.55.0.1           # bridge / control-server host IP

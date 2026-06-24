@@ -1,11 +1,11 @@
 //! Bond: aggregate N TCP connections into one logical transport channel.
 //!
 //! - Send: round-robin SPRAY across healthy links so a single flow uses every
-//! link, not just the best one. Each link has its own send task that COALESCES
-//! (writes a whole batch of pending frames, then one `flush`) — per-packet flush
-//! pins yamux throughput to a synchronous round-trip per frame. Frames may
-//! arrive reordered across links; the carried wg datagrams tolerate that (replay
-//! window), and each frame is length-prefixed so it's never split across links.
+//!   link, not just the best one. Each link has its own send task that COALESCES
+//!   (writes a whole batch of pending frames, then one `flush`) — per-packet flush
+//!   pins yamux throughput to a synchronous round-trip per frame. Frames may
+//!   arrive reordered across links; the carried wg datagrams tolerate that (replay
+//!   window), and each frame is length-prefixed so it's never split across links.
 //! - Recv: all connections push into a shared channel, first packet wins.
 //! - Reconnect: dead connections are replaced in background.
 

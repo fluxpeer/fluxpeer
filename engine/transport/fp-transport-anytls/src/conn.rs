@@ -186,7 +186,9 @@ impl ManagedConnection {
         let health = Arc::new(ConnHealth::new(config));
         let total = config.effective_bond_connections() as u8;
 
-        let tcp = TcpStream::connect(addr).await.map_err(fp_transport::Error::IO)?;
+        // Protect-before-connect so this link egresses the real interface, not the
+        // VPN tun, when running under a mobile VpnService (no-op on desktop/server).
+        let tcp = fp_transport::connect_tcp(addr).await.map_err(fp_transport::Error::IO)?;
         tcp.set_nodelay(true).map_err(fp_transport::Error::IO)?;
 
         // Set TCP keepalive via socket2

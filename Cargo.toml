@@ -131,3 +131,11 @@ incremental = false
 lto = "thin"
 opt-level = 3
 strip = true
+
+[profile.release-min]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

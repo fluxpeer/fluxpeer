@@ -7,9 +7,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use parking_lot::Mutex;
+use portable_atomic::AtomicU64;
 use sqlx::AnyPool;
 use tokio::sync::watch;
 

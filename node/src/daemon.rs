@@ -30,6 +30,21 @@ struct Daemon {
     nets: Mutex<HashMap<String, Child>>,
 }
 
+fn admin_api_allowed() -> bool {
+    std::env::var("FLUXPEER_ALLOW_ADMIN_API").as_deref() == Ok("1")
+}
+
+fn admin_api_disabled() -> serde_json::Value {
+    serde_json::json!({ "error": "admin api disabled" })
+}
+
+fn redact_config(mut cfg: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = cfg.as_object_mut() {
+        obj.insert("private_key".to_string(), serde_json::json!("<redacted>"));
+    }
+    cfg
+}
+
 /// Run the daemon: bring up every config in `dir`, then serve the control API.
 pub async fn daemon(dir: String, addr: Option<String>) -> std::io::Result<()> {
     let dir = PathBuf::from(dir);
@@ -45,7 +60,10 @@ pub async fn daemon(dir: String, addr: Option<String>) -> std::io::Result<()> {
     }
     let addr = addr.unwrap_or_else(|| DAEMON_ADDR.to_string());
     let listener = TcpListener::bind(&addr).await?;
-    println!("→ fluxpeer daemon: {} network(s) up; control API on {addr}", d.nets.lock().len());
+    println!(
+        "→ fluxpeer daemon: {} network(s) up; control API on {addr}",
+        d.nets.lock().len()
+    );
     loop {
         let (stream, _) = listener.accept().await?;
         let d = d.clone();
@@ -53,6 +71,32 @@ pub async fn daemon(dir: String, addr: Option<String>) -> std::io::Result<()> {
             let _ = d.handle(stream).await;
         });
     }
+}
+
+/// Update `exit_node` in every membership config under `dir`.
+pub fn set_exit(dir: &str, enabled: bool) -> std::io::Result<usize> {
+    let mut updated = 0usize;
+    for path in configs(Path::new(dir)) {
+        let raw = std::fs::read_to_string(&path)?;
+        let mut cfg: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: invalid JSON: {err}", path.display()),
+            )
+        })?;
+        let Some(obj) = cfg.as_object_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: config root is not an object", path.display()),
+            ));
+        };
+        obj.insert("exit_node".to_string(), serde_json::json!(enabled));
+        let mut serialized = serde_json::to_string_pretty(&cfg).map_err(std::io::Error::other)?;
+        serialized.push('\n');
+        std::fs::write(&path, serialized)?;
+        updated += 1;
+    }
+    Ok(updated)
 }
 
 impl Daemon {
@@ -105,7 +149,10 @@ impl Daemon {
                         libc::kill(pid as i32, libc::SIGTERM);
                     }
                 }
-                if tokio::time::timeout(std::time::Duration::from_secs(3), c.wait()).await.is_err() {
+                if tokio::time::timeout(std::time::Duration::from_secs(3), c.wait())
+                    .await
+                    .is_err()
+                {
                     let _ = c.kill().await;
                 }
             }
@@ -120,6 +167,24 @@ impl Daemon {
             .status();
     }
 
+    /// Bring every running network down — each `stop_iface` SIGTERMs its node so a
+    /// full-tunnel/exit child restores routes + DNS, and a split-tunnel child's TUN
+    /// closes (dropping its overlay/intranet routes) — then exit the daemon process.
+    /// We reply BEFORE exiting (brief delay so the ack flushes) so the caller knows
+    /// teardown is done.
+    async fn shutdown(&self) -> serde_json::Value {
+        let ifaces: Vec<String> = self.nets.lock().keys().cloned().collect();
+        for iface in ifaces {
+            self.stop_iface(&iface).await;
+        }
+        tokio::spawn(async {
+            // Let `handle` write the response below before the process dies.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            std::process::exit(0);
+        });
+        serde_json::json!({ "ok": true, "shutdown": true })
+    }
+
     async fn handle(&self, stream: TcpStream) -> std::io::Result<()> {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
@@ -131,7 +196,8 @@ impl Daemon {
             self.dispatch(&req).await
         };
         let mut s = reader.into_inner();
-        s.write_all(serde_json::to_string(&resp).unwrap_or_default().as_bytes()).await?;
+        s.write_all(serde_json::to_string(&resp).unwrap_or_default().as_bytes())
+            .await?;
         s.write_all(b"\n").await
     }
 
@@ -150,13 +216,39 @@ impl Daemon {
             // override (no admin needed); restarts that network to apply.
             "settings" => self.settings(req).await,
             // Manual config editing + file import (like WireGuard's edit/import).
-            "config" => self.get_config(req["iface"].as_str().unwrap_or("")),
-            "set-config" => self.set_config(req).await,
-            "import" => self.import(req).await,
+            "config" | "get_config" => self.get_config(req["iface"].as_str().unwrap_or("")),
+            "set-config" | "set_config" => {
+                if admin_api_allowed() {
+                    self.set_config(req).await
+                } else {
+                    admin_api_disabled()
+                }
+            }
+            "import" => {
+                if admin_api_allowed() {
+                    self.import(req).await
+                } else {
+                    admin_api_disabled()
+                }
+            }
             // Leave a network for good: stop it + delete its on-disk config + log.
             "leave" => self.leave(req["iface"].as_str().unwrap_or("")).await,
+            // Bring EVERY network down (clean route/DNS teardown) and exit the daemon.
+            // The desktop GUI calls this on Quit so closing the app actually
+            // disconnects, instead of leaving this (detached) daemon — and its
+            // TUN/routes — alive and the overlay/intranet still reachable.
+            "shutdown" => {
+                if admin_api_allowed() {
+                    self.shutdown().await
+                } else {
+                    admin_api_disabled()
+                }
+            }
             // Tail a network's node log (for the GUI diagnostics panel).
-            "logs" => self.logs(req["iface"].as_str().unwrap_or(""), req["lines"].as_u64().unwrap_or(200) as usize),
+            "logs" => self.logs(
+                req["iface"].as_str().unwrap_or(""),
+                req["lines"].as_u64().unwrap_or(200) as usize,
+            ),
             other => serde_json::json!({ "error": format!("unknown cmd: {other}") }),
         }
     }
@@ -196,11 +288,16 @@ impl Daemon {
         }
     }
 
-    /// Return a network's raw config JSON (so the GUI can manually edit it).
+    /// Return a network config JSON with the private key redacted. The local
+    /// daemon token is enough to operate networks, but must not disclose key
+    /// material to API clients.
     fn get_config(&self, iface: &str) -> serde_json::Value {
         let path = self.dir.join(format!("{iface}.json"));
-        match std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
-            Some(cfg) => serde_json::json!({ "iface": iface, "config": cfg }),
+        match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        {
+            Some(cfg) => serde_json::json!({ "iface": iface, "config": redact_config(cfg) }),
             None => serde_json::json!({ "error": "no config for iface" }),
         }
     }
@@ -296,7 +393,11 @@ impl Daemon {
             cfg["dns"] = req["dns"].clone();
         }
         if let Some(ep) = req.get("endpoint").and_then(|x| x.as_str()) {
-            cfg["advertise"] = if ep.is_empty() { serde_json::json!([]) } else { serde_json::json!([ep]) };
+            cfg["advertise"] = if ep.is_empty() {
+                serde_json::json!([])
+            } else {
+                serde_json::json!([ep])
+            };
         }
         // Split-tunnel exclude CIDRs (only meaningful under a full-tunnel exit peer):
         // an empty array clears them, so the field round-trips faithfully.

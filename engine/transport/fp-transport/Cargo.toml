@@ -9,7 +9,7 @@ edition = "2024"
 libc = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "net"] }
 
 [dev-dependencies]
 rand_core = { workspace = true }

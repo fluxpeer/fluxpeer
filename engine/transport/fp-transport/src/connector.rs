@@ -35,7 +35,6 @@ pub trait TransportReceiver: Send + Sync {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use crate::Error;
 
     use bytes::BufMut;

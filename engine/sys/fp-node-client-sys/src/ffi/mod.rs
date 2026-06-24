@@ -7,7 +7,7 @@
 //! 1. `fp_generate_keypair()` — device identity (x25519).
 //! 2. (native) enroll the join token at the control `/enroll` → overlay addr.
 //! 3. `fp_connect_handshake_only(req_json)` — build transport + Noise
-//! handshake; NO TUN yet.
+//!    handshake; NO TUN yet.
 //! 4. (native) NE `setTunnelNetworkSettings` / VpnService `establish()` → fd.
 //! 5. `fp_attach_tun(fd)` — attach the OS-provided fd; data plane goes live.
 //! 6. `fp_disconnect()` — teardown.
@@ -455,8 +455,9 @@ pub extern "C" fn fp_disconnect() -> *mut c_char {
 //
 // One-command onboarding for the mobile app: decode a join token, POST the
 // control-server `/api/v1/enroll`, return the allocated overlay identity. The
-// app pairs this with `fp_generate_keypair` (it supplies `wg_public_key` and
-// keeps the private half) and later builds the `ClientStartReq` for connect.
+// app pairs this with `fp_generate_keypair` (it supplies `wg_private_key`, which
+// the SDK uses to prove possession and derive the public half) and later builds
+// the `ClientStartReq` for connect.
 //
 // HTTP lives here (not native URLSession/OkHttp) because enroll is the one REST
 // call and the mobile design keeps it FFI-built-in; the SDK's reqwest is
@@ -491,7 +492,10 @@ fn decode_join_token(token: &str) -> Result<(String, String), String> {
 
 /// Request shape for `fp_enroll`: supply either `token` (a `fp://join/...`
 /// string) or an explicit `ctrl` + `code` pair, plus the device `name` and
-/// `wg_public_key` (hex, from `fp_generate_keypair`).
+/// `wg_private_key` (hex, from `fp_generate_keypair`). The private key is needed for
+/// the enroll proof-of-possession (audit #11) — the public half + the ECDH proof are
+/// derived inside the SDK and the private key never leaves this process. The legacy
+/// `wg_public_key` field is accepted but ignored (it's derived from the private key).
 #[cfg(feature = "enroll")]
 #[derive(serde::Deserialize)]
 struct EnrollReqJson {
@@ -502,7 +506,10 @@ struct EnrollReqJson {
     #[serde(default)]
     code: Option<String>,
     name: String,
-    wg_public_key: String,
+    wg_private_key: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    wg_public_key: Option<String>,
 }
 
 /// Core enroll logic, shared by the C ABI and the Android JNI shim.
@@ -531,7 +538,7 @@ fn enroll_impl(raw: &str) -> Value {
     // `Client::new` reads FLUXPEER_ADMIN_PASSWORD for admin bearer; unset on
     // mobile, which is correct — `/enroll` is an open (invite-gated) endpoint.
     let client = fluxpeer_sdk::Client::new(ctrl.clone());
-    match rt.block_on(client.enroll(&code, &parsed.name, &parsed.wg_public_key)) {
+    match rt.block_on(client.enroll(&code, &parsed.name, &parsed.wg_private_key)) {
         Ok(mut dev) => {
             if let Some(obj) = dev.as_object_mut() {
                 obj.insert("control_server".to_string(), Value::String(ctrl));
@@ -544,7 +551,7 @@ fn enroll_impl(raw: &str) -> Value {
 
 /// Enroll this device against a control-server and return its overlay identity.
 ///
-/// `req_json` = `{"token":"fp://join/<b64>","name":"...","wg_public_key":"<hex>"}`
+/// `req_json` = `{"token":"fp://join/<b64>","name":"...","wg_private_key":"<hex>"}`
 /// (or `{"ctrl":"...","code":"...",...}` instead of `token`). On success the
 /// `result` is the created device — `{id, network_id, name, wg_public_key,
 /// address_v4, address_v6, status}` — plus `control_server` (the resolved ctrl
@@ -568,6 +575,8 @@ struct GatewayReqJson {
     ctrl: Option<String>,
     #[serde(default)]
     control_server: Option<String>,
+    #[serde(default)]
+    auth_token: Option<String>,
     device_id: String,
 }
 
@@ -588,7 +597,8 @@ fn gateway_impl(raw: &str) -> Value {
     let Some(rt) = runtime() else {
         return err_val("engine unavailable: tokio runtime build failed");
     };
-    let client = fluxpeer_sdk::Client::new(ctrl.trim_end_matches('/').to_string());
+    let auth_token = parsed.auth_token.unwrap_or_default();
+    let client = fluxpeer_sdk::Client::with_password(ctrl.trim_end_matches('/').to_string(), &auth_token);
     match rt.block_on(client.gateway(&parsed.device_id)) {
         Ok(v) => ok_val(v),
         Err(e) => err_val(format!("gateway failed: {e:#}")),
@@ -597,8 +607,9 @@ fn gateway_impl(raw: &str) -> Value {
 
 /// Resolve the gateway connect params for an enrolled device.
 ///
-/// `req_json` = `{"ctrl":"<control-server>","device_id":"<id>"}` (`control_server`
-/// also accepted). `result` = `{node_pubkey, node_addr, node_port,
+/// `req_json` = `{"ctrl":"<control-server>","device_id":"<id>","auth_token":"<token>"}`
+/// (`control_server` also accepted; empty/missing `auth_token` sends no bearer).
+/// `result` = `{node_pubkey, node_addr, node_port,
 /// transport_protocol, iface_ipv4?, mtu?, dns, allowed_routes, config_epoch}` —
 /// the node_* fields `/enroll` cannot provide; the caller merges them into the
 /// `ClientStartReq` for `fp_connect_handshake_only`.

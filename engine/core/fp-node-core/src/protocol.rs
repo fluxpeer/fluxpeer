@@ -6,7 +6,7 @@
 //! Bump rules:
 //! - increment the relevant `*_PROTOCOL_VERSION` on ANY wire-format change;
 //! - raise a `MIN_SUPPORTED_*` only when intentionally dropping backward
-//! compatibility with older peers.
+//!   compatibility with older peers.
 //!
 //! The control-plane API version (`server_api_version`) and the relay protocol
 //! are documented in `api-schema/PROTOCOL_VERSIONING.md`; the constants below are

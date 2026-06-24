@@ -53,7 +53,7 @@ fi
 SSH=(ssh -o ProxyCommand=none -o ProxyJump=none -o ConnectTimeout=15)
 SCP=(scp -o ProxyCommand=none -o ProxyJump=none -o ConnectTimeout=15)
 FLUX=target/debug/fluxpeer        # local CLI/ctl/join (talks to the public control)
-NODE_A_BIN=fpbuild/target/x86_64-unknown-linux-musl/release/fluxpeer  # relative to node-a home (scp expands it remotely)
+NODE_A_BIN=target/x86_64-unknown-linux-musl/release/fluxpeer  # relative to node-a home (scp expands it remotely)
 REMOTE=fluxpeer-wan               # binary path on each node (home dir)
 TMP=$(mktemp -d /tmp/fpwan.XXXX)
 A_SSH=""; B_SSH=""; NET=""

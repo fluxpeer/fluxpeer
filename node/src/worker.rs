@@ -26,8 +26,8 @@ use crate::peer::{Peer, accept_init, handle_wg, send_to_peer};
 use crate::relay::RelayOut;
 use crate::status::{self, PeerStat, StatusRegistry};
 use crate::util::{
-    DISCO_MAGIC, LIVENESS_DEAD_SECS, REKEY_AFTER_SECS, T_DATA, T_HANDSHAKE_INIT, T_HANDSHAKE_RESP, disco_dgram,
-    ip_in_cidr, le_u32,
+    DISCO_MAGIC, LIVENESS_DEAD_SECS, REKEY_AFTER_SECS, T_DATA, T_HANDSHAKE_INIT, T_HANDSHAKE_RESP, auth_disco_dgram,
+    disco_authed, disco_replay_ok, ip_in_cidr, le_u32,
 };
 
 /// Shared `wg session index → owning worker id`, written by whichever worker
@@ -58,12 +58,7 @@ impl IndexTable {
     /// Drop every index this worker assigned to `pk` (local + the shared owner map),
     /// so a revoked peer's RESP/DATA no longer route anywhere (REVOKE-1).
     pub(crate) fn remove_peer(&mut self, pk: [u8; 32]) {
-        let idxs: Vec<u32> = self
-            .local
-            .iter()
-            .filter(|(_, v)| **v == pk)
-            .map(|(k, _)| *k)
-            .collect();
+        let idxs: Vec<u32> = self.local.iter().filter(|(_, v)| **v == pk).map(|(k, _)| *k).collect();
         if idxs.is_empty() {
             return;
         }
@@ -187,7 +182,6 @@ pub(crate) struct WorkerState {
     pub(crate) own_priv: StaticSecret,
     pub(crate) own_pub: PublicKey,
     pub(crate) force_relay: bool,
-    pub(crate) ping: Vec<u8>,
     /// Decrypted IP packets out to the single TUN-writer task.
     pub(crate) tun_out: mpsc::Sender<Vec<u8>>,
     /// Shared live per-peer status/counters (this worker writes its shard's peers).
@@ -204,7 +198,7 @@ pub(crate) struct WorkerState {
 /// delivers each other's direct keepalive). Free fn so the tick loop stays flat.
 async fn keepalive_send(
     udp: &UdpSocket,
-    ping: &[u8],
+    own_pub: &[u8; 32],
     force_relay: bool,
     relay_out: &Option<RelayOut>,
     peer: &Peer,
@@ -212,12 +206,13 @@ async fn keepalive_send(
 ) {
     send_to_peer(udp, peer, force_relay, relay_out, ka).await;
     if peer.relay_pinned && !force_relay {
+        let ping = peer.disco_ping(own_pub);
         if let Some(addr) = peer.direct_addr {
             let _ = udp.send_to(ka, addr).await;
-            let _ = udp.send_to(ping, addr).await;
+            let _ = udp.send_to(&ping, addr).await;
         }
         for c in &peer.candidates {
-            let _ = udp.send_to(ping, *c).await;
+            let _ = udp.send_to(&ping, *c).await;
         }
     }
 }
@@ -326,8 +321,9 @@ impl WorkerState {
             *peer.stat.endpoint.lock() = peer.direct_addr;
 
             if !self.force_relay && !peer.disco_validated {
+                let ping = peer.disco_ping(self.own_pub.as_bytes());
                 for c in &peer.candidates {
-                    let _ = self.udp.send_to(&self.ping, *c).await;
+                    let _ = self.udp.send_to(&ping, *c).await;
                 }
             }
             if !peer.handshaked {
@@ -358,7 +354,15 @@ impl WorkerState {
                 if out.first() == Some(&T_DATA) {
                     let ka = out.to_vec();
                     peer.stat.add_tx(ka.len());
-                    keepalive_send(&self.udp, &self.ping, self.force_relay, &self.relay_out, peer, &ka).await;
+                    keepalive_send(
+                        &self.udp,
+                        self.own_pub.as_bytes(),
+                        self.force_relay,
+                        &self.relay_out,
+                        peer,
+                        &ka,
+                    )
+                    .await;
                 } else if out.first() == Some(&T_HANDSHAKE_INIT)
                     && self.own_pub.as_bytes() < &peer.pubkey
                     && let Some(idx) = le_u32(out, 4)
@@ -390,7 +394,10 @@ impl WorkerState {
             let dead = peer.rtt.map_or(Duration::from_secs(LIVENESS_DEAD_SECS), |r| {
                 (r * 8).max(Duration::from_secs(LIVENESS_DEAD_SECS))
             });
-            let silent = peer.last_recv_direct.map(|t| now.duration_since(t) >= dead).unwrap_or(true);
+            let silent = peer
+                .last_recv_direct
+                .map(|t| now.duration_since(t) >= dead)
+                .unwrap_or(true);
             if silent && !peer.prefer_relay && !self.force_relay && self.relay_out.is_some() {
                 // Move to relay but keep the LIVE session and rekey GAPLESSLY
                 // (rekey_init, not a rebuild): the old session keeps decrypting
@@ -453,10 +460,8 @@ impl WorkerState {
     }
 
     async fn on_udp_in(&mut self, from: SocketAddr, bytes: &[u8], dbuf: &mut [u8]) {
-        if let Some(body) = bytes.strip_prefix(DISCO_MAGIC) {
-            if let Ok((msg, _)) = Disco::decode(body) {
-                self.on_disco(from, msg).await;
-            }
+        if bytes.starts_with(DISCO_MAGIC) {
+            self.on_disco(from, bytes).await;
             return;
         }
         // wg packet: INIT → decrypt-to-identify the peer; RESP/DATA → find the peer
@@ -539,44 +544,71 @@ impl WorkerState {
         }
     }
 
-    async fn on_disco(&mut self, from: SocketAddr, msg: Disco) {
+    /// Handle an inbound disco datagram (`dgram` includes `DISCO_MAGIC`). Every peer
+    /// ping/pong MUST carry a valid per-peer MAC (static-static DH) and a fresh
+    /// timestamp, so an off-path attacker can no longer forge a probe that redirects
+    /// or black-holes a peer's path (the pre-handshake DoS). An unknown sender, a
+    /// bad/absent MAC, or a stale timestamp is silently dropped.
+    async fn on_disco(&mut self, from: SocketAddr, dgram: &[u8]) {
+        let Some(body) = dgram.strip_prefix(DISCO_MAGIC) else {
+            return;
+        };
+        let Ok((msg, used)) = Disco::decode(body) else {
+            return;
+        };
         match msg {
             Disco::Ping { tx_id, sender } => {
-                let _ = self
-                    .udp
-                    .send_to(&disco_dgram(&Disco::Pong { tx_id, observed: from }), from)
-                    .await;
-                // Learn the sender's REACHABLE address by identity (its pubkey),
-                // not the advertised candidate — works through a symmetric NAT,
-                // where the source port differs per destination.
-                if let Some(peer) = self.peers.iter_mut().find(|p| p.pubkey == sender) {
-                    peer.direct_addr = Some(from);
-                    if !peer.relay_pinned {
-                        peer.prefer_relay = false;
-                    }
-                    if !peer.disco_validated {
-                        peer.disco_validated = true;
-                        tracing::info!(%from, "disco: learned peer address from its ping");
-                    }
+                // Identify the claimed sender; only a real peer shares the DH key.
+                // (This also kills the old "reply to ANY ping" reflection.)
+                let Some(pos) = self.peers.iter().position(|p| p.pubkey == sender) else {
+                    return;
+                };
+                let disco_key = self.peers[pos].disco_key;
+                if !disco_authed(&disco_key, dgram, body, used) || !disco_replay_ok(&tx_id) {
+                    return;
+                }
+                // Authenticated: reply with a MAC'd Pong, then learn the sender's
+                // REACHABLE address by identity (its pubkey), not the advertised
+                // candidate — works through a symmetric NAT, where the source port
+                // differs per destination.
+                let pong = auth_disco_dgram(&disco_key, &Disco::Pong { tx_id, observed: from });
+                let _ = self.udp.send_to(&pong, from).await;
+                let peer = &mut self.peers[pos];
+                peer.direct_addr = Some(from);
+                if !peer.relay_pinned {
+                    peer.prefer_relay = false;
+                }
+                if !peer.disco_validated {
+                    peer.disco_validated = true;
+                    tracing::info!(%from, "disco: learned peer address from its (authenticated) ping");
                 }
             }
-            Disco::Pong { .. } => {
-                let hit = self
+            Disco::Pong { tx_id, .. } => {
+                // A Pong from a known candidate (or current direct addr) routes; a
+                // roaming Pong is dropped — authenticated wg DATA is the roaming
+                // authority. Verify the MAC against that peer's key.
+                let Some(pos) = self
                     .peers
-                    .iter_mut()
-                    .find(|p| p.candidates.contains(&from) || p.direct_addr == Some(from));
-                if let Some(peer) = hit {
-                    peer.direct_addr = Some(from);
-                    if !peer.relay_pinned {
-                        if peer.prefer_relay {
-                            tracing::info!(%from, "disco validated direct; upgrading off relay");
-                        }
-                        peer.prefer_relay = false;
+                    .iter()
+                    .position(|p| p.candidates.contains(&from) || p.direct_addr == Some(from))
+                else {
+                    return;
+                };
+                let disco_key = self.peers[pos].disco_key;
+                if !disco_authed(&disco_key, dgram, body, used) || !disco_replay_ok(&tx_id) {
+                    return;
+                }
+                let peer = &mut self.peers[pos];
+                peer.direct_addr = Some(from);
+                if !peer.relay_pinned {
+                    if peer.prefer_relay {
+                        tracing::info!(%from, "disco validated direct; upgrading off relay");
                     }
-                    if !peer.disco_validated {
-                        peer.disco_validated = true;
-                        tracing::info!(%from, "disco: direct path validated");
-                    }
+                    peer.prefer_relay = false;
+                }
+                if !peer.disco_validated {
+                    peer.disco_validated = true;
+                    tracing::info!(%from, "disco: direct path validated");
                 }
             }
             _ => {}
@@ -617,10 +649,11 @@ impl WorkerState {
         }
         let stat = PeerStat::new(allowed_ips);
         self.status.write().insert(pubkey, stat.clone());
-        let mut peer = Peer::fresh(pubkey, candidates, self.force_relay, stat);
+        let mut peer = Peer::fresh(pubkey, candidates, self.force_relay, stat, &self.own_priv);
         if !self.force_relay {
+            let ping = peer.disco_ping(self.own_pub.as_bytes());
             for c in &peer.candidates {
-                let _ = self.udp.send_to(&self.ping, *c).await;
+                let _ = self.udp.send_to(&ping, *c).await;
             }
         }
         if initiator {
@@ -666,8 +699,9 @@ impl WorkerState {
         peer.candidates = candidates.clone();
         peer.disco_validated = false; // re-validate against the new endpoints
         if !self.force_relay {
+            let ping = peer.disco_ping(self.own_pub.as_bytes());
             for c in &candidates {
-                let _ = self.udp.send_to(&self.ping, *c).await;
+                let _ = self.udp.send_to(&ping, *c).await;
             }
         }
         tracing::info!(peer = %hex::encode(&pubkey[..4]), n = candidates.len(), "peer endpoints updated (reconcile, session kept)");

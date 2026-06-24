@@ -16,6 +16,7 @@ use std::sync::Arc;
 pub mod domain;
 pub mod ipam;
 pub mod persistence;
+mod pop;
 pub mod sql_store;
 pub mod state;
 
@@ -96,6 +97,27 @@ struct EnrollReq {
     invite_code: String,
     name: String,
     wg_public_key: String,
+    /// Proof-of-possession (audit #11): the `challenge_id` from `/enroll/challenge`
+    /// and the ECDH `proof` = DH(wg_priv, server_pub). Optional in the struct so a
+    /// missing proof yields a clean 401 (not a 422), but the SQL path REQUIRES them.
+    #[serde(default)]
+    challenge_id: Option<String>,
+    #[serde(default)]
+    proof: Option<String>,
+}
+
+/// Round 1 of enroll proof-of-possession: client presents the wg public key it
+/// intends to enroll; we return an ephemeral server key + id to prove possession.
+#[derive(Deserialize)]
+struct EnrollChallengeReq {
+    wg_public_key: String,
+}
+
+#[derive(Serialize)]
+struct EnrollChallengeResp {
+    challenge_id: String,
+    /// Server ephemeral x25519 public key (hex); client DHs it with its wg private key.
+    server_pub: String,
 }
 
 #[derive(Deserialize)]
@@ -480,10 +502,30 @@ struct EnrollResponse {
     auth_token: String,
 }
 
+/// Round 1: mint a proof-of-possession challenge for the claimed wg public key.
+async fn sql_enroll_challenge(Json(req): Json<EnrollChallengeReq>) -> Result<Json<EnrollChallengeResp>, StatusCode> {
+    pop::new_challenge(&req.wg_public_key)
+        .map(|c| {
+            Json(EnrollChallengeResp {
+                challenge_id: c.challenge_id,
+                server_pub: c.server_pub,
+            })
+        })
+        .ok_or(StatusCode::BAD_REQUEST)
+}
+
 async fn sql_enroll(
     State(s): State<Arc<SqlStore>>,
     Json(req): Json<EnrollReq>,
 ) -> Result<(StatusCode, Json<EnrollResponse>), StatusCode> {
+    // Proof-of-possession is mandatory (audit #11): without it a caller could enroll
+    // a wg public key it doesn't own. Verify before allocating any IPAM / token.
+    let (Some(cid), Some(proof)) = (req.challenge_id.as_deref(), req.proof.as_deref()) else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    if !pop::verify(cid, &req.wg_public_key, proof) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     s.enroll(&req.invite_code, &req.name, &req.wg_public_key, now_unix())
         .await
         .map(|(device, auth_token)| (StatusCode::CREATED, Json(EnrollResponse { device, auth_token })))
@@ -516,6 +558,13 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// (a guessable `dev-N` id is no longer authority). 401 on any mismatch/absence.
 async fn require_device(s: &SqlStore, headers: &axum::http::HeaderMap, device_id: &str) -> Result<(), StatusCode> {
     let tok = bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    // An admin automation bearer (master key) may act on ANY device — admins already
+    // see everything (dashboard, device list); the threat the keystone closes is the
+    // UNAUTHENTICATED guessable-`dev-N` caller, not an authenticated admin. Without
+    // this, `fp ctl device config/...` and other admin tooling 401 on every device.
+    if auth::is_master_bearer(tok) {
+        return Ok(());
+    }
     match s.device_token(device_id).await {
         Ok(Some(stored)) if ct_eq(stored.as_bytes(), tok.as_bytes()) => Ok(()),
         Ok(_) => Err(StatusCode::UNAUTHORIZED),
@@ -707,6 +756,7 @@ pub fn sql_router(store: Arc<SqlStore>) -> Router {
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/admin/login", post(auth::admin_login))
+        .route("/enroll/challenge", post(sql_enroll_challenge))
         .route("/enroll", post(sql_enroll))
         .route("/devices/:id/config", get(sql_device_config))
         .route("/devices/:id/gateway", get(sql_device_gateway))
@@ -770,6 +820,7 @@ pub fn router(store: Arc<Store>) -> Router {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // non-test items intentionally follow
 mod test {
     use super::*;
     use http_body_util::BodyExt;

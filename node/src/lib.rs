@@ -24,9 +24,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fp_crypto::x25519::{PublicKey, StaticSecret};
-use fp_disco::Disco;
-use fp_tun::TunPacket;
 use fp_tun::Device; // brings the `.name()` method on the concrete device into scope
+use fp_tun::TunPacket;
 use futures::{SinkExt, StreamExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -34,14 +33,16 @@ use tokio::sync::mpsc;
 mod config;
 mod control;
 mod daemon;
+mod dns;
+mod firewall;
 mod gso;
 mod join;
-mod show;
-mod status;
-mod statusd;
 mod peer;
 mod relay;
 mod route;
+mod show;
+mod status;
+mod statusd;
 mod tcp_direct;
 mod util;
 mod worker;
@@ -51,7 +52,7 @@ use control::{fetch_relays, resolve_from_control, stun_query};
 use peer::{Peer, send_to_peer};
 use relay::{RelayIn, RelayOut, RelayTarget, relay_supervisor};
 use tcp_direct::{TcpConn, TcpIn, tcp_direct_manager};
-use util::{disco_dgram, hex32, le_u32, local_ipv4_toward, netmask_v4, url_host};
+use util::{hex32, le_u32, local_ipv4_toward, netmask_v4, url_host};
 
 /// Routing tables the central readers consult per packet. Behind `RwLock` so the
 /// reconcile loop (REVOKE-1) can mutate membership live; reads are brief and dropped
@@ -160,7 +161,12 @@ impl Reconciler {
             let desired_snapshot = desired.clone(); // for the exit-node re-eval below
             let desired_set: std::collections::HashSet<[u8; 32]> = desired.iter().map(|p| p.pubkey).collect();
             // Removed (revoked): known, gone from desired. Drop the session first.
-            let removed: Vec<[u8; 32]> = self.known.keys().copied().filter(|pk| !desired_set.contains(pk)).collect();
+            let removed: Vec<[u8; 32]> = self
+                .known
+                .keys()
+                .copied()
+                .filter(|pk| !desired_set.contains(pk))
+                .collect();
             for pk in removed {
                 self.remove_peer(pk).await;
             }
@@ -334,6 +340,47 @@ impl Reconciler {
 /// packets would route back INTO the tun (a loop). Desktop/server pass `None`.
 pub type ProtectFn = std::sync::Arc<dyn Fn(std::os::fd::RawFd) + Send + Sync>;
 
+/// Owns the OS-injected tun fd until fp-tun adopts it. If `run_with` errors out
+/// before adoption (a bind failure, an unreachable control server, …), the guard
+/// closes the fd on drop — otherwise it leaks, and on mobile those leaks pile up
+/// across every reconnect. Disarmed right before fp-tun takes the fd (fp-tun's own
+/// `Fd::Drop` closes it thereafter, so we must NOT double-close).
+#[cfg(unix)]
+struct InjectedFdGuard(Option<std::os::fd::RawFd>);
+#[cfg(unix)]
+impl InjectedFdGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+#[cfg(unix)]
+impl Drop for InjectedFdGuard {
+    fn drop(&mut self) {
+        if let Some(fd) = self.0 {
+            use std::os::fd::FromRawFd;
+            // SAFETY: we hold sole ownership of this fd until disarm (fp-tun adoption);
+            // reclaim it as an OwnedFd so it closes exactly once on drop.
+            drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        }
+    }
+}
+
+/// Bind `0.0.0.0:port` UDP with SO_REUSEADDR. Reuse lets a rapid stop/start rebind
+/// the listen port instead of failing with EADDRINUSE — which, on mobile, would
+/// kill the engine *after* `runNode` already reported success and leak the tun fd.
+fn bind_reuse_udp(port: u16) -> std::io::Result<UdpSocket> {
+    let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    let sock = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    sock.set_reuse_address(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    UdpSocket::from_std(sock.into())
+}
+
 /// Bring up the tunnels from a config FILE (desktop/server: we create the device).
 pub async fn run(cfg_path: &str) -> std::io::Result<()> {
     let cfg: Config = serde_json::from_slice(&std::fs::read(cfg_path)?)?;
@@ -354,10 +401,25 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
     let own_priv = StaticSecret::from(hex32(&cfg.private_key));
     let own_pub = PublicKey::from(&own_priv);
 
+    // Register the protect callback process-wide so the relay/tcp-direct/bonded
+    // transports (which open their own egress sockets) protect them too, not just
+    // the wg UDP socket below. No-op off mobile (protect = None).
+    #[cfg(unix)]
+    if let Some(p) = &protect {
+        fp_transport::set_protect(p.clone());
+    }
+
+    // Own the OS-injected tun fd until fp-tun adopts it below, so any early error
+    // (bind, control fetch) closes it instead of leaking (see InjectedFdGuard).
+    #[cfg(unix)]
+    let mut fd_guard = cfg.tun_fd.map(|fd| InjectedFdGuard(Some(fd)));
+
     // Bind the wg UDP socket FIRST so STUN learns the NAT mapping for this port.
-    // Arc so the data plane can later share one socket across per-core worker
-    // tasks (multicore sharding); `&udp` still deref-coerces to `&UdpSocket`.
-    let udp = Arc::new(UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, cfg.listen_port))).await?);
+    // SO_REUSEADDR so a rapid stop/start (common on mobile, where the OS keeps the
+    // tun/process briefly alive) doesn't hit EADDRINUSE on the listen port and kill
+    // the engine. Arc so the data plane can later share one socket across per-core
+    // worker tasks (multicore sharding); `&udp` still deref-coerces to `&UdpSocket`.
+    let udp = Arc::new(bind_reuse_udp(cfg.listen_port)?);
     // Mobile: exclude our egress socket from the VPN (else wg packets loop into the
     // tun). No-op on desktop/server (protect = None). Relay/tcp-direct sockets are
     // protected the same way where they're opened (see relay/tcp_direct).
@@ -438,7 +500,10 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
     let injected_fd = cfg.tun_fd;
     let embedded = injected_fd.is_some();
     if embedded {
-        tracing::info!(os = std::env::consts::OS, "node running EMBEDDED (adopting OS-provided tun fd)");
+        tracing::info!(
+            os = std::env::consts::OS,
+            "node running EMBEDDED (adopting OS-provided tun fd)"
+        );
     }
     let mut tun_cfg = fp_tun::configure();
     if let Some(fd) = injected_fd {
@@ -455,7 +520,17 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
             tracing::info!(mtu = m, "applying MTU");
         }
     }
-    let eff_dns: Vec<String> = if cfg.dns.is_empty() { r.dns.clone() } else { cfg.dns.clone() };
+    let eff_dns: Vec<String> = if cfg.dns.is_empty() {
+        r.dns.clone()
+    } else {
+        cfg.dns.clone()
+    };
+    // Disarm BEFORE adoption: fp-tun is about to take ownership of the injected fd
+    // and will close it on its own Drop, so the guard must not also close it.
+    #[cfg(unix)]
+    if let Some(g) = fd_guard.as_mut() {
+        g.disarm();
+    }
     let dev = fp_tun::create_as_async(&tun_cfg).map_err(std::io::Error::other)?;
     // The actual kernel device name — equals cfg.tun_name on Linux, an auto-assigned
     // utunN on macOS. Routes must target THIS; the logical/status name stays tun_name.
@@ -600,10 +675,6 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
         })
         .max(1)
         .min(r.peers.len().max(1));
-    let ping = disco_dgram(&Disco::Ping {
-        tx_id: [0u8; 12],
-        sender: *own_pub.as_bytes(),
-    });
 
     // --- TCP-direct (middle rung), multi-peer: each peer gets its own direct
     // TCP connection. We dial peers with a larger pubkey (we're the smaller-keyed
@@ -658,8 +729,9 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
         let stat = status::PeerStat::new(pi.allowed_ips.clone());
         status_reg.write().insert(pi.pubkey, stat.clone());
         allowed.push((pi.allowed_ips, pi.pubkey, wid));
-        let mut peer = Peer::fresh(pi.pubkey, pi.candidates, cfg.force_relay, stat);
+        let mut peer = Peer::fresh(pi.pubkey, pi.candidates, cfg.force_relay, stat, &own_priv);
         if !cfg.force_relay {
+            let ping = peer.disco_ping(own_pub.as_bytes());
             for c in &peer.candidates {
                 let _ = udp.send_to(&ping, *c).await;
             }
@@ -842,7 +914,6 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
             own_priv: own_priv.clone(),
             own_pub,
             force_relay: cfg.force_relay,
-            ping: ping.clone(),
             tun_out: tun_out_tx.clone(),
             status: status_reg.clone(),
         };
@@ -941,10 +1012,54 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
 }
 
 pub use config::keygen;
-pub use daemon::daemon;
+pub use daemon::{daemon, set_exit};
+pub use join::config_dir;
 pub use join::join;
 pub use show::{list_networks, show};
-pub use join::config_dir;
+
+pub fn fw_selftest(action: &str, phys: &str, tun: &str) -> std::io::Result<()> {
+    let fw = firewall::detect();
+    println!("firewall backend: {}", fw.name());
+    match action {
+        "detect" => {}
+        "up" => fw.up(phys, tun),
+        "down" => fw.down(phys, tun),
+        "killswitch-on" => fw.killswitch_on(phys, tun),
+        "killswitch-off" => fw.killswitch_off(phys, tun),
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unknown fw-selftest action: {other}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn dns_selftest(action: &str, dns: Option<&str>) -> std::io::Result<()> {
+    let backend = dns::detect();
+    println!("dns backend: {}", backend.name());
+    match action {
+        "detect" => {}
+        "set" => {
+            let Some(dns) = dns else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "dns-selftest set requires a DNS server",
+                ));
+            };
+            backend.set(dns);
+        }
+        "clear" => backend.clear(),
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unknown dns-selftest action: {other}"),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Install admin-set DNS servers (the editable `DNS =` wg setting). Writing
 /// `/etc/resolv.conf` clobbers system DNS, so it's gated behind `FLUXPEER_MANAGE_DNS=1`

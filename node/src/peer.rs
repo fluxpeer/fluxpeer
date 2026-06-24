@@ -6,15 +6,19 @@ use std::time::{Duration, Instant};
 
 use fp_crypto::RawCryptor;
 use fp_crypto::x25519::{PublicKey, StaticSecret};
+use fp_disco::Disco;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::relay::RelayOut;
-use crate::util::{T_DATA, T_HANDSHAKE_RESP, le_u32};
+use crate::util::{T_DATA, T_HANDSHAKE_RESP, auth_disco_dgram, disco_shared, disco_tx_id, le_u32};
 
 /// Per-peer wg session + path state.
 pub(crate) struct Peer {
     pub(crate) pubkey: [u8; 32],
+    /// Per-peer disco MAC key = static-static DH(own_priv, peer_pubkey), cached so
+    /// every disco ping/pong to/from this peer is authenticated without re-deriving.
+    pub(crate) disco_key: [u8; 32],
     pub(crate) candidates: Vec<SocketAddr>,
     pub(crate) raw: RawCryptor,
     pub(crate) direct_addr: Option<SocketAddr>,
@@ -87,9 +91,11 @@ impl Peer {
         candidates: Vec<SocketAddr>,
         force_relay: bool,
         stat: Arc<crate::status::PeerStat>,
+        own_priv: &StaticSecret,
     ) -> Self {
         Peer {
             pubkey,
+            disco_key: disco_shared(own_priv, &pubkey),
             direct_addr: if force_relay { None } else { candidates.first().copied() },
             candidates,
             raw: RawCryptor::new::<fp_crypto_noise::Cryptor>(),
@@ -114,6 +120,19 @@ impl Peer {
             init_sent_at: None,
             stat,
         }
+    }
+
+    /// Build an authenticated disco Ping toward this peer (a hole-punch probe),
+    /// MAC'd with the per-peer DH key + a fresh timestamped tx_id so the peer can
+    /// trust the path hint and reject replays.
+    pub(crate) fn disco_ping(&self, own_pub: &[u8; 32]) -> Vec<u8> {
+        auth_disco_dgram(
+            &self.disco_key,
+            &Disco::Ping {
+                tx_id: disco_tx_id(),
+                sender: *own_pub,
+            },
+        )
     }
 
     /// Fold a fresh RTT sample (init→resp) into the smoothed estimate.
@@ -142,7 +161,10 @@ pub(crate) async fn send_to_peer(
         && let Some(addr) = peer.direct_addr
     {
         let _ = udp.send_to(bytes, addr).await;
-    } else if !force_relay && !peer.prefer_relay && let Some(tx) = &peer.tcp_out {
+    } else if !force_relay
+        && !peer.prefer_relay
+        && let Some(tx) = &peer.tcp_out
+    {
         // TCP-direct: try_send (drop-on-full), wg retransmits any dropped frame.
         // Gated on !prefer_relay so a dead-but-open TCP connection doesn't swallow
         // packets when liveness/relay-receipt says to use the relay.

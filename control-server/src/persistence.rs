@@ -523,6 +523,7 @@ pub async fn count_rows(pool: &AnyPool) -> Result<i64, sqlx::Error> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // non-test items intentionally follow
 mod test {
     use super::*;
 

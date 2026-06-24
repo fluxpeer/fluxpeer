@@ -156,9 +156,25 @@ fn print_human(v: &serde_json::Value) {
             Some(ep) => println!("  endpoint: {ep}  ({transport})"),
             None => println!("  endpoint: (none)  ({transport})"),
         }
-        let ips: Vec<&str> = p["allowed_ips"].as_array().map(Vec::as_slice).unwrap_or(&[]).iter().filter_map(|x| x.as_str()).collect();
-        println!("  allowed ips: {}", if ips.is_empty() { "(none)".to_string() } else { ips.join(", ") });
-        println!("  latest handshake: {}", ago(p["last_handshake_unix"].as_u64().unwrap_or(0)));
+        let ips: Vec<&str> = p["allowed_ips"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        println!(
+            "  allowed ips: {}",
+            if ips.is_empty() {
+                "(none)".to_string()
+            } else {
+                ips.join(", ")
+            }
+        );
+        println!(
+            "  latest handshake: {}",
+            ago(p["last_handshake_unix"].as_u64().unwrap_or(0))
+        );
         println!(
             "  transfer: {} received, {} sent",
             human_bytes(p["rx_bytes"].as_u64().unwrap_or(0)),
@@ -189,7 +205,10 @@ fn ago(unix: u64) -> String {
     if unix == 0 {
         return "never".to_string();
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let d = now.saturating_sub(unix);
     if d < 60 {
         format!("{d} second{} ago", plural(d))

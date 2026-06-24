@@ -67,6 +67,7 @@ fn short_key(pubkey: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // non-test items intentionally follow
 mod import_test {
     use super::*;
 
@@ -105,14 +106,15 @@ impl Client {
     pub fn new(base: impl Into<String>) -> Self {
         // Authenticate management calls with the admin password as a bearer when
         // `FLUXPEER_ADMIN_PASSWORD` is set (the control-server accepts the password
-        // directly or a session token). Node-only endpoints ignore it.
+        // directly or a session token). Device-scoped calls pass their enroll-issued
+        // auth token here; truly open endpoints ignore it.
         let pw = std::env::var("FLUXPEER_ADMIN_PASSWORD").unwrap_or_default();
         Self::with_password(base, &pw)
     }
 
     /// Like [`Client::new`] but with an explicit admin bearer (e.g. typed into a
     /// GUI), instead of reading `FLUXPEER_ADMIN_PASSWORD` from the environment. An
-    /// empty `password` sends no auth header (fine for open/node endpoints).
+    /// empty `password` sends no auth header (fine only for truly open endpoints).
     pub fn with_password(base: impl Into<String>, password: &str) -> Self {
         let mut builder = reqwest::Client::builder();
         if !password.is_empty()
@@ -203,24 +205,67 @@ impl Client {
             .map_err(Into::into)
     }
 
-    /// Enroll a device with an invite code (open endpoint; no admin auth). Returns
-    /// the created device (id + centrally-allocated overlay address). Used by the
-    /// `fluxpeer join` one-command onboarding flow.
-    pub async fn enroll(&self, invite_code: &str, name: &str, wg_public_key: &str) -> Result<Value> {
+    /// Enroll a device with an invite code (open endpoint; no admin auth). Runs the
+    /// two-round proof-of-possession (audit #11): proves we hold the wg PRIVATE key
+    /// for the public key being enrolled, so a caller can't squat a key it doesn't
+    /// own. Takes the wg private key (hex) — the public half and the ECDH proof are
+    /// derived here and the private key never leaves the process. Returns the created
+    /// device (id + overlay address + one-time `auth_token`). Used by `fluxpeer join`.
+    pub async fn enroll(&self, invite_code: &str, name: &str, wg_private_key: &str) -> Result<Value> {
+        use fp_crypto::x25519::{PublicKey, StaticSecret};
+
+        let priv_bytes: [u8; 32] = hex::decode(wg_private_key)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .context("wg_private_key must be 32-byte hex")?;
+        let sk = StaticSecret::from(priv_bytes);
+        let pub_hex = hex::encode(PublicKey::from(&sk).to_bytes());
+
+        // Round 1: fetch an ephemeral server key + challenge id for this public key.
+        let chal: Value = self
+            .http
+            .post(self.url("/enroll/challenge"))
+            .json(&json!({ "wg_public_key": pub_hex }))
+            .send()
+            .await
+            .context("challenge request failed")?
+            .error_for_status()
+            .context("enroll challenge rejected")?
+            .json()
+            .await
+            .context("decode challenge response")?;
+        let challenge_id = chal["challenge_id"].as_str().context("challenge missing challenge_id")?;
+        let server_pub: [u8; 32] = chal["server_pub"]
+            .as_str()
+            .and_then(|s| hex::decode(s).ok())
+            .and_then(|v| v.try_into().ok())
+            .context("challenge server_pub not 32-byte hex")?;
+
+        // Round 2: proof = DH(wg_priv, server_pub); the server recomputes DH(e_priv,
+        // wg_pub) and compares — equal iff we hold wg_priv.
+        let proof = hex::encode(sk.diffie_hellman(&PublicKey::from(server_pub)).to_bytes());
+
         self.http
             .post(self.url("/enroll"))
-            .json(&json!({ "invite_code": invite_code, "name": name, "wg_public_key": wg_public_key }))
+            .json(&json!({
+                "invite_code": invite_code,
+                "name": name,
+                "wg_public_key": pub_hex,
+                "challenge_id": challenge_id,
+                "proof": proof,
+            }))
             .send()
             .await
             .context("request failed")?
             .error_for_status()
-            .context("enroll rejected (bad/expired invite?)")?
+            .context("enroll rejected (bad/expired invite or proof-of-possession failed?)")?
             .json()
             .await
             .context("decode enroll response")
     }
 
-    /// Resolve a device's gateway connect params (open endpoint; node-only).
+    /// Resolve a device's gateway connect params. Device-scoped control routes
+    /// require the enroll-issued auth token as this client's bearer.
     /// Returns `{node_pubkey, node_addr, node_port, transport_protocol,
     /// iface_ipv4?, mtu?, dns, allowed_routes, config_epoch}` — what a thin/
     /// mobile node merges into its `ClientStartReq` to reach the mesh via a
@@ -294,7 +339,8 @@ impl Client {
             .map_err(Into::into)
     }
 
-    /// Report a device's cumulative traffic stats (node → control; open endpoint).
+    /// Report a device's cumulative traffic stats (node → control). Device-scoped
+    /// control routes require the enroll-issued auth token as this client's bearer.
     pub async fn report_stats(&self, device_id: &str, rx: i64, tx: i64, peers: &Value) -> Result<()> {
         self.http
             .post(self.url(&format!("/devices/{device_id}/stats")))
@@ -329,7 +375,8 @@ impl Client {
             .map_err(Into::into)
     }
 
-    /// Report a device's reachable candidate endpoints (disco).
+    /// Report a device's reachable candidate endpoints (disco). Device-scoped
+    /// control routes require the enroll-issued auth token as this client's bearer.
     pub async fn set_endpoints(&self, device_id: &str, endpoints: &[String]) -> Result<()> {
         self.http
             .post(self.url(&format!("/devices/{device_id}/endpoints")))

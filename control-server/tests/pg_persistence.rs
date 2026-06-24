@@ -45,6 +45,37 @@ async fn body_json(resp: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+/// Full two-round enroll with proof-of-possession (audit #11); returns the response.
+async fn enroll_pop(app: &axum::Router, code: &str, name: &str, seed: u8) -> axum::response::Response {
+    use fp_crypto::x25519::{PublicKey, StaticSecret};
+    let sk = StaticSecret::from([seed; 32]);
+    let pub_hex = hex::encode(PublicKey::from(&sk).to_bytes());
+    let resp = app
+        .clone()
+        .oneshot(post("/api/v1/enroll/challenge", json!({ "wg_public_key": pub_hex })))
+        .await
+        .unwrap();
+    let chal = body_json(resp).await;
+    let server_pub: [u8; 32] = hex::decode(chal["server_pub"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let proof = hex::encode(sk.diffie_hellman(&PublicKey::from(server_pub)).to_bytes());
+    app.clone()
+        .oneshot(post(
+            "/api/v1/enroll",
+            json!({
+                "invite_code": code,
+                "name": name,
+                "wg_public_key": pub_hex,
+                "challenge_id": chal["challenge_id"].as_str().unwrap(),
+                "proof": proof,
+            }),
+        ))
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn persistence_survives_restart_on_postgres() {
     let Some(url) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
@@ -84,14 +115,7 @@ async fn persistence_survives_restart_on_postgres() {
             .unwrap();
         let code = body_json(resp).await["code"].as_str().unwrap().to_string();
 
-        let resp = app
-            .clone()
-            .oneshot(post(
-                "/api/v1/enroll",
-                json!({"invite_code": code, "name": "a", "wg_public_key": "k1"}),
-            ))
-            .await
-            .unwrap();
+        let resp = enroll_pop(&app, &code, "a", 1).await;
         assert_eq!(resp.status(), StatusCode::CREATED);
         let d1 = body_json(resp).await;
         assert_eq!(
@@ -100,14 +124,7 @@ async fn persistence_survives_restart_on_postgres() {
         );
         let d1_id = d1["id"].as_str().unwrap().to_string();
 
-        let resp = app
-            .clone()
-            .oneshot(post(
-                "/api/v1/enroll",
-                json!({"invite_code": code, "name": "b", "wg_public_key": "k2"}),
-            ))
-            .await
-            .unwrap();
+        let resp = enroll_pop(&app, &code, "b", 2).await;
         let d2_id = body_json(resp).await["id"].as_str().unwrap().to_string();
 
         // revoke d2

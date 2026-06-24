@@ -85,6 +85,23 @@ fn protect_socket(fd: RawFd) {
     }
 }
 
+/// Engine → Kotlin upcall: the node engine exited on its OWN (a fatal error or the
+/// data plane returning), NOT via `stopNode`. Without this the service would keep
+/// showing a stale "connected" state behind a dead engine; the Kotlin side tears
+/// down (releasing the wake lock + the tun fd) on receipt. Runs on the fp-node
+/// thread, so it must attach to the JVM first.
+fn engine_exited() {
+    let (Some(vm), Some(class)) = (JVM.get(), NODE_CLASS.get()) else {
+        return;
+    };
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return;
+    };
+    if let Err(e) = env.call_static_method(class, "onEngineExit", "()V", &[]) {
+        tracing::error!("[jni] onEngineExit upcall failed: {e}");
+    }
+}
+
 /// `runNode(cfgJson: String, tunFd: int) -> String`. Starts the full node engine on
 /// a background thread with its own multi-thread runtime, adopting `tunFd`. Returns
 /// a JSON status immediately (the engine runs until `stopNode` or error).
@@ -122,8 +139,12 @@ pub extern "system" fn Java_dev_fluxpeer_fluxpeer_FluxpeerNode_runNode<'l>(
             let protect: fluxpeer_node::ProtectFn = Arc::new(protect_socket);
             tokio::select! {
                 r = fluxpeer_node::run_embedded(&cfg, fd, Some(protect)) => {
+                    // The engine ended by itself (error / lost its last path). Tell the
+                    // service so it tears down instead of showing a stale "connected".
                     tracing::warn!(?r, "[fp-node] engine exited");
+                    engine_exited();
                 }
+                // stopNode: the select cancels run_embedded; expected, no upcall.
                 _ = stop_rx => tracing::info!("[fp-node] stop requested"),
             }
         });

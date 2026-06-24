@@ -9,9 +9,9 @@
 #
 # Requires root (netns/veth/TUN) and a built `fluxpeer` binary. Run on a Linux
 # build host:
-#   FLUXPEER_BIN=~/fpbuild/target/release/fluxpeer scripts/regression-netns.sh
+#   FLUXPEER_BIN=./target/release/fluxpeer scripts/regression-netns.sh
 set -u
-B=${FLUXPEER_BIN:-$HOME/fpbuild/target/release/fluxpeer}
+B=${FLUXPEER_BIN:-./target/release/fluxpeer}
 D=${FLUXPEER_REG_DIR:-$HOME/fp-reg}
 NS=fpns
 CPORT=18090            # control-server (bound on the host veth IP so the netns can reach it)
@@ -65,11 +65,16 @@ python3 -c "import json;p='$D/cfg/A.json';c=json.load(open(p));c['tun_name']='fp
 python3 -c "import json;p='$D/cfg/B.json';c=json.load(open(p));c['tun_name']='fpr1';c['listen_port']=$PB;json.dump(c,open(p,'w'))"
 IDA=$(python3 -c "import json;print(json.load(open('$D/cfg/A.json'))['device_id'])")
 IDB=$(python3 -c "import json;print(json.load(open('$D/cfg/B.json'))['device_id'])")
-ADDRB=$(curl -s $CTRL/api/v1/devices/$IDB/config | python3 -c "import sys,json;print(json.load(sys.stdin).get('address_v4',''))" 2>/dev/null)
+# Per-device auth token (enroll-issued): the /devices/:id/* routes are bearer-gated
+# (the IDOR keystone fix), so a guessable dev-N id is no longer authority. The join
+# persisted each token in the node config.
+TOKA=$(python3 -c "import json;print(json.load(open('$D/cfg/A.json')).get('auth_token',''))")
+TOKB=$(python3 -c "import json;print(json.load(open('$D/cfg/B.json')).get('auth_token',''))")
+ADDRB=$(curl -s -H "Authorization: Bearer $TOKB" $CTRL/api/v1/devices/$IDB/config | python3 -c "import sys,json;print(json.load(sys.stdin).get('address_v4',''))" 2>/dev/null)
 
 echo "===== set reachable endpoints (A on host veth, B on netns veth) ====="
-curl -s -X POST $CTRL/api/v1/devices/$IDA/endpoints -H 'content-type: application/json' -d "{\"endpoints\":[\"10.0.0.1:$PA\"]}" >/dev/null
-curl -s -X POST $CTRL/api/v1/devices/$IDB/endpoints -H 'content-type: application/json' -d "{\"endpoints\":[\"10.0.0.2:$PB\"]}" >/dev/null
+curl -s -X POST $CTRL/api/v1/devices/$IDA/endpoints -H 'content-type: application/json' -H "Authorization: Bearer $TOKA" -d "{\"endpoints\":[\"10.0.0.1:$PA\"]}" >/dev/null
+curl -s -X POST $CTRL/api/v1/devices/$IDB/endpoints -H 'content-type: application/json' -H "Authorization: Bearer $TOKB" -d "{\"endpoints\":[\"10.0.0.2:$PB\"]}" >/dev/null
 ok "endpoints set"
 
 echo "===== run node-A (host) + node-B (in $NS) ====="
