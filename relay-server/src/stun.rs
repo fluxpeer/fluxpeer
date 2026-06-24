@@ -18,7 +18,16 @@ pub async fn serve_stun(addr: SocketAddr) -> std::io::Result<()> {
     tracing::info!(%addr, "relay-server STUN (UDP) listening");
     let mut buf = [0u8; 1500];
     loop {
-        let (n, from) = sock.recv_from(&mut buf).await?;
+        // Log-and-continue, never propagate: a single recv error (e.g. an ICMP
+        // port-unreachable surfaced on some platforms) must not kill the responder —
+        // the relay is the default-advertised STUN, so dying = fleet-wide relay flap.
+        let (n, from) = match sock.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "STUN recv_from error; continuing");
+                continue;
+            }
+        };
         if let Some(body) = buf[..n].strip_prefix(DISCO_MAGIC)
             && let Ok((Disco::Ping { tx_id, .. }, _)) = Disco::decode(body)
         {

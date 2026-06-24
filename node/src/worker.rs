@@ -308,7 +308,7 @@ impl WorkerState {
             // current transport rung (mirrors send_to_peer), rtt, endpoint.
             let tp = if !peer.handshaked {
                 status::T_NONE
-            } else if !self.force_relay && !peer.prefer_relay && peer.direct_addr.is_some() {
+            } else if !self.force_relay && !peer.prefer_relay && !peer.prefer_tcp && peer.direct_addr.is_some() {
                 status::T_UDP_DIRECT
             } else if !self.force_relay && peer.tcp_out.is_some() {
                 status::T_TCP_DIRECT

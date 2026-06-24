@@ -33,6 +33,12 @@ where
     let mut hdr = [0u8; 5];
     rd.read_exact(&mut hdr).await?;
     let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+    // Bound the length a hostile/on-path relay can claim: without this the
+    // `vec![0u8; len]` below would let it force a multi-GiB allocation (client OOM)
+    // before any read. Mirror the server's own MAX_PACKET_SIZE+key cap.
+    if len > fluxpeer_relay_server::proto::MAX_PACKET_SIZE + 64 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "relay ServerInfo frame too large"));
+    }
     rd.read_exact(&mut vec![0u8; len]).await?;
 
     let (in_tx, in_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);

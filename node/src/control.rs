@@ -83,8 +83,13 @@ pub(crate) async fn fetch_relays(cfg: &Config) -> Vec<RelayDir> {
 /// STUN: send a disco Ping to `stun` and return the reflexive (public) `ip:port`
 /// it observed us at — our NAT mapping for `udp`, advertised so peers can punch.
 pub(crate) async fn stun_query(udp: &UdpSocket, stun: SocketAddr) -> Option<SocketAddr> {
+    // Random transaction id, validated on the Pong: binds the reply to THIS query so
+    // an off-path attacker who spoofs the STUN server's source can't pre/blind-forge
+    // a Pong that poisons our advertised reflexive address (audit finding 8).
+    let mut tx_id = [0u8; 12];
+    getrandom::getrandom(&mut tx_id).ok()?;
     let ping = disco_dgram(&Disco::Ping {
-        tx_id: [0u8; 12],
+        tx_id,
         sender: [0u8; 32],
     });
     let mut buf = [0u8; 1500];
@@ -93,7 +98,8 @@ pub(crate) async fn stun_query(udp: &UdpSocket, stun: SocketAddr) -> Option<Sock
         if let Ok(Ok((n, from))) = tokio::time::timeout(Duration::from_millis(500), udp.recv_from(&mut buf)).await
             && from == stun
             && let Some(body) = buf[..n].strip_prefix(DISCO_MAGIC)
-            && let Ok((Disco::Pong { observed, .. }, _)) = Disco::decode(body)
+            && let Ok((Disco::Pong { tx_id: echo, observed }, _)) = Disco::decode(body)
+            && echo == tx_id
         {
             return Some(observed);
         }
