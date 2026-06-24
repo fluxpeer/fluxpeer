@@ -323,8 +323,13 @@ pub(crate) fn set_path(peer: &mut Peer, from: Option<SocketAddr>, via: &str) {
         }
         // TCP-direct: the peer reaches us over TCP (UDP is blocked) — reply over TCP,
         // not the relay. Follows the peer off the relay too (unless hard-pinned).
+        // TCP-direct IS a direct (non-relay) path, so refresh `last_recv_direct` here
+        // too: the silence check keys on it, and without this a stable TCP-direct-only
+        // peer (UDP blocked / double-NAT) would always read as "silent" and collapse
+        // to relay permanently — the TCP-direct middle rung must be a resting state.
         "tcp-direct" => {
             peer.prefer_tcp = true;
+            peer.last_recv_direct = Some(Instant::now());
             if !peer.relay_pinned {
                 peer.prefer_relay = false;
             }
