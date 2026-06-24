@@ -241,12 +241,17 @@ impl RelayServer {
                     }
                     None => break "outbound closed",
                 },
-                inbound = receiver.recv() => match inbound {
-                    Ok(bytes) => match Frame::decode(&bytes) {
+                inbound = tokio::time::timeout(PLAIN_TCP_IDLE_TIMEOUT, receiver.recv()) => match inbound {
+                    Ok(Ok(bytes)) => match Frame::decode(&bytes) {
                         Ok((frame, _)) => self.handle_inbound(pubkey, frame, &self_tx, &mut bucket),
                         Err(_) => break "protocol error",
                     },
-                    Err(_) => break "client closed",
+                    Ok(Err(_)) => break "client closed",
+                    // No frame (not even a 3s keepalive Ping) for the idle window: a
+                    // silently-dead bonded peer (dropped NAT mapping / force-kill) that
+                    // the bond layer never surfaces as an error. Drop it so its hub
+                    // registration is freed instead of black-holing traffic (finding 2).
+                    Err(_) => break "idle timeout",
                 },
             }
         };
