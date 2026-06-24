@@ -9,7 +9,13 @@
 //! Ping→Pong, PeerGone, per-client inbound rate limit, bounded send queues.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Drop a plain-TCP client that hasn't sent ANY frame (not even its 3s keepalive
+/// Ping) for this long. A half-open TCP (peer force-killed, NAT dropped the mapping)
+/// otherwise leaves the read blocked forever, pinning a stale pubkey registration so
+/// returning frames queue to a dead socket. 20s tolerates ~6 missed keepalives.
+const PLAIN_TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 use fp_transport_tcp_bond::TcpBondConnector;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -299,10 +305,13 @@ impl RelayServer {
                     }
                     None => break "outbound closed",
                 },
-                inbound = reader.next_frame() => match inbound {
-                    Ok(Some(frame)) => self.handle_inbound(pubkey, frame, &self_tx, &mut bucket),
-                    Ok(None) => break "client closed",
-                    Err(_) => break "protocol/io error",
+                inbound = tokio::time::timeout(PLAIN_TCP_IDLE_TIMEOUT, reader.next_frame()) => match inbound {
+                    Ok(Ok(Some(frame))) => self.handle_inbound(pubkey, frame, &self_tx, &mut bucket),
+                    Ok(Ok(None)) => break "client closed",
+                    Ok(Err(_)) => break "protocol/io error",
+                    // No frame (not even a keepalive Ping) for the idle window → the
+                    // client is gone/half-open; drop it so its registration is freed.
+                    Err(_) => break "idle timeout",
                 },
             }
         };
