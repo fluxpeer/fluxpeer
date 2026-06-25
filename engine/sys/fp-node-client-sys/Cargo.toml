@@ -54,7 +54,9 @@ tokio-stream = { workspace = true }
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 
-# `examples/mobilecli.rs` — headless mesh client (intranet node).
+# `tests/gateway_auth.rs` — control-server gateway-auth integration test.
+# (The retired `examples/mobilecli.rs` dispatcher demo was removed 2026-06-25;
+#  mobile clients are full nodes now — see docs/MOBILE-E2E.md.)
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing-subscriber = { workspace = true }

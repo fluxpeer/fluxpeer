@@ -1140,10 +1140,8 @@ dependencies = [
  "flume",
  "fp-conhash",
  "fp-crypto",
- "fp-crypto-noise",
  "fp-node-core",
  "fp-transport",
- "fp-transport-udp",
  "fp-tun",
  "futures",
  "hex",
@@ -1154,7 +1152,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
- "tracing-subscriber",
  "x25519-dalek",
 ]
 
