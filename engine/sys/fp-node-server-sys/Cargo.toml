@@ -2,6 +2,11 @@
 name = "fp-node-server-sys"
 version = "2.2.5"
 edition = "2024"
+# RETIRED (2026-06-25): the dispatcher "gateway server" (formerly `examples/mobilegw`)
+# is superseded by mobile-as-node — the phone now runs the full node engine
+# (fp-node-mobile-sys: magicsock+disco) and peers with a real `fluxpeer node`, not a
+# dispatcher gateway. Crate kept for reference only; it has no production consumer.
+# Mobile e2e is now scripts/e2e-android-node.sh (see docs/MOBILE-E2E.md).
 
 [features]
 debug_log = ["fp-node-core/debug_log"]
@@ -28,10 +33,3 @@ serde = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "sync"] }
 tokio-stream = { workspace = true }
-
-# `examples/mobilegw.rs` — runnable gateway server for the mobile client protocol.
-[dev-dependencies]
-fp-transport-udp = { workspace = true }
-fp-crypto-noise = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-tracing-subscriber = { workspace = true }
