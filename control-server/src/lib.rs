@@ -233,24 +233,38 @@ fn parse_endpoint(ep: &str) -> Option<(String, u16)> {
     Some((host.to_string(), port.parse().ok()?))
 }
 
-/// Pick a gateway from a device's config: the first active peer advertising a
-/// usable `ip:port`. Its `allowed_ips` become the client's tunnel routes.
+/// Pick a gateway from a device's config. **Prefer an exit peer** — one that
+/// advertises a default route (`0.0.0.0/0` / `::/0`) — so a client asking for a
+/// gateway to full-tunnel through gets the real exit, not whichever peer happens
+/// to be first in the list (which may be a non-exit peer on an unreachable LAN
+/// endpoint). Fall back to the first active peer with a usable `ip:port`. The
+/// chosen peer's `allowed_ips` become the client's tunnel routes.
 fn select_gateway(cfg: &domain::DeviceConfig) -> Option<GatewayConfig> {
-    for peer in &cfg.peers {
-        for ep in &peer.endpoints {
-            if let Some((node_addr, node_port)) = parse_endpoint(ep) {
-                return Some(GatewayConfig {
-                    node_pubkey: peer.wg_public_key.clone(),
-                    node_addr,
-                    node_port,
-                    transport_protocol: "udp".to_string(),
-                    iface_ipv4: cfg.address_v4.clone(),
-                    iface_ipv6: cfg.address_v6.clone(),
-                    mtu: cfg.mtu,
-                    dns: cfg.dns.clone(),
-                    allowed_routes: peer.allowed_ips.clone(),
-                    config_epoch: cfg.config_epoch,
-                });
+    // Pass 1: only exit peers (advertise a default route). Pass 2: any peer.
+    for want_exit in [true, false] {
+        for peer in &cfg.peers {
+            let is_exit = peer
+                .allowed_ips
+                .iter()
+                .any(|c| c == "0.0.0.0/0" || c == "::/0");
+            if want_exit && !is_exit {
+                continue;
+            }
+            for ep in &peer.endpoints {
+                if let Some((node_addr, node_port)) = parse_endpoint(ep) {
+                    return Some(GatewayConfig {
+                        node_pubkey: peer.wg_public_key.clone(),
+                        node_addr,
+                        node_port,
+                        transport_protocol: "udp".to_string(),
+                        iface_ipv4: cfg.address_v4.clone(),
+                        iface_ipv6: cfg.address_v6.clone(),
+                        mtu: cfg.mtu,
+                        dns: cfg.dns.clone(),
+                        allowed_routes: peer.allowed_ips.clone(),
+                        config_epoch: cfg.config_epoch,
+                    });
+                }
             }
         }
     }
