@@ -540,7 +540,17 @@ impl WorkerState {
         )
         .await
         {
-            let _ = self.tun_out.send(pkt).await;
+            let pkt_len = pkt.len();
+            if let Err(e) = self.tun_out.send(pkt).await {
+                let peer = hex::encode(&self.peers[pos].pubkey[..4]);
+                tracing::error!(
+                    peer = %peer,
+                    via,
+                    plaintext_len = e.0.len(),
+                    expected_len = pkt_len,
+                    "tun writer queue closed; dropping decrypted packet"
+                );
+            }
         }
     }
 

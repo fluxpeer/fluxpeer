@@ -30,9 +30,31 @@ git rev-parse --short HEAD                  # pin the commit; tree must be clean
 cargo zigbuild --release --target x86_64-unknown-linux-musl -p fluxpeer
 # client (Android engine + APK), same HEAD:
 ANDROID_NDK_HOME=$HOME/Library/Android/sdk/ndk/<ver> scripts/build-android.sh
-( cd ../fluxpeer-app && flutter build apk --release )
-adb install -r ../fluxpeer-app/build/app/outputs/flutter-apk/app-release.apk
+( cd ../fluxpeer-app && flutter build apk --debug )
 ```
+
+## 铁律 — mobile test = UNINSTALL → REBUILD → FRESH INSTALL (never `install -r`)
+Every mobile (Android/iOS) test run **must uninstall the app, rebuild the APK, and do a
+clean install** — never `adb install -r`, never reuse a stale APK or a stale VPN session.
+
+```bash
+adb uninstall dev.fluxpeer.fluxpeer            # delete: clears stale WorkManager DB + VPN state
+( cd ../fluxpeer-app && flutter build apk --debug )   # recompile from the pinned HEAD
+adb install ../fluxpeer-app/build/app/outputs/flutter-apk/app-debug.apk   # fresh install
+# then: join in-app → connect ONCE → wait 1–3 min for disco to converge → test. DO NOT churn.
+```
+Why: (1) `install -r` keeps the old `androidx.work` WorkDatabase → the new build crashes on
+launch. (2) Reconnecting/toggling a live session repeatedly corrupts the VPN tun-fd / NAT
+mapping / disco endpoints — the data plane then carries handshakes/keepalives but drops app
+traffic (verified: ICMP round-trips at the peer, but the phone never receives the reply).
+A clean reinstall is the only reliable reset; **connect once and leave it alone** while disco
+converges. Restarting the engine more than necessary makes it worse, not better.
+
+> **Release build caveat:** `flutter build apk --release` currently has an unresolved
+> data-plane bug (handshake OK, app traffic doesn't traverse the tunnel) that the R8/JNI keep
+> rules + tun-fd lifetime fix did NOT fully resolve — the residual difference looks like
+> Flutter release/AOT packaging affecting the native data plane. **Use `--debug` until that
+> is fixed.**
 
 ## Topology
 ```
