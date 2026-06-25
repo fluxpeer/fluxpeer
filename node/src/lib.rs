@@ -778,11 +778,25 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
 
     // TUN writer: sole owner of the framed sink (one fd → writes are serial).
     tokio::spawn(async move {
+        let mut written: u64 = 0;
         while let Some(pkt) = tun_out_rx.recv().await {
-            if tun_tx.send(TunPacket::new(pkt)).await.is_err() {
-                break;
+            let pkt_len = pkt.len();
+            match tun_tx.send(TunPacket::new(pkt)).await {
+                Ok(()) => {
+                    written += 1;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        written,
+                        plaintext_len = pkt_len,
+                        "tun fd write failed; writer exiting"
+                    );
+                    break;
+                }
             }
         }
+        tracing::warn!(written, "tun writer task exited");
     });
     // TUN reader: egress IP packet → owning peer/worker by allowed_ips.
     {

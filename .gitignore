@@ -88,3 +88,4 @@ clients/mobile/build/
 clients/mobile/.dart_tool/
 clients/mobile/ios/**/Frameworks/
 clients/desktop/target/
+fluxpeer-node.json
