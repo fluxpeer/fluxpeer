@@ -372,7 +372,24 @@ try:
     scenario('S0', s0)
     # S1 (AD-1+AD-2): only the admin's 0.0.0.0/0 approval (no exit_node flag on the
     # exit) + the client's `use_exit=auto` opt-in → full-tunnel internet works.
-    scenario('S1', lambda: (pair(), probes(True)))
+    def wan_probe():
+        cli_cfg = api('GET', f'/devices/{state["c"]["device_id"]}/config', token=state['c']['auth_token'])
+        # All lifecycle cleanup is scoped to the probe created by this run.
+        containers.append('fpe-wanprobe')
+        try:
+            need(P + ['run', '-d', '--pull=never', '--cap-add', 'NET_ADMIN', '--name', 'fpe-wanprobe',
+                      '--network', 'fpe-wan', IMAGE, 'sleep', 'infinity'])
+            need(px('fpe-wanprobe', 'ip', 'route', 'add', cli_cfg['address_v4'] + '/32', 'via', WAN + '.20'))
+            check('wan-probe-reaches-exit', px('fpe-wanprobe', 'ping', '-c', '2', '-W', '2', WAN + '.20'))
+            check('wan-new-conn-to-client-overlay-rejected',
+                  px('fpe-wanprobe', 'ping', '-c', '2', '-W', '2', cli_cfg['address_v4']), False)
+            # The guard is limited to WAN; initiating from routed LAN still works.
+            check('lan-new-conn-to-client-overlay', px('fpe-intra', 'ping', '-c', '2', '-W', '2', cli_cfg['address_v4']))
+            capture('after-wan-probe')
+        finally:
+            need(P + ['rm', '-f', '-t', '0', 'fpe-wanprobe'])
+            containers.remove('fpe-wanprobe')
+    scenario('S1', lambda: (pair(), probes(True), wan_probe()))
     # S1-split (AD-2): same approved exit, but the client never opted in → default
     # prefixes are stripped; overlay/intranet work, public does NOT (split-tunnel).
     def s1split():

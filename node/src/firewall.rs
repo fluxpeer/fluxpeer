@@ -399,10 +399,16 @@ fn iptables_with(runner: &mut impl apply::Runner, op: Operation, phys: &str, tun
             Err(e) => return Err(e),
         };
         for chain in std::iter::once("FORWARD").chain(docker.then_some("DOCKER-USER")) {
-            // Insert the outbound rule first, then the established return rule
-            // at position 1; both precede Docker's isolation jumps/drop rules.
+            // Install the WAN-only guard first, then move our ACCEPT rules in
+            // front of it. Reinsert existing ACCEPTs too: an upgrade from the
+            // previous ruleset must preserve this order, not leave DROP first.
+            // All three precede external rules without affecting LAN ingress.
             let outbound = [chain, "-i", tun, "-o", phys, "-m", "comment", "--comment", &tag, "-j", "ACCEPT"];
             let inbound = [chain, "-i", phys, "-o", tun, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-m", "comment", "--comment", &tag, "-j", "ACCEPT"];
+            let ingress = [chain, "-i", phys, "-o", tun, "-m", "conntrack", "!", "--ctstate", "RELATED,ESTABLISHED", "-m", "comment", "--comment", &tag, "-j", "DROP"];
+            iptables_ensure_with(runner, bin, &[], "-I", &ingress)?;
+            iptables_drain_with(runner, bin, &[], &outbound)?;
+            iptables_drain_with(runner, bin, &[], &inbound)?;
             iptables_ensure_with(runner, bin, &[], "-I", &outbound)?;
             iptables_ensure_with(runner, bin, &[], "-I", &inbound)?;
         }
@@ -465,7 +471,7 @@ fn nft_with(runner: &mut impl apply::Runner, op: Operation, phys: &str, tun: &st
             // interface strings are JSON escaped (also valid nft string syntax).
             let phys = serde_json::to_string(phys).map_err(|e| ApplyError::new(&["nft"], e.to_string()))?;
             let tun = serde_json::to_string(tun).map_err(|e| ApplyError::new(&["nft"], e.to_string()))?;
-            let script = format!("add table inet {id}\ndelete table inet {id}\ntable inet {id} {{\n chain postrouting {{ type nat hook postrouting priority srcnat; policy accept; iifname {tun} oifname {phys} masquerade; }}\n chain forward {{ type filter hook forward priority filter; policy accept; iifname {tun} oifname {phys} accept; iifname {phys} oifname {tun} ct state established,related accept; }}\n}}\n");
+            let script = format!("add table inet {id}\ndelete table inet {id}\ntable inet {id} {{\n chain postrouting {{ type nat hook postrouting priority srcnat; policy accept; iifname {tun} oifname {phys} masquerade; }}\n chain forward {{ type filter hook forward priority filter; policy accept; iifname {tun} oifname {phys} accept; iifname {phys} oifname {tun} ct state established,related accept; iifname {phys} oifname {tun} ct state != {{ established, related }} drop; }}\n}}\n");
             runner.run(&["nft", "-f", "-"], Some(&script))?;
         }
         Operation::Down => {
@@ -585,6 +591,8 @@ mod tests {
         fail_delete: bool,
         no_docker: bool,
         no_ipv6: bool,
+        forward_accept: bool,
+        fail_ingress_add: bool,
         external_rules: Option<String>,
     }
     impl apply::Runner for Host {
@@ -595,6 +603,9 @@ mod tests {
             let args = normalized.as_slice();
             if self.no_ipv6 && args.first() == Some(&"ip6tables") { return Err(error(Some(3), "Table does not exist")); }
             if self.no_docker && args == ["iptables", "-S", "DOCKER-USER"] { return Err(error(Some(1), "No chain/target/match by that name.")); }
+            if self.fail_ingress_add && args.contains(&"-I") && args.contains(&"!") {
+                return Err(error(Some(4), "ingress DROP install failed"));
+            }
             match args {
                 ["sysctl", "-n", _] => return Ok(u8::from(self.forwarding).to_string()),
                 ["sysctl", "-w", value] => { self.forwarding = value.ends_with("=1"); return Ok(String::new()); }
@@ -623,7 +634,7 @@ mod tests {
                 }
                 [_, "-X", _] => return Ok(String::new()),
                 [_, "-S", chain] if chain.starts_with("FPKS_") => return Ok(String::new()),
-                [_, "-S", "FORWARD"] => return Ok("-P FORWARD DROP\n-A FORWARD -j DOCKER-USER".into()),
+                [_, "-S", "FORWARD"] => return Ok(format!("-P FORWARD {}\n-A FORWARD -j DOCKER-USER", if self.forward_accept { "ACCEPT" } else { "DROP" })),
                 [_, "-S", "DOCKER-USER"] => return Ok("-N DOCKER-USER\n-A DOCKER-USER -j DROP".into()),
                 _ => {}
             }
@@ -673,8 +684,74 @@ mod tests {
         iptables_with(&mut host, Operation::KillswitchOff, "eth0", "fp0", &a, "100.72.0.0/24").unwrap();
         iptables_with(&mut host, Operation::Down, "eth0", "fp0", &a, "100.72.0.0/24").unwrap();
         assert!(host.rules.contains(&foreign));
-        assert_eq!(host.rules.len(), 10); // nine rules for B plus the administrator's rule
+        assert_eq!(host.rules.len(), 14); // thirteen rules for B plus the administrator's rule
         assert!(host.rules.iter().filter(|r| *r != &foreign).all(|r| r.iter().any(|s| s.starts_with(&b))));
+    }
+
+    #[test]
+    fn wan_ingress_guard_precedes_external_rules_on_accept_hosts_and_upgrades_existing_rules() {
+        let mut host = Host { forward_accept: true, ..Host::default() };
+        let id = instance("custom0").unwrap();
+        let tag = format!("{id}:forward");
+        // Simulate a pre-T-0032 installation and a host allowing all forwarding.
+        for bin in ["iptables", "ip6tables"] {
+            for chain in ["FORWARD", "DOCKER-USER"] {
+                for tail in [
+                    vec!["-i", "custom0", "-o", "wan0", "-m", "comment", "--comment", &tag, "-j", "ACCEPT"],
+                    vec!["-i", "wan0", "-o", "custom0", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-m", "comment", "--comment", &tag, "-j", "ACCEPT"],
+                    vec!["-j", "ACCEPT"],
+                ] {
+                    host.rules.insert([vec![bin, chain], tail].concat().into_iter().map(str::to_string).collect());
+                }
+            }
+        }
+        iptables_with(&mut host, Operation::Up, "wan0", "custom0", &id, "100.72.0.0/24").unwrap();
+        for bin in ["iptables", "ip6tables"] {
+            for chain in ["FORWARD", "DOCKER-USER"] {
+                let insertions: Vec<_> = host.commands.iter().filter(|c| c.first().is_some_and(|v| v == bin)
+                    && c.get(3).is_some_and(|v| v == "-I") && c.get(4).is_some_and(|v| v == chain)).cloned().collect();
+                let expected = [
+                    vec![bin, "-w", "10", "-I", chain, "-i", "wan0", "-o", "custom0", "-m", "conntrack", "!", "--ctstate", "RELATED,ESTABLISHED", "-m", "comment", "--comment", &tag, "-j", "DROP"],
+                    vec![bin, "-w", "10", "-I", chain, "-i", "custom0", "-o", "wan0", "-m", "comment", "--comment", &tag, "-j", "ACCEPT"],
+                    vec![bin, "-w", "10", "-I", chain, "-i", "wan0", "-o", "custom0", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-m", "comment", "--comment", &tag, "-j", "ACCEPT"],
+                ].map(|v| v.into_iter().map(str::to_string).collect::<Vec<_>>());
+                // Each -I inserts at position 1: return ACCEPT, outbound ACCEPT,
+                // WAN-only DROP, then the preexisting external ACCEPT.
+                assert_eq!(insertions, expected);
+            }
+        }
+        let count = host.rules.len();
+        iptables_with(&mut host, Operation::Up, "wan0", "custom0", &id, "100.72.0.0/24").unwrap();
+        assert_eq!(host.rules.len(), count);
+        iptables_with(&mut host, Operation::Down, "changed-wan", "custom0", &id, "").unwrap();
+        assert_eq!(host.rules.len(), 4);
+        assert!(host.rules.iter().all(|r| r.len() == 4 && r[2] == "-j" && r[3] == "ACCEPT"));
+    }
+
+    #[test]
+    fn wan_ingress_install_failure_is_visible_and_retains_lease_for_retry_and_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = Host { forward_accept: true, fail_ingress_add: true, ..Host::default() };
+        let result = execute_with(&mut host, dir.path(), "iptables", Operation::Up, ("wan0", "fp0"), &options());
+        assert!(result.unwrap_err().stderr.contains("ingress DROP install failed"));
+        assert!(has_lease_at(dir.path(), "fp0").unwrap());
+        host.fail_ingress_add = false;
+        execute_with(&mut host, dir.path(), "iptables", Operation::Up, ("wan0", "fp0"), &options()).unwrap();
+        assert!(host.rules.iter().any(|r| r.iter().any(|v| v == "!")));
+        recover_with(&mut host, dir.path(), "fp0").unwrap();
+        assert!(host.rules.is_empty()); assert!(!host.forwarding);
+        assert!(!has_lease_at(dir.path(), "fp0").unwrap());
+    }
+
+    #[test]
+    fn nft_wan_ingress_guard_is_scoped_and_ordered_after_return_accept() {
+        let id = instance("custom0").unwrap();
+        let mut runner = Host::default();
+        nft_with(&mut runner, Operation::Up, "wan0", "custom0", &id).unwrap();
+        assert_eq!(runner.commands, [vec!["nft", "-f", "-"]]);
+        let script = &runner.scripts[0];
+        assert!(script.contains("iifname \"wan0\" oifname \"custom0\" ct state established,related accept; iifname \"wan0\" oifname \"custom0\" ct state != { established, related } drop;"));
+        assert!(!script.contains("lan0"));
     }
 
     #[test]
@@ -700,7 +777,7 @@ mod tests {
                 execute_with(&mut host, dir.path(), backend, Operation::Down, ("eth0", order[0]), &options()).unwrap();
                 assert!(host.forwarding);
                 if backend == "nft" { assert!(host.tables.contains_key(&instance(order[1]).unwrap())); assert_eq!(host.tables.len(), 1); }
-                else { assert_eq!(host.rules.len(), 9); }
+                else { assert_eq!(host.rules.len(), 13); }
                 execute_with(&mut host, dir.path(), backend, Operation::Down, ("eth0", order[1]), &options()).unwrap();
                 assert!(!host.forwarding);
                 assert!(host.tables.is_empty()); assert!(host.rules.is_empty());
@@ -714,7 +791,7 @@ mod tests {
         assert!(!forward_policy_drop("-P FORWARD ACCEPT\n-A FORWARD -j DROP"));
         let mut host = Host { no_docker: true, no_ipv6: true, ..Host::default() };
         iptables_with(&mut host, Operation::Up, "wan0", "fp0", &instance("fp0").unwrap(), "100.72.0.0/24").unwrap();
-        assert_eq!(host.rules.len(), 3);
+        assert_eq!(host.rules.len(), 4);
         assert!(host.rules.iter().all(|r| !r.iter().any(|v| v == "DOCKER-USER")));
         let v6: Vec<_> = host.commands.iter().filter(|c| c.first().is_some_and(|s| s == "ip6tables")).collect();
         assert_eq!(v6, [&vec!["ip6tables", "-w", "10", "-S", "FORWARD"]]);

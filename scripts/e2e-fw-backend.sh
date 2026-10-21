@@ -20,7 +20,7 @@ have(){ command -v "$1" >/dev/null 2>&1; }
 SUDO=""; [ "$(id -u)" = 0 ] || SUDO="sudo -n"
 
 nft_has_table(){ $SUDO nft list table inet "$TABLE" >/dev/null 2>&1; }
-nft_rule_count(){ $SUDO nft list table inet "$TABLE" 2>/dev/null | grep -cE '^[[:space:]]*iifname .* (masquerade|accept)([[:space:]]|$)'; }
+nft_rule_count(){ $SUDO nft list table inet "$TABLE" 2>/dev/null | grep -cE '^[[:space:]]*iifname .* (masquerade|accept|drop)([[:space:]]|$)'; }
 ipt_masq_count(){ $SUDO iptables -w 10 -t nat -S POSTROUTING 2>/dev/null | grep -F "$TABLE:nat" | grep -c MASQUERADE; }
 ipt_fwd_count(){ $SUDO iptables -w 10 -S FORWARD 2>/dev/null | grep -cF "$TABLE:forward"; }
 
@@ -37,7 +37,7 @@ test_backend(){ # $1 = nft|iptables
     # idempotent
     $SUDO env FLUXPEER_FW_BACKEND="$be" "$B" fw-selftest up --phys "$PHYS" --tun "$TUN" --overlay-cidr "$OVERLAY_CIDR" >/dev/null 2>&1
     local c2; c2=$(nft_rule_count)
-    [ "$c2" = 3 ] && ok "[$be] idempotent: three owned rules" || no "[$be] unexpected rule count: $c2"
+    [ "$c2" = 4 ] && ok "[$be] idempotent: four owned rules" || no "[$be] unexpected rule count: $c2"
     $SUDO env FLUXPEER_FW_BACKEND="$be" "$B" fw-selftest down --phys "$PHYS" --tun "$TUN" >/dev/null 2>&1
     nft_has_table && no "[$be] down left inet fluxpeer table (LEAK)" || ok "[$be] down deleted table (zero residue)"
   else
