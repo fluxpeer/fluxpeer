@@ -204,6 +204,7 @@ fn json_status(
                 "last_handshake_unix": p.last_handshake_unix,
                 "rtt_ms": if p.rtt_us == 0 { serde_json::Value::Null } else { (p.rtt_us as f64 / 1000.0).into() },
                 "rx_bytes": p.rx_bytes,
+                "rx_source_drops": p.rx_source_drops,
                 "tx_bytes": p.tx_bytes,
             })
         })

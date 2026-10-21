@@ -1362,6 +1362,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
             force_relay: cfg.force_relay,
             tun_out: tun_out_tx.clone(),
             status: status_reg.clone(),
+            allowed: allowed.clone(),
         };
         tokio::spawn(state.run(wrx));
     }
@@ -1688,6 +1689,33 @@ mod exit_contract_tests {
         assert_eq!(state.applied.as_deref(), Some("192.0.2.53"));
         assert_eq!(desired_dns(&[], &["192.0.2.53".into(), "2001:db8::53".into()], false, true).as_deref(), Some("192.0.2.53 2001:db8::53"));
         assert_eq!(desired_dns(&[], &overrides, false, false), None);
+    }
+
+    #[tokio::test]
+    async fn reconcile_exit_selection_switches_inbound_public_source_authorization() {
+        let mut a = peer(22, "192.0.2.22:1234", &["100.72.16.22/32", "0.0.0.0/0"]);
+        let mut b = peer(23, "192.0.2.23:1234", &["100.72.16.23/32", "0.0.0.0/0"]);
+        a.pubkey = PublicKey::from(&StaticSecret::from([22; 32])).to_bytes();
+        b.pubkey = PublicKey::from(&StaticSecret::from([23; 32])).to_bytes();
+        let approved = vec![a.clone(), b.clone()];
+        let (tx, _rx) = mpsc::channel(8);
+        let mut r = test_reconciler(test_host(), a.clone(), a.clone(), tx);
+        r.known.insert(b.pubkey, (0, b.candidates.clone(), b.allowed_ips.clone()));
+        for (mode, expected) in [(hex::encode(a.pubkey), Some(a.pubkey)), (hex::encode(b.pubkey), Some(b.pubkey)), ("off".into(), None)] {
+            let (selected, effective) = control::apply_use_exit(&approved, Some(&mode), true);
+            assert_eq!(selected, expected);
+            // Production reconcile action: publishes the exact effective routes
+            // used by both egress and decrypted-source authorization.
+            for peer in effective { r.update_routes(peer); }
+            assert_eq!(worker::route_tun(&packet([203, 0, 113, 9]), &r.allowed.load()).map(|(key, _)| key), expected);
+            worker::inbound_security_tests::assert_public_delivery(r.allowed.clone(), 22, selected == Some(a.pubkey)).await;
+            worker::inbound_security_tests::assert_public_delivery(r.allowed.clone(), 23, selected == Some(b.pubkey)).await;
+            // Even the selected exit cannot impersonate the other member's /32.
+            for (seed, source, accepted) in [(22, "100.72.16.23", false), (23, "100.72.16.22", false),
+                (22, "100.72.16.22", true), (23, "100.72.16.23", true)] {
+                worker::inbound_security_tests::assert_source_delivery(r.allowed.clone(), seed, source, accepted).await;
+            }
+        }
     }
 
     fn test_reconciler(host: HostEffects, old: control::PeerInfo, new: control::PeerInfo, tx: mpsc::Sender<worker::WorkerMsg>) -> Reconciler {

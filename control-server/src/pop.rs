@@ -57,6 +57,9 @@ pub(crate) struct Challenge {
 pub(crate) fn new_challenge(claimed_pub_hex: &str) -> Option<Challenge> {
     let claimed = fluxpeer_sdk::key::decode(claimed_pub_hex)?;
     let ephemeral = StaticSecret::from(random_32());
+    if !ephemeral.diffie_hellman(&PublicKey::from(claimed)).was_contributory() {
+        return None;
+    }
     let server_pub = hex::encode(PublicKey::from(&ephemeral).to_bytes());
     let challenge_id = crate::auth::random_hex(16);
     let now = Instant::now();
@@ -104,7 +107,7 @@ pub(crate) fn verify(challenge_id: &str, claimed_pub_hex: &str, proof_hex: &str)
     // expected = DH(e_priv, P); the client sent DH(wg_priv, e_pub) — equal iff it
     // holds wg_priv for P.
     let expected = entry.ephemeral.diffie_hellman(&PublicKey::from(entry.claimed_pub));
-    ct_eq(expected.as_bytes(), &proof)
+    expected.was_contributory() && ct_eq(expected.as_bytes(), &proof)
 }
 
 fn random_32() -> [u8; 32] {
@@ -138,6 +141,42 @@ mod tests {
     fn keypair(seed: u8) -> (StaticSecret, String) {
         let sk = StaticSecret::from([seed; 32]);
         (sk.clone(), hex::encode(PublicKey::from(&sk).to_bytes()))
+    }
+
+    fn low_order_keys() -> Vec<[u8; 32]> {
+        let mut keys = vec![[0; 32]];
+        let mut one = [0; 32]; one[0] = 1; keys.push(one);
+        // p-1, p and p+1: order-two / non-canonical aliases of zero and one.
+        for first in [0xec, 0xed, 0xee] {
+            let mut key = [0xff; 32]; key[0] = first; key[31] = 0x7f; keys.push(key);
+        }
+        for encoded in [
+            "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+            "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+        ] { keys.push(decode_key(encoded).unwrap()); }
+        // X25519 masks bit 255; all high-bit aliases must be rejected too.
+        let aliases: Vec<_> = keys.iter().map(|key| { let mut key = *key; key[31] |= 0x80; key }).collect();
+        keys.extend(aliases);
+        keys
+    }
+
+    #[test]
+    fn low_order_keys_are_rejected_before_challenge_and_at_verification() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        for key in low_order_keys() {
+            for encoded in [hex::encode(key), STANDARD.encode(key)] {
+                assert!(new_challenge(&encoded).is_none());
+                // Defense in depth: even a previously minted pending challenge
+                // must not accept the publicly computable all-zero DH result.
+                let id = crate::auth::random_hex(16);
+                pending().lock().insert(id.clone(), Pending {
+                    ephemeral: StaticSecret::from([17; 32]), claimed_pub: key,
+                    expires: Instant::now() + CHALLENGE_TTL,
+                });
+                assert!(!verify(&id, &encoded, &"00".repeat(32)));
+                assert!(!pending().lock().contains_key(&id));
+            }
+        }
     }
 
     #[test]

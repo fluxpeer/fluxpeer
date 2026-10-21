@@ -427,3 +427,27 @@ async fn revoked_key_rejoins_with_new_invite_and_possession_proof() {
     let invalid = app.oneshot(post("/api/v1/enroll", json!({"invite_code": invite.code,"name":"bad","wg_public_key":"bad"}))).await.unwrap();
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn low_order_pop_cannot_consume_an_invite_or_create_a_device() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let store = Arc::new(SqlStore::connect("sqlite::memory:").await.unwrap());
+    let network = store.create_network("low-order-pop").await.unwrap();
+    let invite = store.create_invite(&network.id, None, Some(1)).await.unwrap();
+    let app = sql_router(store.clone());
+    let mut one = [0u8; 32]; one[0] = 1;
+    for key in [[0; 32], one] {
+        for encoded in [hex::encode(key), STANDARD.encode(key)] {
+            let response = app.clone().oneshot(post("/api/v1/enroll/challenge", json!({"wg_public_key":encoded}))).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let response = app.clone().oneshot(post("/api/v1/enroll", json!({
+                "wg_public_key":encoded, "invite_code":invite.code, "name":"forged",
+                "challenge_id":"invalid", "proof":"00".repeat(32),
+            }))).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+    assert!(store.list_devices(&network.id).await.unwrap().is_empty());
+    assert_eq!(store.list_invites(&network.id).await.unwrap()[0].uses, 0);
+    assert_eq!(enroll_pop(&app, &invite.code, "honest", 61).await.status(), StatusCode::CREATED);
+}

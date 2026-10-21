@@ -58,14 +58,57 @@ fn default_name() -> String {
 /// path; `no_run` writes the config but doesn't bring the tunnel up.
 /// Decode a join token → keygen → enroll → write a node config (auto-assigning a
 /// free tun/port slot unless `out` pins a path). Returns `(config_path, tun_name)`.
-/// Shared by the CLI `join` and the daemon's `join` command (which spawns the
-/// tunnel itself rather than blocking here).
+/// CLI-only persistence; the daemon uses enroll_config and exclusive confined
+/// member creation instead of this legacy output-path/fallback policy.
 pub(crate) async fn enroll_and_write(
     token: &str,
     name: Option<String>,
     out: Option<String>,
     dir: &std::path::Path,
 ) -> std::io::Result<(PathBuf, String)> {
+    let Enrollment { mut config, name, address } = enroll(token, name).await?;
+    let cfg = &mut config;
+    // Multi-network: each membership is its own config in the config dir with a
+    // distinct tun/port (auto-assigned), so one device can be in many networks.
+    let (path, tun_name, listen_port) = match out {
+        Some(o) => (PathBuf::from(o), "fp0".to_string(), 41820u16),
+        None => assign_slot(dir),
+    };
+    cfg["listen_port"] = listen_port.into();
+    cfg["tun_name"] = tun_name.clone().into();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let path = match write_config(&path, cfg) {
+        Ok(()) => path,
+        Err(e) => {
+            let alt = PathBuf::from("fluxpeer-node.json");
+            eprintln!(
+                "! could not write {} ({e}); falling back to {}",
+                path.display(),
+                alt.display()
+            );
+            write_config(&alt, cfg)?;
+            alt
+        }
+    };
+    println!("{}", enrollment_message(&name, cfg["device_id"].as_str().unwrap_or(""), &address, &path));
+    Ok((path, tun_name))
+}
+
+/// Enroll without writing credentials. Daemon callers supply their own confined
+/// persistence policy; CLI output/fallback behavior stays in enroll_and_write.
+pub(crate) async fn enroll_config(token: &str, name: Option<String>) -> std::io::Result<serde_json::Value> {
+    Ok(enroll(token, name).await?.config)
+}
+
+struct Enrollment { config: serde_json::Value, name: String, address: String }
+
+fn enrollment_message(name: &str, device_id: &str, address: &str, path: &std::path::Path) -> String {
+    format!("✓ enrolled as \"{name}\" — device {device_id}, overlay {address}; config {}", path.display())
+}
+
+async fn enroll(token: &str, name: Option<String>) -> std::io::Result<Enrollment> {
     let JoinToken { ctrl, code } = decode_token(token)?;
     let name = name.unwrap_or_else(default_name);
 
@@ -83,44 +126,11 @@ pub(crate) async fn enroll_and_write(
     // The per-device auth token is returned ONCE at enroll; persist it so the node
     // can authenticate its control-server calls (config pull / endpoints / routes).
     let auth_token = dev["auth_token"].as_str().unwrap_or_default().to_string();
-    let addr = dev["address_v4"].as_str().unwrap_or("(pending)");
 
-    // Multi-network: each membership is its own config in the config dir with a
-    // distinct tun/port (auto-assigned), so one device can be in many networks.
-    let (path, tun_name, listen_port) = match out {
-        Some(o) => (PathBuf::from(o), "fp0".to_string(), 41820u16),
-        None => assign_slot(dir),
-    };
-    let cfg = serde_json::json!({
-        "private_key": priv_hex,
-        "device_id": device_id,
-        "control_server": ctrl,
-        "auth_token": auth_token,
-        "listen_port": listen_port,
-        "tun_name": tun_name,
-        "prefix_len": 24,
-    });
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let path = match write_config(&path, &cfg) {
-        Ok(()) => path,
-        Err(e) => {
-            let alt = PathBuf::from("fluxpeer-node.json");
-            eprintln!(
-                "! could not write {} ({e}); falling back to {}",
-                path.display(),
-                alt.display()
-            );
-            write_config(&alt, &cfg)?;
-            alt
-        }
-    };
-    println!(
-        "✓ enrolled as \"{name}\" — device {device_id}, overlay {addr}; config {}",
-        path.display()
-    );
-    Ok((path, tun_name))
+    Ok(Enrollment { config: serde_json::json!({
+        "private_key": priv_hex, "device_id": device_id, "control_server": ctrl,
+        "auth_token": auth_token, "prefix_len": 24,
+    }), name, address: dev["address_v4"].as_str().unwrap_or("(pending)").to_string() })
 }
 
 pub async fn join(token: &str, name: Option<String>, out: Option<String>, no_run: bool) -> std::io::Result<()> {
@@ -175,7 +185,38 @@ pub(crate) fn assign_slot(dir: &std::path::Path) -> (PathBuf, String, u16) {
 }
 
 fn write_config(path: &std::path::Path, cfg: &serde_json::Value) -> std::io::Result<()> {
-    let mut f = std::fs::File::create(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut f = options.open(path)?;
     f.write_all(serde_json::to_string_pretty(cfg).unwrap_or_default().as_bytes())?;
     f.write_all(b"\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_message_preserves_plain_device_name_and_overlay_address() {
+        let message = enrollment_message("work laptop", "dev-7", "100.72.16.7", std::path::Path::new("member.json"));
+        assert_eq!(message, "✓ enrolled as \"work laptop\" — device dev-7, overlay 100.72.16.7; config member.json");
+        assert!(!message.contains("\\\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_credential_file_is_created_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let cfg = serde_json::json!({"private_key":"fixture", "auth_token":"fixture-token"});
+        write_config(&path, &cfg).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap(), cfg);
+    }
 }

@@ -9,6 +9,7 @@
 //! command, so other local processes can't drive the tunnels.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -56,7 +57,7 @@ pub async fn daemon(dir: String, addr: Option<String>) -> std::io::Result<()> {
         nets: Mutex::new(HashMap::new()),
     });
     for cfg in configs(&dir) {
-        d.spawn_net(&cfg);
+        if let Err(error) = d.spawn_net(&cfg) { tracing::error!(%error, "failed to start network"); }
     }
     let addr = addr.unwrap_or_else(|| DAEMON_ADDR.to_string());
     let listener = TcpListener::bind(&addr).await?;
@@ -176,7 +177,7 @@ fn edit_configs(
         edit(obj);
         let mut serialized = serde_json::to_string_pretty(&cfg).map_err(std::io::Error::other)?;
         serialized.push('\n');
-        std::fs::write(&path, serialized)?;
+        open_output(&path, false)?.write_all(serialized.as_bytes())?;
         updated += 1;
     }
     if updated == 0
@@ -190,37 +191,157 @@ fn edit_configs(
     Ok(updated)
 }
 
+/// Interface names are identifiers, never caller-supplied paths.
+fn valid_iface(iface: &str) -> bool {
+    (1..=15).contains(&iface.len()) && !iface.starts_with('-')
+        && iface.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn invalid_iface(error: impl std::fmt::Display) -> serde_json::Value {
+    // The daemon uses line-delimited JSON over TCP, not HTTP.
+    serde_json::json!({ "status": 400, "error": error.to_string() })
+}
+
+/// Resolve a direct child of the configuration directory. Reject symlinks
+/// (including dangling ones) before canonicalization or any file side effects.
+fn confined_path(dir: &Path, iface: &str, extension: &str, optional: bool) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind};
+    if !valid_iface(iface) { return Err(Error::new(ErrorKind::InvalidInput, "invalid iface")); }
+    confined_file(dir, std::ffi::OsStr::new(&format!("{iface}.{extension}")), optional)
+}
+
+fn confined_file(dir: &Path, name: &std::ffi::OsStr, optional: bool) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind};
+    let root = dir.canonicalize()?;
+    let path = root.join(name);
+    if path.parent() != Some(root.as_path()) {
+        return Err(Error::new(ErrorKind::InvalidInput, "path escapes configuration directory"));
+    }
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            if !meta.file_type().is_file() {
+                return Err(Error::new(ErrorKind::InvalidInput, "membership paths must be regular files"));
+            }
+            let resolved = path.canonicalize()?;
+            if resolved.parent() != Some(root.as_path()) {
+                return Err(Error::new(ErrorKind::InvalidInput, "path escapes configuration directory"));
+            }
+            Ok(resolved)
+        }
+        Err(e) if optional && e.kind() == ErrorKind::NotFound => Ok(path),
+        Err(e) => Err(e),
+    }
+}
+
+fn member_config(dir: &Path, iface: &str) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind};
+    if !valid_iface(iface) { return Err(Error::new(ErrorKind::InvalidInput, "invalid iface")); }
+    // Membership is the on-disk config, even while its child is disconnected.
+    // Keep supporting CLI configs with custom filenames (for example node.json).
+    let mut members = configs(dir).into_iter().filter(|path| read_iface(path).as_deref() == Some(iface));
+    let path = members.next().ok_or_else(|| Error::new(ErrorKind::InvalidInput, "iface is not a registered member"))?;
+    if members.next().is_some() {
+        return Err(Error::new(ErrorKind::InvalidInput, "iface has multiple membership configs"));
+    }
+    Ok(path)
+}
+
+/// Open the checked leaf without following a replacement symlink. Delay
+/// truncation until the opened descriptor is verified to be a regular file.
+fn open_output(path: &Path, create_new: bool) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(!create_new).create_new(create_new);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() { return Err(std::io::Error::other("output is not a regular file")); }
+    if !create_new { file.set_len(0)?; }
+    Ok(file)
+}
+
+fn write_json(path: &Path, cfg: &serde_json::Value, create_new: bool) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(cfg).map_err(std::io::Error::other)?;
+    let mut file = open_output(path, create_new)?;
+    file.write_all(&bytes)?;
+    file.write_all(b"\n")
+}
+
+/// Reserve a confined writable config slot before consuming an invitation.
+/// The temporary-path guard removes the empty reservation on enrollment failure.
+struct MemberSlot {
+    file: tempfile::NamedTempFile,
+    tun: String,
+    port: u16,
+}
+
+impl MemberSlot {
+    fn save(mut self, cfg: &serde_json::Value) -> std::io::Result<(PathBuf, String)> {
+        let mut cfg = cfg.clone();
+        let obj = cfg.as_object_mut().ok_or_else(|| std::io::Error::other("config must be an object"))?;
+        obj.insert("tun_name".into(), self.tun.clone().into());
+        obj.insert("listen_port".into(), self.port.into());
+        let bytes = serde_json::to_vec_pretty(&cfg).map_err(std::io::Error::other)?;
+        self.file.write_all(&bytes)?;
+        self.file.write_all(b"\n")?;
+        let (_, path) = self.file.keep().map_err(|error| error.error)?;
+        Ok((path, self.tun))
+    }
+}
+
+/// Join/import share an exclusive allocator. Occupied or unsafe config/log
+/// slots are skipped; open/create_new both checks writability and reserves it.
+fn reserve_member(dir: &Path) -> std::io::Result<MemberSlot> {
+    let root = dir.canonicalize()?;
+    let used: std::collections::HashSet<_> = configs(&root).iter().filter_map(|path| read_iface(path)).collect();
+    for n in 0..=u16::MAX - 41820 {
+        let tun = format!("fp{n}");
+        if used.contains(&tun) { continue; }
+        let candidate = root.join(format!("{tun}.json"));
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e),
+        }
+        match std::fs::symlink_metadata(root.join(format!("{tun}.log"))) {
+            Ok(meta) if !meta.file_type().is_file() => continue,
+            Ok(_) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e),
+        }
+        let path = confined_path(&root, &tun, "json", true)?;
+        confined_path(&root, &tun, "log", true)?;
+        match open_output(&path, true) {
+            Ok(file) => {
+                let path = tempfile::TempPath::try_from_path(path)?;
+                return Ok(MemberSlot { file: tempfile::NamedTempFile::from_parts(file, path), tun, port: 41820 + n });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free membership slot"))
+}
+
 impl Daemon {
     /// Spawn a node task for one config (idempotent per interface).
-    fn spawn_net(&self, cfg: &Path) {
-        let Some(iface) = read_iface(cfg) else { return };
-        if self.nets.lock().contains_key(&iface) {
-            return;
-        }
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("fluxpeer"));
-        let p = cfg.to_string_lossy().to_string();
-        // Capture the node's tracing output (stderr) to `<dir>/<iface>.log` so the
-        // GUI's diagnostics panel can tail it; truncate per run to stay bounded.
-        let log_path = self.dir.join(format!("{iface}.log"));
-        let log = std::fs::File::create(&log_path).ok();
-        let (out, err) = match log {
-            Some(f) => match f.try_clone() {
-                Ok(f2) => (std::process::Stdio::from(f), std::process::Stdio::from(f2)),
-                Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
-            },
-            None => (std::process::Stdio::null(), std::process::Stdio::null()),
-        };
+    fn spawn_net(&self, cfg: &Path) -> std::io::Result<()> {
+        let iface = read_iface(cfg).ok_or_else(|| std::io::Error::other("invalid membership config"))?;
+        let registered = member_config(&self.dir, &iface)?;
+        if cfg.canonicalize()? != registered { return Err(std::io::Error::other("unregistered config path")); }
+        if self.nets.lock().contains_key(&iface) { return Ok(()); }
+        let exe = std::env::current_exe()?;
+        let log_path = confined_path(&self.dir, &iface, "log", true)?;
+        let log = open_output(&log_path, false)?;
+        let err = log.try_clone()?;
         let mut cmd = Command::new(exe);
-        cmd.args(["node", "run", &p]).stdout(out).stderr(err).kill_on_drop(true);
-        if std::env::var_os("RUST_LOG").is_none() {
-            cmd.env("RUST_LOG", "info");
-        }
-        match cmd.spawn() {
-            Ok(child) => {
-                self.nets.lock().insert(iface, child);
-            }
-            Err(e) => tracing::error!(config = %p, error = %e, "failed to start network"),
-        }
+        cmd.arg("node").arg("run").arg(&registered).stdout(log).stderr(err).kill_on_drop(true);
+        if std::env::var_os("RUST_LOG").is_none() { cmd.env("RUST_LOG", "info"); }
+        let child = cmd.spawn()?;
+        self.nets.lock().insert(iface, child);
+        Ok(())
     }
 
     /// Stop one network: kill its process and WAIT for it to exit, so the OS
@@ -253,7 +374,7 @@ impl Daemon {
         let _ = std::fs::remove_file(crate::statusd::socket_path(iface));
         #[cfg(target_os = "linux")]
         let _ = std::process::Command::new("ip")
-            .args(["link", "del", iface])
+            .args(["link", "del", "dev", iface])
             .stderr(std::process::Stdio::null()) // device usually already gone with the process
             .status();
     }
@@ -293,9 +414,15 @@ impl Daemon {
     }
 
     async fn dispatch(&self, req: &serde_json::Value) -> serde_json::Value {
-        match req["cmd"].as_str().unwrap_or("") {
+        let cmd = req["cmd"].as_str().unwrap_or("");
+        if matches!(cmd, "up" | "down" | "settings" | "config" | "get_config" | "set-config" | "set_config" | "leave" | "logs")
+            && let Err(error) = self.validate_operation(req["iface"].as_str().unwrap_or(""), matches!(cmd, "down" | "leave"))
+        {
+            return invalid_iface(error);
+        }
+        match cmd {
             // Live status of every running network (for the GUI dashboard).
-            "status" => crate::show::aggregate_status().await,
+            "status" => self.annotate_status(crate::show::aggregate_status().await),
             // The networks this device has joined + up/down.
             "networks" => self.networks(),
             // Join a new network from an invite token, then bring it up.
@@ -344,7 +471,33 @@ impl Daemon {
         }
     }
 
+    fn validate_operation(&self, iface: &str, stopping: bool) -> std::io::Result<()> {
+        if !valid_iface(iface) { return Err(std::io::Error::other("invalid iface")); }
+        if stopping && self.nets.lock().contains_key(iface) { return Ok(()); }
+        member_config(&self.dir, iface).map(|_| ())
+    }
+
+    fn duplicate_ifaces(&self) -> Vec<String> {
+        let mut counts = HashMap::<String, usize>::new();
+        for path in configs(&self.dir) {
+            if let Some(iface) = read_iface(&path) { *counts.entry(iface).or_default() += 1; }
+        }
+        let mut duplicates: Vec<_> = counts.into_iter().filter_map(|(iface, n)| (n > 1).then_some(iface)).collect();
+        duplicates.sort(); duplicates
+    }
+
+    fn annotate_status(&self, mut status: serde_json::Value) -> serde_json::Value {
+        if let Some(entries) = status.as_array_mut() {
+            for iface in self.duplicate_ifaces() {
+                entries.push(serde_json::json!({"iface":iface, "membership_error":"multiple membership configs",
+                    "up":self.nets.lock().contains_key(&iface)}));
+            }
+        }
+        status
+    }
+
     fn networks(&self) -> serde_json::Value {
+        let duplicates = self.duplicate_ifaces();
         let running = self.nets.lock();
         let mut arr = Vec::new();
         for cfg in configs(&self.dir) {
@@ -354,6 +507,7 @@ impl Daemon {
                 let iface = v["tun_name"].as_str().unwrap_or("?").to_string();
                 arr.push(serde_json::json!({
                     "iface": iface,
+                    "membership_error": if duplicates.contains(&iface) { Some("multiple membership configs") } else { None },
                     "control_server": v["control_server"].as_str().unwrap_or(""),
                     "up": running.contains_key(&iface),
                     "exit_node": v["exit_node"].as_bool().unwrap_or(false),
@@ -371,15 +525,31 @@ impl Daemon {
     }
 
     async fn join(&self, token: &str) -> serde_json::Value {
-        if token.is_empty() {
-            return serde_json::json!({ "error": "missing join token" });
+        self.join_with(token, |path| self.spawn_net(path)).await
+    }
+
+    async fn join_with(&self, token: &str, spawn: impl FnOnce(&Path) -> std::io::Result<()>) -> serde_json::Value {
+        let slot = match reserve_member(&self.dir) {
+            Ok(slot) => slot,
+            Err(error) => return serde_json::json!({"error":format!("membership save failed (preflight): {error}")}),
+        };
+        match crate::join::enroll_config(token, None).await {
+            Ok(cfg) => Self::start_member(slot.save(&cfg), spawn),
+            Err(error) => serde_json::json!({"error":error.to_string()}),
         }
-        match crate::join::enroll_and_write(token, None, None, &self.dir).await {
-            Ok((path, iface)) => {
-                self.spawn_net(&path);
-                serde_json::json!({ "ok": true, "iface": iface })
-            }
-            Err(e) => serde_json::json!({ "error": format!("{e}") }),
+    }
+
+    fn install_member(&self, cfg: &serde_json::Value, spawn: impl FnOnce(&Path) -> std::io::Result<()>) -> serde_json::Value {
+        Self::start_member(reserve_member(&self.dir).and_then(|slot| slot.save(cfg)), spawn)
+    }
+
+    fn start_member(saved: std::io::Result<(PathBuf, String)>, spawn: impl FnOnce(&Path) -> std::io::Result<()>) -> serde_json::Value {
+        match saved {
+            Ok((path, iface)) => match spawn(&path) {
+                Ok(()) => serde_json::json!({"ok":true, "iface":iface}),
+                Err(error) => serde_json::json!({"error":format!("membership saved but start failed: {error}"), "iface":iface}),
+            },
+            Err(error) => serde_json::json!({"error":format!("membership save failed: {error}")}),
         }
     }
 
@@ -387,7 +557,9 @@ impl Daemon {
     /// daemon token is enough to operate networks, but must not disclose key
     /// material to API clients.
     fn get_config(&self, iface: &str) -> serde_json::Value {
-        let path = self.dir.join(format!("{iface}.json"));
+        let path = match member_config(&self.dir, iface) {
+            Ok(path) => path, Err(error) => return invalid_iface(error),
+        };
         match std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -401,58 +573,64 @@ impl Daemon {
     async fn set_config(&self, req: &serde_json::Value) -> serde_json::Value {
         let iface = req["iface"].as_str().unwrap_or("");
         let cfg = &req["config"];
-        if iface.is_empty() || !cfg.is_object() || cfg["private_key"].as_str().is_none() {
+        if !cfg.is_object() || cfg["private_key"].as_str().is_none() {
             return serde_json::json!({ "error": "invalid config (need an object with private_key, …)" });
         }
-        let path = self.dir.join(format!("{iface}.json"));
-        if std::fs::write(&path, serde_json::to_string_pretty(cfg).unwrap_or_default()).is_err() {
+        let path = match member_config(&self.dir, iface) {
+            Ok(path) => path, Err(error) => return invalid_iface(error),
+        };
+        if cfg["tun_name"].as_str() != Some(iface) {
+            return invalid_iface("config tun_name must match the registered iface");
+        }
+        if write_json(&path, cfg, false).is_err() {
             return serde_json::json!({ "error": "write failed" });
         }
-        self.restart(iface, &path).await;
+        if let Err(error) = self.restart(iface, &path).await { return serde_json::json!({"error":error.to_string()}); }
         serde_json::json!({ "ok": true, "iface": iface })
     }
 
     /// Import a network config (from a file the GUI read) as a new network + up it.
     async fn import(&self, req: &serde_json::Value) -> serde_json::Value {
+        self.import_with(req, |path| self.spawn_net(path))
+    }
+
+    fn import_with(&self, req: &serde_json::Value, spawn: impl FnOnce(&Path) -> std::io::Result<()>) -> serde_json::Value {
         let cfg = &req["config"];
         if !cfg.is_object() || cfg["private_key"].as_str().is_none() {
             return serde_json::json!({ "error": "not a fluxpeer node config (need private_key, device_id, control_server)" });
         }
-        // give it a fresh, non-colliding tun/port slot.
-        let (path, tun, port) = crate::join::assign_slot(&self.dir);
-        let mut cfg = cfg.clone();
-        cfg["tun_name"] = serde_json::json!(tun);
-        cfg["listen_port"] = serde_json::json!(port);
-        if std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap_or_default()).is_err() {
-            return serde_json::json!({ "error": "write failed" });
-        }
-        self.spawn_net(&path);
-        serde_json::json!({ "ok": true, "iface": tun })
+        self.install_member(cfg, spawn)
     }
 
     /// Leave a network permanently: stop it, then delete its on-disk config + log
     /// so it no longer appears in `networks` and won't auto-start next daemon run.
     /// (Control-server membership is left intact — re-joining just needs the token.)
     async fn leave(&self, iface: &str) -> serde_json::Value {
-        if iface.is_empty() {
-            return serde_json::json!({ "error": "missing iface" });
-        }
-        let cfg = self.dir.join(format!("{iface}.json"));
-        if !cfg.exists() {
-            return serde_json::json!({ "error": format!("no config for {iface}") });
-        }
+        if let Err(error) = self.validate_operation(iface, true) { return invalid_iface(error); }
+        let cfg = member_config(&self.dir, iface);
         self.stop_iface(iface).await;
-        let _ = std::fs::remove_file(&cfg);
-        let _ = std::fs::remove_file(self.dir.join(format!("{iface}.log")));
+        let cfg = match cfg {
+            Ok(path) => path,
+            Err(_) => return serde_json::json!({"iface":iface, "up":false, "left":false,
+                "error":"stopped; membership cleanup requires a unique valid config"}),
+        };
+        if let Err(error) = std::fs::remove_file(cfg) { return serde_json::json!({"error":error.to_string(), "up":false}); }
+        let log = match confined_path(&self.dir, iface, "log", true) {
+            Ok(path) => path,
+            Err(error) => return serde_json::json!({"error":error.to_string(), "up":false}),
+        };
+        if let Err(error) = std::fs::remove_file(log)
+            && error.kind() != std::io::ErrorKind::NotFound
+        { return serde_json::json!({"error":error.to_string(), "up":false}); }
         serde_json::json!({ "ok": true, "iface": iface, "left": true })
     }
 
     /// Return the last `lines` of a network's node log (diagnostics panel).
     fn logs(&self, iface: &str, lines: usize) -> serde_json::Value {
-        if iface.is_empty() {
-            return serde_json::json!({ "error": "missing iface" });
-        }
-        let path = self.dir.join(format!("{iface}.log"));
+        if let Err(error) = member_config(&self.dir, iface) { return invalid_iface(error); }
+        let path = match confined_path(&self.dir, iface, "log", true) {
+            Ok(path) => path, Err(error) => return invalid_iface(error),
+        };
         let Ok(raw) = std::fs::read_to_string(&path) else {
             return serde_json::json!({ "iface": iface, "log": "" });
         };
@@ -463,18 +641,17 @@ impl Daemon {
     }
 
     /// Restart one network (down + up) to apply a config change.
-    async fn restart(&self, iface: &str, path: &Path) {
+    async fn restart(&self, iface: &str, path: &Path) -> std::io::Result<()> {
         self.stop_iface(iface).await;
-        self.spawn_net(path);
+        self.spawn_net(path)
     }
 
     /// Edit a network's own wg settings in its local config + restart it to apply.
     async fn settings(&self, req: &serde_json::Value) -> serde_json::Value {
         let iface = req["iface"].as_str().unwrap_or("");
-        if iface.is_empty() {
-            return serde_json::json!({ "error": "missing iface" });
-        }
-        let path = self.dir.join(format!("{iface}.json"));
+        let path = match member_config(&self.dir, iface) {
+            Ok(path) => path, Err(error) => return invalid_iface(error),
+        };
         let Ok(raw) = std::fs::read_to_string(&path) else {
             return serde_json::json!({ "error": "no config for iface" });
         };
@@ -529,27 +706,22 @@ impl Daemon {
                 cfg[k] = serde_json::json!(b);
             }
         }
-        if std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap_or_default()).is_err() {
+        if write_json(&path, &cfg, false).is_err() {
             return serde_json::json!({ "error": "write failed" });
         }
-        self.restart(iface, &path).await; // MTU/DNS/endpoint take effect on restart
+        if let Err(error) = self.restart(iface, &path).await { return serde_json::json!({"error":error.to_string()}); } // MTU/DNS/endpoint take effect on restart
         serde_json::json!({ "ok": true, "iface": iface })
     }
 
     /// Connect (`up=true`) or disconnect (`up=false`) one network.
     async fn set_iface(&self, iface: &str, up: bool) -> serde_json::Value {
-        if iface.is_empty() {
-            return serde_json::json!({ "error": "missing iface" });
-        }
+        if let Err(error) = self.validate_operation(iface, !up) { return invalid_iface(error); }
         if up {
-            let cfg = self.dir.join(format!("{iface}.json"));
-            if !cfg.exists() {
-                return serde_json::json!({ "error": format!("no config for {iface}") });
-            }
+            let cfg = match member_config(&self.dir, iface) { Ok(path) => path, Err(error) => return invalid_iface(error) };
             // Defensive: make sure any prior task for this iface is fully stopped
             // (and its device/port released) before recreating it.
             self.stop_iface(iface).await;
-            self.spawn_net(&cfg);
+            if let Err(error) = self.spawn_net(&cfg) { return serde_json::json!({"error":error.to_string()}); }
         } else {
             self.stop_iface(iface).await;
         }
@@ -583,8 +755,14 @@ fn configs(dir: &Path) -> Vec<PathBuf> {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.extension().is_some_and(|x| x == "json") {
-                out.push(p);
+            if p.extension().is_some_and(|x| x == "json")
+                && let Some(name) = p.file_name()
+                && let Ok(path) = confined_file(dir, name, false)
+                && let Some(iface) = read_iface(&path)
+                && valid_iface(&iface)
+                && confined_path(dir, &iface, "log", true).is_ok()
+            {
+                out.push(path);
             }
         }
     }
@@ -764,3 +942,7 @@ mod tests {
         assert!(set_use_exit(&dir, Some("fp9"), "auto").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "daemon_security_tests.rs"]
+mod security_tests;

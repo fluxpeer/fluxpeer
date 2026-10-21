@@ -152,6 +152,14 @@ pub(crate) struct RouteTable {
 }
 
 impl RouteTable {
+    /// Symmetric cryptokey routing: the longest matching source prefix must
+    /// belong to the authenticated peer, with the same tie-break as egress.
+    fn accepts_source(&self, peer: &[u8; 32], packet: &[u8]) -> bool {
+        fp_crypto::src_address(packet).is_some_and(|source| {
+            self.routes.iter().find(|r| r.prefix.contains(source)).is_some_and(|r| r.peer == *peer)
+        })
+    }
+
     pub(crate) fn with_peer(&self, peer: [u8; 32], worker: usize, prefixes: &[String]) -> Self {
         self.with_peer_report(peer, worker, prefixes, |prefix| {
             tracing::warn!(%prefix, "allowed_ips prefix claimed by multiple peers; routing to the lexicographically smaller pubkey");
@@ -168,11 +176,15 @@ impl RouteTable {
         let mut owners = HashMap::new();
         let mut conflicts = std::collections::HashSet::new();
         for entry in &routes {
-            if let Some(owner) = owners.insert(entry.prefix, entry.peer)
-                && owner != entry.peer && conflicts.insert(entry.prefix)
-                && !self.conflicts.contains(&entry.prefix)
-            {
-                warn(entry.prefix);
+            match owners.entry(entry.prefix) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(entry.peer);
+                }
+                std::collections::hash_map::Entry::Occupied(slot) => {
+                    if *slot.get() != entry.peer && conflicts.insert(entry.prefix) && !self.conflicts.contains(&entry.prefix) {
+                        warn(entry.prefix);
+                    }
+                }
             }
         }
         Self { routes, conflicts }
@@ -247,6 +259,8 @@ pub(crate) struct WorkerState {
     pub(crate) tun_out: mpsc::Sender<Vec<u8>>,
     /// Shared live per-peer status/counters (this worker writes its shard's peers).
     pub(crate) status: StatusRegistry,
+    /// Shared with reconciliation and egress; no separate receive ACL can drift.
+    pub(crate) allowed: Arc<arc_swap::ArcSwap<RouteTable>>,
 }
 
 /// A restarted responder has no session/init to send. Without a relay, the
@@ -597,8 +611,9 @@ impl WorkerState {
         via: &'static str,
         dbuf: &mut [u8],
     ) {
+        let Some(peer) = self.peers.get_mut(pos) else { return; };
         if let Some(pkt) = handle_wg(
-            &mut self.peers[pos],
+            peer,
             bytes,
             from,
             via,
@@ -610,9 +625,13 @@ impl WorkerState {
         )
         .await
         {
+            if !self.allowed.load().accepts_source(&peer.pubkey, &pkt) {
+                peer.stat.rx_source_drops.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             let pkt_len = pkt.len();
             if let Err(e) = self.tun_out.send(pkt).await {
-                let peer = hex::encode(&self.peers[pos].pubkey[..4]);
+                let peer = hex::encode(peer.pubkey);
                 tracing::error!(
                     peer = %peer,
                     via,
@@ -1126,7 +1145,7 @@ mod tests {
         let (targets, updates) = tokio::sync::watch::channel(vec![]);
         let (tun_out, _tun_in) = mpsc::channel(16);
         let mut state = WorkerState { peers: vec![peer], index_map: IndexTable::new(HashMap::from([(le_u32(&init,4).unwrap(), *remote_pub.as_bytes())]), Arc::default(), 0),
-            udp, relay_out: Some(RelayOut::new(sender, updates)), own_priv: own, own_pub, force_relay: false, tun_out, status: Arc::default() };
+            udp, relay_out: Some(RelayOut::new(sender, updates)), own_priv: own, own_pub, force_relay: false, tun_out, status: Arc::default(), allowed: Arc::default() };
         let mut wire = [0; 2048];
         for _ in 0..8 { state.on_tick(&mut wire).await; }
         assert!(!state.peers[0].prefer_relay); assert!(relay_rx.try_recv().is_err());
@@ -1154,3 +1173,7 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+#[path = "inbound_security_tests.rs"]
+pub(crate) mod inbound_security_tests;

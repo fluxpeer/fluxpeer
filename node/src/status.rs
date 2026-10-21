@@ -42,6 +42,8 @@ pub(crate) fn transport_name(t: u8) -> &'static str {
 pub(crate) struct PeerStat {
     pub(crate) rx_bytes: AtomicU64,
     pub(crate) tx_bytes: AtomicU64,
+    /// Decrypted non-empty packets rejected by source authorization.
+    pub(crate) rx_source_drops: AtomicU64,
     /// Wall-clock unix secs of the last completed handshake (0 = never).
     pub(crate) last_handshake_unix: AtomicU64,
     /// Smoothed RTT in microseconds (0 = unknown).
@@ -57,6 +59,7 @@ impl PeerStat {
         Arc::new(Self {
             rx_bytes: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
+            rx_source_drops: AtomicU64::new(0),
             last_handshake_unix: AtomicU64::new(0),
             rtt_us: AtomicU64::new(0),
             transport: AtomicU8::new(T_NONE),
@@ -92,6 +95,7 @@ pub(crate) struct PeerSnapshot {
     pub(crate) rtt_us: u64,
     pub(crate) rx_bytes: u64,
     pub(crate) tx_bytes: u64,
+    pub(crate) rx_source_drops: u64,
 }
 
 /// Snapshot every known peer (point-in-time read of the shared registry).
@@ -107,6 +111,7 @@ pub(crate) fn snapshot(reg: &StatusRegistry) -> Vec<PeerSnapshot> {
             rtt_us: s.rtt_us.load(Ordering::Relaxed),
             rx_bytes: s.rx_bytes.load(Ordering::Relaxed),
             tx_bytes: s.tx_bytes.load(Ordering::Relaxed),
+            rx_source_drops: s.rx_source_drops.load(Ordering::Relaxed),
         })
         .collect()
 }
