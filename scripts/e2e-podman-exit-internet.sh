@@ -182,7 +182,7 @@ def new_network(name, directory=None):
     state['default_route'] = route('0.0.0.0/0')
     if directory:
         api('POST', '/relays', dict(region='fpe-test', url=f'{MESH}.10:{13443 if directory == "anytls" else 13478}',
-            network_id=state['net'], anytls=directory == 'anytls', stun_url=f'{MESH}.10:13478'))
+            network_id=state['net'], anytls=directory == 'anytls', stun_url=f'{MESH}.10:13478', node_id='fluxpeer-relay'))
 
 def observe_counters():
     # Counter-only rules observe traversal; they do not accept/drop/masquerade.
@@ -412,7 +412,7 @@ try:
         ('direct-udp', 'direct', None, True), ('relay-tcp', 'tcp', None, True),
         ('relay-anytls-explicit', 'anytls', None, True), ('relay-bond', 'bond', None, True),
         ('relay-tcp-directory', 'directory-tcp', 'tcp', True),
-        ('relay-anytls-directory', 'directory-anytls', 'anytls', False)]:
+        ('relay-anytls-directory', 'directory-anytls', 'anytls', True)]:
         def test_transport(label=label, mode=mode, directory=directory, positive=positive):
             new_network(label, directory); pair(transport=mode); probes(positive, positive)
         scenario('S5-' + label, test_transport)

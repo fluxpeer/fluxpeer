@@ -352,16 +352,27 @@ struct RegisterRelayReq {
     anytls: bool,
     #[serde(default)]
     stun_url: Option<String>,
+    #[serde(default)]
+    node_id: Option<String>,
+}
+
+// Missing identity is a legacy request; an explicitly empty identity is invalid.
+fn validate_relay_identity(req: &RegisterRelayReq) -> Result<(), StatusCode> {
+    if req.node_id.as_ref().is_some_and(|id| id.trim().is_empty()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
 }
 
 async fn register_relay(
     State(store): State<Arc<Store>>,
     Json(req): Json<RegisterRelayReq>,
-) -> (StatusCode, Json<domain::RelayNode>) {
-    (
+) -> Result<(StatusCode, Json<domain::RelayNode>), StatusCode> {
+    validate_relay_identity(&req)?;
+    Ok((
         StatusCode::CREATED,
-        Json(store.register_relay(&req.region, &req.url, req.network_id, req.anytls, req.stun_url)),
-    )
+        Json(store.register_relay(&req.region, &req.url, req.network_id, req.anytls, req.stun_url, req.node_id)),
+    ))
 }
 
 async fn list_relays(State(store): State<Arc<Store>>, Path(network_id): Path<String>) -> Json<Vec<domain::RelayNode>> {
@@ -710,7 +721,8 @@ async fn sql_register_relay(
     State(s): State<Arc<SqlStore>>,
     Json(req): Json<RegisterRelayReq>,
 ) -> Result<(StatusCode, Json<domain::RelayNode>), StatusCode> {
-    s.register_relay(&req.region, &req.url, req.network_id, req.anytls, req.stun_url)
+    validate_relay_identity(&req)?;
+    s.register_relay(&req.region, &req.url, req.network_id, req.anytls, req.stun_url, req.node_id)
         .await
         .map(|r| (StatusCode::CREATED, Json(r)))
         .map_err(sql_status)

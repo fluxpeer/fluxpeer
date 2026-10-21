@@ -171,9 +171,17 @@ paths:
               required: [region, url]
               properties:
                 region: { type: string }
-                url: { type: string }
+                url: { type: string, description: "Relay host:port; IP literals and DNS names are supported" }
                 network_id: { type: string, nullable: true }
+                anytls: { type: boolean, default: false }
+                stun_url: { type: string, nullable: true, description: "UDP STUN host:port; defaults to url" }
+                node_id:
+                  type: string
+                  nullable: true
+                  minLength: 1
+                  description: "Actual relay transport identity, matching FLUXPEER_RELAY_NODE_ID. Omitted/null preserves legacy client fallback."
       responses:
+        "400": { description: explicitly empty transport identity }
         "201":
           description: created
           content: { application/json: { schema: { $ref: "#/components/schemas/RelayNode" } } }
@@ -229,6 +237,12 @@ components:
         region: { type: string }
         url: { type: string }
         network_id: { type: string, nullable: true }
+        anytls: { type: boolean, default: false }
+        stun_url: { type: string, nullable: true, description: "UDP STUN host:port" }
+        node_id:
+          type: string
+          nullable: true
+          description: "Relay-reported transport identity, distinct from id; null on legacy registrations"
     PeerConfig:
       type: object
       properties:

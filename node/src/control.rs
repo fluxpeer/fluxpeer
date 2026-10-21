@@ -90,7 +90,7 @@ pub(crate) fn parse_settings(conf: &serde_json::Value) -> (Option<i32>, Vec<Stri
 /// A relay learned from the control-server relay directory (A-finish: nodes pull
 /// relay/STUN endpoints from coordination instead of pinning them in config).
 pub(crate) struct RelayDir {
-    pub(crate) url: String,
+    pub(crate) addresses: Vec<SocketAddr>,
     pub(crate) anytls: bool,
     pub(crate) node_id: String,
     pub(crate) stun: Option<SocketAddr>,
@@ -109,21 +109,80 @@ pub(crate) fn relay_transport_matches(force: bool, anytls: bool, require_anytls:
 pub(crate) async fn fetch_relays(cfg: &Config) -> std::io::Result<Vec<RelayDir>> {
     let client = mk_client(cfg);
     let conf = client.device_config(&cfg.device_id).await.map_err(request_error)?;
-    Ok(conf["relays"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|r| {
-                    Some(RelayDir {
-                        url: r["url"].as_str()?.to_string(),
-                        anytls: r["anytls"].as_bool().unwrap_or(false),
-                        node_id: r["id"].as_str().unwrap_or("fluxpeer-relay").to_string(),
-                        stun: r["stun_url"].as_str().and_then(|s| s.parse().ok()),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default())
+    Ok(resolve_relay_directory(&conf).await)
+}
+
+/// Directory endpoints are host:port (including bracketed IPv6), not HTTP URLs.
+/// Bound each lookup and retain all addresses for transport failover.
+async fn resolve_directory_endpoint(endpoint: &str) -> std::io::Result<Vec<SocketAddr>> {
+    let mut addresses: Vec<_> = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(endpoint))
+        .await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "relay directory DNS timeout"))??
+        .collect();
+    addresses.sort_unstable_by_key(|addr| (!addr.is_ipv4(), *addr));
+    addresses.dedup();
+    if addresses.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "relay directory DNS returned no addresses"));
+    }
+    Ok(addresses)
+}
+
+async fn resolve_relay_entry(entry: &serde_json::Value) -> Option<RelayDir> {
+    let id = entry["id"].as_str().unwrap_or("fluxpeer-relay");
+    let Some(url) = entry["url"].as_str() else {
+        tracing::warn!(relay = id, "relay directory entry has no endpoint; skipping");
+        return None;
+    };
+    let node_id = match entry.get("node_id") {
+        None | Some(serde_json::Value::Null) => {
+            tracing::warn!(relay = id, "relay directory lacks transport identity; using legacy directory id");
+            id
+        }
+        Some(serde_json::Value::String(value)) if !value.trim().is_empty() => value,
+        _ => {
+            tracing::warn!(relay = id, "relay directory has invalid transport identity; skipping");
+            return None;
+        }
+    };
+    let addresses = match resolve_directory_endpoint(url).await {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            tracing::warn!(relay = id, endpoint = url, %error, "relay directory resolution failed; skipping");
+            return None;
+        }
+    };
+    let stun = match entry.get("stun_url") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(endpoint)) => match resolve_directory_endpoint(endpoint).await {
+            // The node's STUN socket is IPv4. Prefer a usable A record even if
+            // the OS resolver returned AAAA first; relay TCP can use both.
+            Ok(addresses) => {
+                let stun = addresses.into_iter().find(SocketAddr::is_ipv4);
+                if stun.is_none() {
+                    tracing::warn!(relay = id, %endpoint, "directory STUN has no IPv4 address; skipping STUN");
+                }
+                stun
+            }
+            Err(error) => {
+                tracing::warn!(relay = id, %endpoint, %error, "directory STUN resolution failed; skipping entry");
+                return None;
+            }
+        },
+        _ => {
+            tracing::warn!(relay = id, "relay directory has invalid STUN endpoint; skipping");
+            return None;
+        }
+    };
+    Some(RelayDir { addresses, anytls: entry["anytls"].as_bool().unwrap_or(false), node_id: node_id.to_owned(), stun })
+}
+
+async fn resolve_relay_directory(conf: &serde_json::Value) -> Vec<RelayDir> {
+    use futures::StreamExt;
+    let Some(entries) = conf["relays"].as_array() else { return Vec::new(); };
+    // Resolve a bounded number concurrently without changing directory order.
+    futures::stream::iter(entries.iter().map(resolve_relay_entry))
+        .buffered(8)
+        .filter_map(|relay| async { relay })
+        .collect().await
 }
 
 /// STUN: send a disco Ping to `stun` and return the reflexive (public) `ip:port`
@@ -367,6 +426,73 @@ fn parse_pubkey_hex(s: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn registered_anytls_identity_reaches_client_with_matching_password() {
+        use fluxpeer_control_server::{router, state::Store};
+        use fp_transport_anytls::AnytlsConfig;
+        let store = std::sync::Arc::new(Store::new());
+        let net = store.create_network("directory-test");
+        let invite = store.create_invite(&net.id, None, None).unwrap();
+        let device = store.enroll(&invite.code, "client", "test-key", 0).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router(store)).await.unwrap(); });
+        let client = Client::new(&url);
+        for identity in ["fluxpeer-relay", "custom-edge-identity"] {
+            let registered = client.register_relay_with_identity("eu", "localhost:443", None, true, Some("localhost:3478"), Some(identity)).await.unwrap();
+            assert_ne!(registered["id"], identity);
+            assert_eq!(registered["node_id"], identity);
+        }
+        let cfg = serde_json::from_value(serde_json::json!({
+            "private_key": "00".repeat(32), "device_id": device.id, "control_server": url,
+            "listen_port": 0, "tun_name": "fp-test", "prefix_len": 32
+        })).unwrap();
+        let directory = fetch_relays(&cfg).await.unwrap();
+        assert_eq!(directory.len(), 2);
+        for identity in ["fluxpeer-relay", "custom-edge-identity"] {
+            let entry = directory.iter().find(|r| r.node_id == identity).unwrap();
+            // The relay listener and node dialer both use with_node_id(). The
+            // directory-generated relay-N id must never seed the client password.
+            assert_eq!(AnytlsConfig::with_node_id(&entry.node_id).password, AnytlsConfig::with_node_id(identity).password);
+            assert!(entry.anytls);
+            assert!(entry.addresses.iter().all(|a| a.ip().is_loopback() && a.port() == 443));
+            assert!(entry.stun.is_some_and(|a| a.is_ipv4() && a.ip().is_loopback() && a.port() == 3478));
+        }
+        assert!(client.register_relay_with_identity("eu", "localhost:443", None, true, None, Some(" ")).await.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_directory_legacy_identity_and_ip_literals_remain_compatible() {
+        let directory = resolve_relay_directory(&serde_json::json!({"relays": [
+            {"id":"relay-42", "url":"127.0.0.1:443", "stun_url":"127.0.0.1:3478", "anytls":true},
+            {"id":"relay-43", "node_id":null, "url":"[::1]:443"},
+            {"url":"127.0.0.1:444"}
+        ]})).await;
+        assert_eq!(directory.len(), 3);
+        assert_eq!(directory[0].node_id, "relay-42");
+        assert_eq!(directory[0].addresses, vec!["127.0.0.1:443".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(directory[0].stun, Some("127.0.0.1:3478".parse().unwrap()));
+        assert_eq!(directory[1].node_id, "relay-43");
+        assert_eq!(directory[1].addresses, vec!["[::1]:443".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(directory[2].node_id, "fluxpeer-relay");
+    }
+
+    #[tokio::test]
+    async fn relay_directory_skips_bad_endpoints_and_identities_without_losing_valid_rows() {
+        let directory = resolve_relay_directory(&serde_json::json!({"relays": [
+            {"id":"bad-relay", "node_id":"edge", "url":"localhost:invalid-port"},
+            {"id":"bad-stun", "node_id":"edge", "url":"localhost:443", "stun_url":"localhost:invalid-port"},
+            {"id":"no-url", "node_id":"edge"},
+            {"id":"bad-id", "node_id":12, "url":"localhost:443"},
+            {"id":"empty-id", "node_id":" ", "url":"localhost:443"},
+            {"id":"good", "node_id":"edge", "url":"localhost:443", "stun_url":"localhost:3478"}
+        ]})).await;
+        assert_eq!(directory.len(), 1);
+        assert_eq!(directory[0].node_id, "edge");
+        assert!(directory[0].stun.is_some());
+    }
 
     async fn http_responses(responses: Vec<(u16, String)>) -> (Config, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

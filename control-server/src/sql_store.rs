@@ -460,6 +460,7 @@ impl SqlStore {
         network_id: Option<String>,
         anytls: bool,
         stun_url: Option<String>,
+        node_id: Option<String>,
     ) -> Result<RelayNode> {
         let relay = RelayNode {
             id: format!("relay-{}", self.seq.fetch_add(1, Ordering::Relaxed)),
@@ -468,6 +469,7 @@ impl SqlStore {
             network_id,
             anytls,
             stun_url: stun_url.or_else(|| Some(url.to_string())),
+            node_id,
         };
         db::insert_relay(&self.pool, &relay).await?;
         Ok(relay)
@@ -633,10 +635,11 @@ mod test {
 
         // shared/official relay (anytls, STUN defaults to url) + a network-scoped one
         let shared = s
-            .register_relay("eu", "relay.example.org:443", None, true, None)
+            .register_relay("eu", "relay.example.org:443", None, true, None, Some("edge-eu".into()))
             .await
             .unwrap();
         assert!(shared.anytls);
+        assert_eq!(shared.node_id.as_deref(), Some("edge-eu"));
         assert_eq!(shared.stun_url.as_deref(), Some("relay.example.org:443"));
         s.register_relay(
             "us",
@@ -644,6 +647,7 @@ mod test {
             Some(net.id.clone()),
             false,
             Some("198.51.100.7:3478".into()),
+            None,
         )
         .await
         .unwrap();
@@ -656,7 +660,10 @@ mod test {
         // a device pulls the directory in its config
         let cfg = s.device_config(&a.id).await.unwrap();
         assert_eq!(cfg.relays.len(), 2);
-        assert!(cfg.relays.iter().any(|r| r.url == "relay.example.org:443" && r.anytls));
+        assert!(cfg.relays.iter().any(|r| r.url == "relay.example.org:443" && r.anytls && r.node_id.as_deref() == Some("edge-eu")));
+        // Fresh store connection must read identity from SQL, not process memory.
+        let reopened = SqlStore::connect("sqlite:file:memdb_relay?mode=memory&cache=shared").await.unwrap();
+        assert!(reopened.device_config(&a.id).await.unwrap().relays.contains(&shared));
     }
 
     #[tokio::test]

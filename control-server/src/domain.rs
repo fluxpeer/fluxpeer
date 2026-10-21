@@ -72,6 +72,10 @@ pub struct RelayNode {
     /// relay port when omitted at registration.
     #[serde(default)]
     pub stun_url: Option<String>,
+    /// Relay-reported AnyTLS identity; distinct from the directory row id.
+    /// Absent on legacy registrations. Must match FLUXPEER_RELAY_NODE_ID.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 /// A subnet route advertised by a device acting as a Subnet Router:

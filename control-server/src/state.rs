@@ -322,6 +322,7 @@ impl Store {
         network_id: Option<String>,
         anytls: bool,
         stun_url: Option<String>,
+        node_id: Option<String>,
     ) -> RelayNode {
         let relay = RelayNode {
             id: format!("relay-{}", self.next_seq()),
@@ -330,6 +331,7 @@ impl Store {
             network_id,
             anytls,
             stun_url: stun_url.or_else(|| Some(url.to_string())),
+            node_id,
         };
         self.inner.lock().relays.insert(relay.id.clone(), relay.clone());
         relay
@@ -665,8 +667,8 @@ mod test {
         let s = Store::new();
         let net_a = s.create_network("a");
         let net_b = s.create_network("b");
-        s.register_relay("eu", "relay-eu:443", None, true, None); // shared/official
-        s.register_relay("us", "relay-a:443", Some(net_a.id.clone()), true, None); // a-only
+        s.register_relay("eu", "relay-eu:443", None, true, None, None); // shared/official
+        s.register_relay("us", "relay-a:443", Some(net_a.id.clone()), true, None, None); // a-only
 
         let a = s.list_relays(&net_a.id);
         assert_eq!(a.len(), 2); // shared + a-scoped

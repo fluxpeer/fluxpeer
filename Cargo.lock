@@ -947,7 +947,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "axum",
  "base64",
+ "fluxpeer-control-server",
  "fluxpeer-relay-server",
  "fluxpeer-sdk",
  "fp-crypto",

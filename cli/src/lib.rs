@@ -121,6 +121,9 @@ pub enum RelayCmd {
         /// UDP STUN address (defaults to `url`; the relay doubles as STUN).
         #[arg(long)]
         stun_url: Option<String>,
+        /// Actual relay transport identity; must match the relay process environment.
+        #[arg(long, env = "FLUXPEER_RELAY_NODE_ID", default_value = "fluxpeer-relay")]
+        node_id: String,
     },
     /// List relays usable by a network.
     List { network_id: String },
@@ -163,9 +166,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 network_id,
                 anytls,
                 stun_url,
+                node_id,
             } => print_json(
                 &client
-                    .register_relay(&region, &url, network_id.as_deref(), anytls, stun_url.as_deref())
+                    .register_relay_with_identity(&region, &url, network_id.as_deref(), anytls, stun_url.as_deref(), Some(&node_id))
                     .await?,
             ),
             RelayCmd::List { network_id } => print_json(&client.list_relays(&network_id).await?),
@@ -307,6 +311,19 @@ fn print_json(v: &Value) {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn relay_registration_reports_default_or_explicit_transport_identity() {
+        // Ignore the developer environment while checking the CLI default.
+        let cmd = <Cli as clap::CommandFactory>::command().mut_subcommand("relay", |cmd| {
+            cmd.mut_subcommand("add", |cmd| cmd.mut_arg("node_id", |arg| arg.env(None::<&str>)))
+        });
+        let matches = cmd.try_get_matches_from(["fp", "relay", "add", "eu", "localhost:443", "--anytls"]).unwrap();
+        let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
+        assert!(matches!(cli.command, Command::Relay { command: RelayCmd::Add { node_id, .. } } if node_id == "fluxpeer-relay"));
+        let cli = Cli::try_parse_from(["fp", "relay", "add", "eu", "localhost:443", "--anytls", "--node-id", "custom-edge"]).unwrap();
+        assert!(matches!(cli.command, Command::Relay { command: RelayCmd::Add { node_id, .. } } if node_id == "custom-edge"));
+    }
 
     #[test]
     fn parses_network_create() {

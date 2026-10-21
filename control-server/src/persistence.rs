@@ -54,10 +54,19 @@ pub async fn migrate(pool: &AnyPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS relay (\
             id TEXT PRIMARY KEY, region TEXT NOT NULL, url TEXT NOT NULL, \
-            network_id TEXT, anytls BIGINT NOT NULL DEFAULT 0, stun_url TEXT)",
+            network_id TEXT, anytls BIGINT NOT NULL DEFAULT 0, stun_url TEXT, node_id TEXT)",
     )
     .execute(pool)
     .await?;
+    // Upgrade existing directories without inventing an identity for old rows.
+    // SQLite and PostgreSQL have different duplicate-column errors; propagate
+    // every other failure so an unusable schema cannot silently start serving.
+    if let Err(error) = sqlx::query("ALTER TABLE relay ADD COLUMN node_id TEXT").execute(pool).await {
+        let duplicate = error.as_database_error().is_some_and(|e| {
+            e.code().as_deref() == Some("42701") || e.message() == "duplicate column name: node_id"
+        });
+        if !duplicate { return Err(error); }
+    }
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS admin (\
             username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, created_at BIGINT NOT NULL)",
@@ -215,13 +224,14 @@ pub async fn list_network_stats(pool: &AnyPool, network_id: &str) -> Result<Vec<
 
 /// Insert a relay into the directory.
 pub async fn insert_relay(pool: &AnyPool, r: &RelayNode) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO relay (id, region, url, network_id, anytls, stun_url) VALUES ($1,$2,$3,$4,$5,$6)")
+    sqlx::query("INSERT INTO relay (id, region, url, network_id, anytls, stun_url, node_id) VALUES ($1,$2,$3,$4,$5,$6,$7)")
         .bind(&r.id)
         .bind(&r.region)
         .bind(&r.url)
         .bind(&r.network_id)
         .bind(i64::from(r.anytls))
         .bind(&r.stun_url)
+        .bind(&r.node_id)
         .execute(pool)
         .await?;
     Ok(())
@@ -231,22 +241,23 @@ pub async fn insert_relay(pool: &AnyPool, r: &RelayNode) -> Result<(), sqlx::Err
 /// (`network_id IS NULL`).
 pub async fn list_relays(pool: &AnyPool, network_id: &str) -> Result<Vec<RelayNode>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT id, region, url, network_id, anytls, stun_url FROM relay WHERE network_id = $1 OR network_id IS NULL",
+        "SELECT id, region, url, network_id, anytls, stun_url, node_id FROM relay WHERE network_id = $1 OR network_id IS NULL",
     )
     .bind(network_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows
+    rows
         .into_iter()
-        .map(|r| RelayNode {
-            id: r.get::<String, _>("id"),
-            region: r.get::<String, _>("region"),
-            url: r.get::<String, _>("url"),
-            network_id: r.get::<Option<String>, _>("network_id"),
-            anytls: r.get::<i64, _>("anytls") != 0,
-            stun_url: r.get::<Option<String>, _>("stun_url"),
-        })
-        .collect())
+        .map(|r| Ok(RelayNode {
+            id: r.try_get::<String, _>("id")?,
+            region: r.try_get::<String, _>("region")?,
+            url: r.try_get::<String, _>("url")?,
+            network_id: r.try_get::<Option<String>, _>("network_id")?,
+            anytls: r.try_get::<i64, _>("anytls")? != 0,
+            stun_url: r.try_get::<Option<String>, _>("stun_url")?,
+            node_id: r.try_get::<Option<String>, _>("node_id")?,
+        }))
+        .collect::<Result<Vec<_>, sqlx::Error>>()
 }
 
 /// Replace a device's reported candidate endpoints (comma-separated `ip:port`s).
@@ -535,6 +546,30 @@ mod test {
             .connect("sqlite::memory:")
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn relay_identity_migrates_legacy_rows_and_roundtrips() {
+        let pool = mem_pool().await;
+        sqlx::query("CREATE TABLE relay (id TEXT PRIMARY KEY, region TEXT NOT NULL, url TEXT NOT NULL, network_id TEXT, anytls BIGINT NOT NULL DEFAULT 0, stun_url TEXT)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO relay VALUES ('relay-old','eu','localhost:443',NULL,1,NULL)")
+            .execute(&pool).await.unwrap();
+        migrate(&pool).await.unwrap();
+        migrate(&pool).await.unwrap(); // Repeated startup must be harmless.
+        let legacy = list_relays(&pool, "net-1").await.unwrap().remove(0);
+        assert_eq!(legacy.node_id, None);
+        let relay = RelayNode { id: "relay-new".into(), node_id: Some("edge-custom".into()), ..legacy };
+        insert_relay(&pool, &relay).await.unwrap();
+        assert_eq!(list_relays(&pool, "net-1").await.unwrap().into_iter().find(|r| r.id == relay.id), Some(relay));
+    }
+
+    #[tokio::test]
+    async fn relay_identity_migration_propagates_schema_failures() {
+        let pool = mem_pool().await;
+        // A view cannot be ALTERed into the required directory schema.
+        sqlx::query("CREATE VIEW relay AS SELECT 'relay-old' AS id").execute(&pool).await.unwrap();
+        assert!(migrate(&pool).await.is_err());
     }
 
     #[tokio::test]

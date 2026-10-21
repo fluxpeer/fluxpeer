@@ -64,6 +64,36 @@ cargo test  --workspace
 The GUI clients live in their own repos (see the table above) and build against this
 core via the `fluxpeer-sdk` / FFI crates.
 
+## Relay directory identity
+
+Register a relay with its actual AnyTLS transport identity in `node_id`, separate
+from the control-server's generated directory `id` (`relay-N`). The registration
+command accepts `--node-id`, or reads `FLUXPEER_RELAY_NODE_ID`, defaulting to
+`fluxpeer-relay` just like the relay process. When registering from another host,
+pass the identity used by that relay explicitly. For example, with your control
+URL and admin credential supplied through the existing environment settings:
+
+```bash
+fp relay add eu relay.example.org:443 --anytls --node-id edge-eu \
+  --stun-url relay.example.org:3478
+```
+
+Here the relay process must use `FLUXPEER_RELAY_NODE_ID=edge-eu`. SDK callers use
+`register_relay_with_identity`; raw HTTP callers include `node_id` in `POST
+/api/v1/relays`. Existing rows are migrated with a null identity. Missing/null
+identities retain the legacy directory-id password derivation and produce a
+client warning; that fallback does not repair an already mismatched old AnyTLS
+registration. Explicit empty identities are rejected.
+
+Directory relay and STUN endpoints accept `host:port`, including DNS names and
+bracketed IPv6 literals. Nodes resolve them asynchronously at bootstrap, with a
+five-second timeout per lookup and up to eight entries in flight. All resolved
+relay addresses enter failover; STUN selects IPv4 for the node's IPv4 UDP socket.
+An invalid or unresolved endpoint causes its directory entry to be skipped with a
+warning. IPv6-only STUN is skipped while keeping the relay candidates. DNS is
+resolved again on a bootstrap retry or a new node session; live DNS refresh is not
+part of this behavior.
+
 ## Contributing & security
 
 Contributions welcome under the licenses above. Please report security issues

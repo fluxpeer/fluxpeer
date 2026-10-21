@@ -812,27 +812,24 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
             None => relays_dir
                 .iter()
                 .filter(|d| control::relay_transport_matches(cfg.force_relay, d.anytls, cfg.relay_anytls, cfg.relay_bond))
-                .filter_map(|d| {
-                    Some(RelayTarget {
-                        addr: d.url.parse().ok()?,
-                        anytls: d.anytls,
-                        bond: cfg.relay_bond,
-                        bond_links: cfg.relay_bond_links,
-                        node_id: d.node_id.clone(),
-                    })
-                })
+                .flat_map(|d| d.addresses.iter().map(|&addr| RelayTarget {
+                    addr,
+                    anytls: d.anytls,
+                    bond: cfg.relay_bond,
+                    bond_links: cfg.relay_bond_links,
+                    node_id: d.node_id.clone(),
+                }))
                 .collect(),
         };
         if !cfg.force_relay || !relay_targets.is_empty() { break (relays_dir, relay_targets); }
         tracing::warn!("forced relay transport unavailable; retrying directory");
         relay_backoff.wait().await;
     };
-    let dir0 = relays_dir.first();
     let eff_stun: Option<SocketAddr> = cfg
         .stun_server
         .as_deref()
         .and_then(|s| s.parse().ok())
-        .or_else(|| dir0.and_then(|d| d.stun));
+        .or_else(|| relays_dir.iter().find_map(|d| d.stun));
     if !relays_dir.is_empty() {
         tracing::info!(relays = relays_dir.len(), candidates = relay_targets.len(), stun = ?eff_stun, "relay directory from control-server");
     }

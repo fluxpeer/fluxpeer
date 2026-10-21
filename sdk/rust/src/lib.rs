@@ -430,6 +430,8 @@ impl Client {
         Ok(())
     }
 
+    /// Legacy registration without a transport identity. Prefer `register_relay_with_identity`
+    /// for AnyTLS relays so clients do not fall back to the generated directory id.
     pub async fn register_relay(
         &self,
         region: &str,
@@ -438,9 +440,23 @@ impl Client {
         anytls: bool,
         stun_url: Option<&str>,
     ) -> Result<Value> {
+        self.register_relay_with_identity(region, url, network_id, anytls, stun_url, None).await
+    }
+
+    /// Register a relay with its actual transport identity (FLUXPEER_RELAY_NODE_ID).
+    /// `None` preserves the legacy directory-id fallback on clients.
+    pub async fn register_relay_with_identity(
+        &self,
+        region: &str,
+        url: &str,
+        network_id: Option<&str>,
+        anytls: bool,
+        stun_url: Option<&str>,
+        node_id: Option<&str>,
+    ) -> Result<Value> {
         self.http
             .post(self.url("/relays"))
-            .json(&json!({ "region": region, "url": url, "network_id": network_id, "anytls": anytls, "stun_url": stun_url }))
+            .json(&json!({ "region": region, "url": url, "network_id": network_id, "anytls": anytls, "stun_url": stun_url, "node_id": node_id }))
             .send()
             .await?
             .error_for_status()?
