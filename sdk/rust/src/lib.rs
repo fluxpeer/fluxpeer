@@ -8,6 +8,11 @@ pub mod prefix;
 pub mod types;
 pub mod wgconf;
 
+/// Transport identities are 1-128 visible ASCII bytes, without whitespace.
+pub fn valid_relay_identity(value: &str) -> bool {
+    (1..=128).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
 /// Default control-server base URL.
 pub const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 
@@ -485,5 +490,18 @@ impl Client {
             .json()
             .await
             .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod relay_identity_tests {
+    #[test]
+    fn visible_ascii_identity_boundaries() {
+        assert!(super::valid_relay_identity("a"));
+        assert!(super::valid_relay_identity(&"~".repeat(128)));
+        assert!(super::valid_relay_identity("edge-1_.!"));
+        for invalid in ["".into(), " ".into(), " edge".into(), "edge ".into(), "edge\tname".into(), "edge\n".into(), "é".into(), "\u{7f}".into(), "a".repeat(129)] {
+            assert!(!super::valid_relay_identity(&invalid), "{invalid:?}");
+        }
     }
 }

@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use fp_crypto::x25519::{PublicKey, StaticSecret};
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub(crate) struct Config {
     /// 64-hex (32-byte) x25519 private key (its public key is enrolled at the server).
     pub(crate) private_key: String,

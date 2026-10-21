@@ -182,7 +182,7 @@ pub(crate) async fn send_to_peer(
         // Gated on !prefer_relay so a dead-but-open TCP connection doesn't swallow
         // packets when liveness/relay-receipt says to use the relay.
         let _ = tx.try_send(bytes.to_vec());
-    } else if let Some(tx) = relay_out {
+    } else if let Some(tx) = relay_out && tx.available() {
         // try_send (drop-on-full), never await: a relay mid-failover must not
         // stall the single-task data plane. wg retransmits any dropped frame.
         let _ = tx.try_send((peer.pubkey, bytes.to_vec()));

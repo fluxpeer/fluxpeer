@@ -115,10 +115,12 @@ async fn persistent_http_enroll_loop_on_sqlite() {
         assert_eq!(resp.status(), StatusCode::CREATED);
         assert_eq!(body_json(resp).await["node_id"], node_id);
     }
-    let resp = app.clone().oneshot(post("/api/v1/relays", json!({
-        "region": "eu", "url": "localhost:443", "node_id": " "
-    }))).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    for invalid in ["".into(), " ".into(), " edge".into(), "edge ".into(), "edge name".into(), "edge\n".into(), "é".into(), "x".repeat(129)] {
+        let resp = app.clone().oneshot(post("/api/v1/relays", json!({
+            "region": "eu", "url": "localhost:443", "node_id": invalid
+        }))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
     let relays = body_json(app.clone().oneshot(get("/api/v1/networks/any/relays")).await.unwrap()).await;
     assert_eq!(relays.as_array().unwrap().len(), 2);
     assert!(relays.as_array().unwrap().iter().any(|r| r["node_id"] == "edge-sql"));

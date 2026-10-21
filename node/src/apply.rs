@@ -48,8 +48,73 @@ impl From<io::Error> for ApplyError {
 
 pub(crate) trait Runner {
     fn run(&mut self, command: &[&str], input: Option<&str>) -> Result<String>;
-    fn write(&mut self, path: &str, data: &str) -> Result { write(path, data) }
+    fn write_file(&mut self, path: &std::path::Path, data: &[u8]) -> Result {
+        write_file_with(path, data, has_selinux_label, |from, to| std::fs::rename(from, to))
+            .map_err(|e| ApplyError::io(&["write", &path.to_string_lossy()], e))
+    }
 }
+// Preserve security labels on the original inode. Absence/unsupported xattrs
+// permit rename; other inspection failures must not silently discard labels.
+fn has_selinux_label(file: &std::fs::File) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the fd is live, the name is NUL-terminated; a null buffer with
+        // size zero asks only for the attribute's length.
+        let size = unsafe { libc::fgetxattr(file.as_raw_fd(), c"security.selinux".as_ptr(), std::ptr::null_mut(), 0) };
+        if size >= 0 { return Ok(true); }
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ENODATA | libc::ENOTSUP)) { Ok(false) } else { Err(error) }
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = file; Ok(false) }
+}
+fn write_file_with(
+    path: &std::path::Path, data: &[u8],
+    labeled: impl FnOnce(&std::fs::File) -> io::Result<bool>,
+    rename: impl FnOnce(&std::path::Path, &std::path::Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| io::Error::other("missing target directory"))?;
+    let original = match std::fs::File::open(path) {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let in_place = || -> io::Result<()> {
+        let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+        file.write_all(data)?;
+        file.sync_all()
+    };
+    if let Some(file) = &original && labeled(file)? { return in_place(); }
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    if let Some(file) = &original {
+        let metadata = file.metadata()?;
+        #[cfg(unix)]
+        {
+            use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+            // SAFETY: temp owns the live fd; uid/gid came from target metadata.
+            if unsafe { libc::fchown(temp.as_file().as_raw_fd(), metadata.uid(), metadata.gid()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        // chown may clear mode bits, so apply permissions afterwards.
+        temp.as_file().set_permissions(metadata.permissions())?;
+    } else {
+        #[cfg(unix)]
+        { use std::os::unix::fs::PermissionsExt; temp.as_file().set_permissions(std::fs::Permissions::from_mode(0o644))?; }
+    }
+    temp.write_all(data)?;
+    temp.as_file().sync_all()?;
+    match rename(temp.path(), path) {
+        Ok(()) => {},
+        Err(error) if matches!(error.kind(), io::ErrorKind::ResourceBusy | io::ErrorKind::CrossesDevices) => return in_place(),
+        Err(error) => return Err(error),
+    }
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 pub(crate) struct System;
 impl Runner for System {
     fn run(&mut self, command: &[&str], input: Option<&str>) -> Result<String> {
@@ -178,6 +243,10 @@ pub(crate) struct Retry {
     delay: u64,
 }
 impl Retry {
+    pub fn waiting(&self, epoch: u64, now: Instant) -> bool {
+        self.epoch == Some(epoch) && self.next.is_some_and(|deadline| now < deadline) && self.error.is_some()
+    }
+
     pub fn run(&mut self, epoch: u64, now: Instant, effect: impl FnOnce() -> Result) -> Result {
         if self.epoch != Some(epoch) { *self = Self { epoch: Some(epoch), ..Self::default() }; }
         if self.next.is_some_and(|t| now < t) && let Some(error) = &self.error { return Err(error.clone()); }
@@ -252,23 +321,17 @@ pub(crate) mod test_support {
     use super::*;
     pub struct Scripted {
         pub commands: Vec<Vec<String>>,
-        pub writes: Vec<(String, String)>,
-        pub write_error: Option<ApplyError>,
         replies: std::collections::VecDeque<Result<String>>,
     }
     impl Scripted {
         pub fn new(replies: Vec<Result<String>>) -> Self {
-            Self { commands: vec![], writes: vec![], write_error: None, replies: replies.into() }
+            Self { commands: vec![], replies: replies.into() }
         }
     }
     impl Runner for Scripted {
         fn run(&mut self, command: &[&str], _: Option<&str>) -> Result<String> {
             self.commands.push(command.iter().map(|s| s.to_string()).collect());
             self.replies.pop_front().expect("unexpected command").map_err(|mut e| { e.command = command.iter().map(|s| s.to_string()).collect(); e })
-        }
-        fn write(&mut self, path: &str, data: &str) -> Result {
-            self.writes.push((path.into(), data.into()));
-            self.write_error.clone().map_or(Ok(()), Err)
         }
     }
     pub fn error(exit_code: Option<i32>, stderr: &str) -> ApplyError {
@@ -359,5 +422,35 @@ mod tests {
         assert_eq!(err.kind, io::ErrorKind::NotFound);
         assert_eq!(err.exit_code, None);
     }
+    #[cfg(unix)]
+    #[test]
+    fn busy_or_cross_device_rename_preserves_inode_and_writes_in_place() {
+        use std::os::unix::fs::MetadataExt;
+        for errno in [libc::EBUSY, libc::EXDEV] {
+            let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("resolver");
+            std::fs::write(&path, b"original longer content").unwrap();
+            let inode = std::fs::metadata(&path).unwrap().ino();
+            write_file_with(&path, b"new", |_| Ok(false), |_, _| Err(io::Error::from_raw_os_error(errno))).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"new");
+            assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_owner_and_labeled_target_uses_original_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("resolver");
+        std::fs::write(&path, b"original").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        write_file_with(&path, b"atomic", |_| Ok(false), |from, to| std::fs::rename(from, to)).unwrap();
+        let atomic = std::fs::metadata(&path).unwrap();
+        assert_ne!(before.ino(), atomic.ino()); assert_eq!((before.uid(), before.gid()), (atomic.uid(), atomic.gid()));
+        write_file_with(&path, b"labeled", |_| Ok(true), |_, _| panic!("labeled target must not rename")).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), atomic.ino());
+        assert_eq!(std::fs::read(&path).unwrap(), b"labeled");
+        assert!(write_file_with(&path, b"denied", |_| Ok(false), |_, _| Err(io::Error::from(io::ErrorKind::PermissionDenied))).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"labeled");
+    }
+
 }
 

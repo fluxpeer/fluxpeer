@@ -62,6 +62,66 @@ type WidMap = Arc<parking_lot::RwLock<std::collections::HashMap<[u8; 32], usize>
 type CandMap = Arc<parking_lot::RwLock<std::collections::HashMap<SocketAddr, usize>>>;
 type AllowedMap = Arc<arc_swap::ArcSwap<worker::RouteTable>>;
 
+/// Directory failures must not hold usable local relay/direct connectivity
+/// hostage. Only forced mode without a usable target blocks bootstrap.
+fn relay_candidates(cfg: &Config, directory: &[control::RelayDir]) -> Vec<RelayTarget> {
+    if let Some(addr) = cfg.relay.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()) {
+        return vec![RelayTarget { addr, anytls: cfg.relay_anytls, bond: cfg.relay_bond, bond_links: cfg.relay_bond_links,
+            node_id: cfg.relay_node_id.clone().unwrap_or_else(|| "fluxpeer-relay".into()) }];
+    }
+    directory.iter().filter(|d| control::relay_transport_matches(cfg.force_relay, d.anytls, cfg.relay_anytls, cfg.relay_bond))
+        .flat_map(|d| d.addresses.iter().map(|&addr| RelayTarget { addr, anytls: d.anytls, bond: cfg.relay_bond,
+            bond_links: cfg.relay_bond_links, node_id: d.node_id.clone() })).collect()
+}
+async fn bootstrap_directory_with<F, Fut>(cfg: &Config, mut fetch: F) -> std::io::Result<(Vec<control::RelayDir>, Vec<RelayTarget>, bool)>
+where F: FnMut() -> Fut, Fut: std::future::Future<Output = std::io::Result<Vec<control::RelayDir>>> {
+    let mut backoff = mobile::Backoff::default();
+    loop {
+        let (directory, retry) = match fetch().await {
+            Ok(directory) => { let empty = directory.is_empty(); (directory, empty) },
+            Err(error) if control::terminal_control_error(&error) => return Err(error),
+            Err(error) => {
+                tracing::warn!(%error, "relay directory unavailable; preserving configured relay or direct connectivity");
+                (Vec::new(), true)
+            }
+        };
+        let targets = relay_candidates(cfg, &directory);
+        if !cfg.force_relay || !targets.is_empty() { return Ok((directory, targets, retry)); }
+        tracing::warn!("forced relay transport unavailable; retrying directory");
+        backoff.wait().await;
+    }
+}
+struct DirectoryRefresh {
+    config: Config,
+    targets: tokio::sync::watch::Sender<Vec<RelayTarget>>,
+    next: Instant,
+    delay: u64,
+    pending: Option<Vec<RelayTarget>>,
+    stun: Option<(Arc<UdpSocket>, Arc<control::StunRefresh>, Vec<String>)>,
+}
+impl DirectoryRefresh {
+    fn new(config: Config, targets: tokio::sync::watch::Sender<Vec<RelayTarget>>) -> Self {
+        Self { config, targets, next: Instant::now() + Duration::from_secs(2), delay: 2, pending: None, stun: None }
+    }
+    async fn refresh_stun(&self, entries: &[control::RelayDir]) -> std::io::Result<()> {
+        if !self.config.advertise.is_empty() { return Ok(()); }
+        let Some((udp, replies, advertised)) = &self.stun else { return Ok(()); };
+        let server = self.config.stun_server.as_deref().and_then(|s| s.parse().ok()).or_else(|| entries.iter().find_map(|entry| entry.stun));
+        let Some(server) = server else { return Ok(()); };
+        let Some(observed) = replies.query(udp, server).await else {
+            tracing::warn!(%server, "refreshed STUN query did not yield a reflexive endpoint"); return Ok(());
+        };
+        let mut endpoints = advertised.clone();
+        let observed = observed.to_string();
+        if !endpoints.contains(&observed) { endpoints.push(observed); }
+        control::mk_client(&self.config).set_endpoints(&self.config.device_id, &endpoints).await.map_err(control::request_error)
+    }
+    fn failed(&mut self) {
+        self.delay = (self.delay * 2).min(60);
+        self.next = Instant::now() + Duration::from_secs(self.delay);
+    }
+}
+
 /// Steady-state membership reconcile (REVOKE-1). Polls the control-server's
 /// `device_config`; when its `config_epoch` advances (a device was revoked or a new
 /// one enrolled), diffs the peer set against `known` and adds/removes peers LIVE —
@@ -87,6 +147,7 @@ struct Reconciler {
     ordinal: usize,
     use_exit: Option<String>,
     relay_available: bool,
+    directory: Option<DirectoryRefresh>,
     desired: Vec<control::PeerInfo>,
     pending: Option<control::Snapshot>,
     self_exit: bool,
@@ -99,7 +160,7 @@ struct HostEffects {
     tun_name: String,
     own_cidr: String,
     control_host: String,
-    relay_ips: Vec<String>,
+    relay_ips: parking_lot::Mutex<Vec<String>>,
     exclude_routes: Vec<String>,
     dns_override: Vec<String>,
     exit_state: ExitState,
@@ -118,8 +179,9 @@ enum HostStage { Routes, Exit, Dns, Nat, Retire }
 #[derive(Default)]
 struct HostRuntime {
     routes: apply::Routes,
-    admin_dns: bool,
     dns: DnsInstall,
+    dns_startup_checked: bool,
+    dns_full_tunnel: bool,
     retries: [apply::Retry; 4],
 }
 #[derive(Default)]
@@ -141,6 +203,18 @@ fn sync_dns_with(state: &mut DnsInstall, desired: Option<&str>, mut set: impl Fn
     Ok(())
 }
 
+fn sync_dns_mode_with(
+    state: &mut DnsInstall, installed_full: &mut bool, desired: Option<&str>, full: bool,
+    mut set: impl FnMut(&str, bool) -> ApplyResult, clear: impl FnMut() -> ApplyResult,
+    mut verify_file: impl FnMut() -> ApplyResult,
+) -> ApplyResult {
+    if *installed_full != full && desired.is_some() { state.dirty = true; }
+    *installed_full = full;
+    sync_dns_with(state, desired, |dns| set(dns, full), clear)?;
+    if full && desired.is_some() { verify_file()?; }
+    Ok(())
+}
+
 impl HostEffects {
     fn effect(&self, _stage: HostStage, operation: impl FnOnce() -> ApplyResult) -> ApplyResult {
         #[cfg(test)]
@@ -155,7 +229,7 @@ impl HostEffects {
         retry.run(epoch, Instant::now(), || self.effect(HostStage::Retire, || retire_exit(&self.exit_state, &self.shutdown, selected)))
     }
 
-    fn sync_exit(&self, peers: &[control::PeerInfo]) -> ApplyResult {
+    fn sync_exit(&self, peers: &[control::PeerInfo], bypass: &[String]) -> ApplyResult {
         if !self.manage_host_routes { return Ok(()); }
         if route::current_os() == route::RouteOs::Windows {
             tracing::warn!("Windows exit routes unsupported; deferred to F05"); return Ok(());
@@ -167,12 +241,33 @@ impl HostEffects {
         }
         retire_exit(&self.exit_state, &self.shutdown, selected_exit(peers))?;
         sync_exit_with(&self.exit_state, &self.shutdown, selected_exit(peers), |s| s.exit_peer,
-            || apply_exit(peers, &self.tun_name, &self.control_host, &self.relay_ips, &self.exclude_routes, &mut self.exit_progress.lock()), remove_exit)
+            || apply_exit(peers, &self.tun_name, bypass, &mut self.exit_progress.lock()), remove_exit)
     }
 
-    fn tick(&self, epoch: u64, peers: &[control::PeerInfo], self_exit: bool) -> ApplyResult {
+    async fn apply(self: &Arc<Self>, epoch: u64, peers: Vec<control::PeerInfo>, self_exit: bool) -> ApplyResult {
+        let bypass = self.prepare_bypass(epoch, &peers, |host| async move {
+            tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host.as_str(), 0))).await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "bypass DNS timeout"))?
+                .map(|addresses| addresses.map(|a| a.ip()).collect())
+        }).await;
+        let host = self.clone();
+        apply::blocking(move || host.tick(epoch, &peers, self_exit, &bypass)).await
+    }
+
+    async fn prepare_bypass<F, Fut>(&self, epoch: u64, peers: &[control::PeerInfo], resolve: F) -> Vec<String>
+    where F: Fn(String) -> Fut, Fut: std::future::Future<Output = std::io::Result<Vec<std::net::IpAddr>>> {
+        if !self.manage_host_routes || *self.shutdown.lock() { return Vec::new(); }
+        if self.runtime.lock().retries.get(1).is_some_and(|retry| retry.waiting(epoch, Instant::now())) { return Vec::new(); }
+        let Some(exit) = selected_exit(peers).and_then(|pk| peers.iter().find(|p| p.pubkey == pk)) else { return Vec::new(); };
+        if self.exit_state.lock().as_ref().is_some_and(|s| s.exit_peer == exit.pubkey && !s.teardown_started.load(std::sync::atomic::Ordering::Relaxed)) { return Vec::new(); }
+        // No runtime, shutdown, exit-state or progress guard crosses DNS awaits.
+        let candidates = exit_bypass_candidates(&self.control_host, &self.relay_ips.lock(), exit, &self.exclude_routes);
+        resolve_bypass_candidates(candidates, resolve).await
+    }
+
+    fn tick(&self, epoch: u64, peers: &[control::PeerInfo], self_exit: bool, bypass: &[String]) -> ApplyResult {
         let mut runtime = self.runtime.lock();
-        let HostRuntime { routes, admin_dns, dns, retries } = &mut *runtime;
+        let HostRuntime { routes, dns, dns_startup_checked, dns_full_tunnel, retries } = &mut *runtime;
         let now = Instant::now();
         let [route_retry, exit_retry, dns_retry, nat_retry] = retries;
         let host = route_retry.run(epoch, now, || self.effect(HostStage::Routes, || {
@@ -180,19 +275,22 @@ impl HostEffects {
             if *stopped || !self.manage_host_routes { return Ok(()); }
             sync_host(peers, &self.own_cidr, &self.tun_name, routes, epoch)
         }));
-        let exit = exit_retry.run(epoch, now, || self.effect(HostStage::Exit, || self.sync_exit(peers)));
+        let exit = exit_retry.run(epoch, now, || self.effect(HostStage::Exit, || self.sync_exit(peers, bypass)));
         let resolver = dns_retry.run(epoch, now, || self.effect(HostStage::Dns, || {
             let stopped = self.shutdown.lock();
             if *stopped || !self.manage_host_routes { return Ok(()); }
-            let admin = if *admin_dns { Ok(()) } else {
-                let result = apply_dns(&self.dns_override, &self.tun_name);
-                if result.is_ok() { *admin_dns = true; }
-                result
-            };
-            let desired_dns = selected_exit(peers).and_then(|pk| peers.iter().find(|p| p.pubkey == pk))
-                .and_then(|p| self.dns_override.first().cloned().or_else(|| p.overlay.map(|a| a.to_string())));
-            let exit_dns = sync_dns_with(dns, desired_dns.as_deref(), |d| route::set_dns(&self.tun_name, d), || route::reset_dns(&self.tun_name));
-            apply::all([admin, exit_dns])
+            if !*dns_startup_checked {
+                dns.dirty |= route::dns_restore_pending(&self.tun_name)?;
+                *dns_startup_checked = true;
+            }
+            let ready = exit.is_ok() && self.exit_state.lock().as_ref().is_some_and(|state| {
+                Some(state.exit_peer) == selected_exit(peers) && !state.teardown_started.load(std::sync::atomic::Ordering::Relaxed)
+            });
+            let manage = std::env::var("FLUXPEER_MANAGE_DNS").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+            let desired = desired_dns(peers, &self.dns_override, ready, manage);
+            sync_dns_mode_with(dns, dns_full_tunnel, desired.as_deref(), ready,
+                |dns, full| route::set_dns(&self.tun_name, dns, full), || route::reset_dns(&self.tun_name),
+                || route::verify_dns_file(&self.tun_name))
         }));
         let nat = nat_retry.run(epoch, now, || self.effect(HostStage::Nat, || sync_nat(self.provider, &self.nat_state, &self.shutdown, self_exit, &self.tun_name, &self.own_cidr)));
         apply::all([host, exit, resolver, nat])
@@ -461,9 +559,7 @@ type NatState = Arc<parking_lot::Mutex<NatInstall>>;
 fn apply_exit(
     peers: &[control::PeerInfo],
     dev: &str,
-    control_host: &str,
-    relay_ips: &[String],
-    exclude_routes: &[String],
+    resolved: &[String],
     progress: &mut route::ExitProgress,
 ) -> ApplyResult<Option<ExitTunState>> {
     let Some(ex) = selected_exit(peers).and_then(|pk| peers.iter().find(|p| p.pubkey == pk)) else {
@@ -476,12 +572,8 @@ fn apply_exit(
             return Err(ApplyError::new(&["discover", "default-gateway"], "no physical gateway/interface for full-tunnel"));
         }
     };
-    use std::net::ToSocketAddrs;
-    let candidates = exit_bypass_candidates(control_host, relay_ips, ex, exclude_routes);
-    // apply_exit runs on the blocking pool, including the OS resolver.
-    let resolved = resolve_bypass_candidates(candidates, |host| (host, 0).to_socket_addrs().map(|it| it.map(|a| a.ip()).collect()));
     let mut bypass = Vec::new();
-    for candidate in resolved { if route::needs_bypass(&candidate)? { bypass.push(candidate); } }
+    for candidate in resolved { if route::needs_bypass(candidate)? { bypass.push(candidate.clone()); } }
     route::exit_up(dev, &gw, &phys, &bypass, progress)?;
     Ok(Some(ExitTunState {
         teardown_started: std::sync::atomic::AtomicBool::new(false),
@@ -491,17 +583,20 @@ fn apply_exit(
     }))
 }
 
-fn resolve_bypass_candidates(
-    candidates: Vec<String>, mut resolve: impl FnMut(&str) -> std::io::Result<Vec<std::net::IpAddr>>,
-) -> Vec<String> {
-    let mut resolved = Vec::new();
-    for candidate in candidates {
-        if candidate.parse::<fluxpeer_sdk::prefix::IpPrefix>().is_ok() { resolved.push(candidate); continue; }
-        match resolve(&candidate) {
-            Ok(addresses) => resolved.extend(addresses.into_iter().map(|a| a.to_string())),
-            Err(error) => tracing::warn!(%candidate, %error, "bypass resolution failed; skipping candidate"),
+async fn resolve_bypass_candidates<F, Fut>(candidates: Vec<String>, resolve: F) -> Vec<String>
+where F: Fn(String) -> Fut, Fut: std::future::Future<Output = std::io::Result<Vec<std::net::IpAddr>>> {
+    use futures::StreamExt;
+    let groups: Vec<_> = futures::stream::iter(candidates.into_iter().map(|candidate| {
+        let resolve = &resolve;
+        async move {
+            if candidate.parse::<fluxpeer_sdk::prefix::IpPrefix>().is_ok() { return vec![candidate]; }
+            match resolve(candidate.clone()).await {
+                Ok(addresses) => addresses.into_iter().map(|a| a.to_string()).collect(),
+                Err(error) => { tracing::warn!(%candidate, %error, "bypass resolution failed; skipping candidate"); Vec::new() }
+            }
         }
-    }
+    })).buffered(8).collect().await;
+    let mut resolved: Vec<_> = groups.into_iter().flatten().collect();
     resolved.sort(); resolved.dedup(); resolved
 }
 
@@ -534,9 +629,14 @@ impl Reconciler {
     }
 
     async fn reconcile_tick(&mut self) -> ApplyResult {
-        let applied_epoch = self.apply_status.lock().applied_epoch;
+        self.refresh_directory().await?;
+        // A newly usable relay may select an endpointless auto-exit at the same
+        // control epoch. Poll a full snapshot before publishing the candidates.
+        let changed = self.directory.as_ref().is_some_and(|d| d.pending.is_some());
+        let applied_epoch = if changed { None } else { self.apply_status.lock().applied_epoch };
+        let mut publish_directory = !changed;
         match control::poll_peers_if_changed(&self.client, &self.device_id, applied_epoch).await {
-            Ok(Some(snap)) => self.pending = Some(snap),
+            Ok(Some(snap)) => { self.pending = Some(snap); publish_directory = true; },
             Ok(None) => {}
             Err(error) => {
                 let failure = ApplyError::new(&["control", "device-config"], error.to_string());
@@ -544,7 +644,52 @@ impl Reconciler {
                 return Err(failure);
             }
         }
-        self.reconcile_effects().await
+        self.reconcile_effects().await?;
+        if publish_directory && let Some(directory) = self.directory.as_mut() && let Some(targets) = directory.pending.take() {
+            directory.targets.send_replace(targets);
+            self.directory = None;
+        }
+        Ok(())
+    }
+
+    async fn refresh_directory(&mut self) -> ApplyResult {
+        let Some(directory) = self.directory.as_mut() else { return Ok(()); };
+        if directory.pending.is_none() {
+            if Instant::now() < directory.next { return Ok(()); }
+            match fetch_relays(&directory.config).await {
+                Ok(entries) if !entries.is_empty() => {
+                    if let Err(error) = directory.refresh_stun(&entries).await {
+                        if control::terminal_control_error(&error) {
+                            let failure = ApplyError::new(&["control", "STUN endpoints"], error.to_string());
+                            self.terminal_control = Some(error); return Err(failure);
+                        }
+                        tracing::warn!(%error, "refreshed STUN endpoint report failed");
+                    }
+                    let targets = relay_candidates(&directory.config, &entries);
+                    if targets == *directory.targets.borrow() { self.directory = None; return Ok(()); }
+                    directory.pending = Some(targets);
+                }
+                Ok(_) => { directory.failed(); return Ok(()); }
+                Err(error) if control::terminal_control_error(&error) => {
+                    let failure = ApplyError::new(&["control", "relay-directory"], error.to_string());
+                    self.terminal_control = Some(error); return Err(failure);
+                }
+                Err(error) => { tracing::warn!(%error, "relay directory refresh deferred"); directory.failed(); return Ok(()); }
+            }
+        }
+        if let Some(targets) = &directory.pending {
+            let ips: Vec<String> = targets.iter().map(|target| target.addr.ip().to_string()).collect();
+            if *self.host.relay_ips.lock() != ips {
+                // Remove the old exit before changing its physical relay bypasses.
+                // Publish to the dialer only after the new host effects succeed.
+                let host = self.host.clone();
+                let epoch = self.desired_epoch;
+                apply::blocking(move || host.retire(epoch, None)).await?;
+                *self.host.relay_ips.lock() = ips;
+            }
+            self.relay_available = !targets.is_empty();
+        }
+        Ok(())
     }
 
     async fn reconcile_effects(&mut self) -> ApplyResult {
@@ -553,7 +698,7 @@ impl Reconciler {
         let peers = self.desired.clone();
         let epoch = self.desired_epoch;
         let self_exit = self.self_exit;
-        let effects = apply::blocking(move || host.tick(epoch, &peers, self_exit)).await;
+        let effects = host.apply(epoch, peers, self_exit).await;
         apply::all([membership, effects])?;
         self.platform.applied(&self.desired).map_err(|e| ApplyError::new(&["mobile", "onRoutes"], e.to_string()))
     }
@@ -781,50 +926,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
 
     // Pull the relay directory from coordination. Local cfg fields, if set, still
     // override it — so a node needs zero relay/STUN config in the common case.
-    let mut relay_backoff = mobile::Backoff::default();
-    let (relays_dir, relay_targets) = loop {
-        let relays_dir = match fetch_relays(&cfg).await {
-            Ok(directory) => directory,
-            Err(error) if control::terminal_control_error(&error) => return Err(error),
-            Err(error) if cfg.force_relay || cfg.tun_fd.is_some() => {
-                tracing::warn!(%error, "relay directory unavailable; retrying");
-                relay_backoff.wait().await;
-                continue;
-            }
-            Err(error) => {
-                tracing::warn!(%error, "relay directory unavailable; continuing direct-only");
-                Vec::new()
-            }
-        };
-        // Relay candidates for failover: a hand-written cfg.relay overrides the
-        // directory entirely; otherwise use every directory relay (dial order).
-        let relay_targets: Vec<RelayTarget> = match cfg.relay.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()) {
-            Some(a) => vec![RelayTarget {
-                addr: a,
-                anytls: cfg.relay_anytls,
-                bond: cfg.relay_bond,
-                bond_links: cfg.relay_bond_links,
-                node_id: cfg
-                    .relay_node_id
-                    .clone()
-                    .unwrap_or_else(|| "fluxpeer-relay".to_string()),
-            }],
-            None => relays_dir
-                .iter()
-                .filter(|d| control::relay_transport_matches(cfg.force_relay, d.anytls, cfg.relay_anytls, cfg.relay_bond))
-                .flat_map(|d| d.addresses.iter().map(|&addr| RelayTarget {
-                    addr,
-                    anytls: d.anytls,
-                    bond: cfg.relay_bond,
-                    bond_links: cfg.relay_bond_links,
-                    node_id: d.node_id.clone(),
-                }))
-                .collect(),
-        };
-        if !cfg.force_relay || !relay_targets.is_empty() { break (relays_dir, relay_targets); }
-        tracing::warn!("forced relay transport unavailable; retrying directory");
-        relay_backoff.wait().await;
-    };
+    let (relays_dir, relay_targets, refresh_directory) = bootstrap_directory_with(&cfg, || fetch_relays(&cfg)).await?;
     let eff_stun: Option<SocketAddr> = cfg
         .stun_server
         .as_deref()
@@ -932,18 +1034,12 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     let own_cidr = overlay_cidr(r.own_addr, cfg.prefix_len);
     let apply_status = Arc::new(parking_lot::Mutex::new(apply::Status::default()));
     let host = Arc::new(HostEffects {
-        tun_name: dev_name.clone(), own_cidr, control_host, relay_ips,
+        tun_name: dev_name.clone(), own_cidr, control_host, relay_ips: parking_lot::Mutex::new(relay_ips),
         exclude_routes: cfg.exclude_routes.clone(), dns_override: eff_dns.clone(),
         exit_state, exit_progress, nat_state: Arc::default(), provider: ProviderPolicy::from_config(&cfg, embedded),
-        manage_host_routes: !embedded, shutdown, runtime: parking_lot::Mutex::default(),
+        manage_host_routes: !embedded, shutdown, runtime: parking_lot::Mutex::new(HostRuntime::default()),
         #[cfg(test)] probe: None,
     });
-    let initial_host = host.clone();
-    let initial_peers = peers.clone();
-    let self_exit = r.self_exit;
-    let result = apply::blocking(move || initial_host.tick(init_epoch, &initial_peers, self_exit)).await;
-    apply_status.lock().complete(init_epoch, result);
-
     // Graceful teardown: restore the default route + DNS (client side) and the NAT
     // rule (exit side) on SIGTERM/SIGINT before exiting — the daemon sends SIGTERM,
     // then SIGKILL. Without this a killed full-tunnel node strands the box's routing.
@@ -971,24 +1067,32 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
         });
     }
 
+    let initial_host = host.clone();
+    let initial_peers = peers.clone();
+    let self_exit = r.self_exit;
+    let result = initial_host.apply(init_epoch, initial_peers, self_exit).await;
+    apply_status.lock().complete(init_epoch, result);
+
+
     let (mut tun_tx, mut tun_rx) = dev.into_framed().split();
 
     // --- Relay: a supervisor keeps ONE connection alive across the candidate
     // list, failing over on dial-failure or drop. It bridges to these stable
     // channels so the data-plane loop never sees a reconnect. ---
-    let (relay_in, relay_out): (Option<RelayIn>, Option<RelayOut>) = if relay_targets.is_empty() {
-        (None, None)
-    } else {
-        let (app_in_tx, app_in_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
-        let (app_out_tx, app_out_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
-        tokio::spawn(relay_supervisor(
-            relay_targets,
-            *own_pub.as_bytes(),
-            app_out_rx,
-            app_in_tx,
-        ));
-        (Some(app_in_rx), Some(app_out_tx))
-    };
+    // Keep the channels alive even if initial DNS resolution found no relays.
+    // A recovered directory feeds the same supervisor without restarting TUN.
+    let (targets_tx, targets_rx) = tokio::sync::watch::channel(relay_targets);
+    let stun_replies = Arc::new(control::StunRefresh::default());
+    let directory = refresh_directory.then(|| {
+        let mut refresh = DirectoryRefresh::new(cfg.clone(), targets_tx.clone());
+        refresh.stun = Some((udp.clone(), stun_replies.clone(), advertise.clone()));
+        refresh
+    });
+    let (app_in_tx, app_in_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
+    let (app_out_tx, app_out_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
+    let relay_sender = RelayOut::new(app_out_tx, targets_rx.clone());
+    tokio::spawn(relay_supervisor(targets_rx, *own_pub.as_bytes(), app_out_rx, app_in_tx));
+    let (relay_in, relay_out): (Option<RelayIn>, Option<RelayOut>) = (Some(app_in_rx), Some(relay_sender));
 
     // --- Build per-peer state, partition across N workers, send first probe ---
     // Worker count: FP_WORKERS override (benchmark/tuning) else cores-1; never
@@ -1154,6 +1258,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     // UDP reader: route each datagram (disco/wg) to its owning worker.
     {
         let udp = udp.clone();
+        let stun_replies = stun_replies.clone();
         let wtxs = wtxs.clone();
         let peer_to_wid = peer_to_wid.clone();
         let cand_to_wid = cand_to_wid.clone();
@@ -1170,6 +1275,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
                 };
                 for i in 0..count {
                     let (data, from) = batch.get(i);
+                    if stun_replies.receive(data, from) { continue; }
                     let wid = {
                         let pw = peer_to_wid.read();
                         let cw = cand_to_wid.read();
@@ -1341,6 +1447,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
             host: host.clone(),
             use_exit: cfg.use_exit.clone(),
             relay_available,
+            directory,
             desired: desired_peers,
             pending: None,
             self_exit: r.self_exit,
@@ -1436,26 +1543,15 @@ fn sync_host(
     Ok(())
 }
 
-fn apply_dns(servers: &[String], iface: &str) -> ApplyResult {
-    if servers.is_empty() { return Ok(()); }
-    let manage = std::env::var("FLUXPEER_MANAGE_DNS").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    if !manage {
-        tracing::info!(?servers, "admin-set DNS (apply with FLUXPEER_MANAGE_DNS=1)");
-        return Ok(());
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = iface;
-        let body: String = servers.iter().map(|s| format!("nameserver {s}\n")).collect();
-        apply::write("/etc/resolv.conf", format!("# managed by fluxpeer\n{body}"))?;
-    }
-    #[cfg(windows)]
-    {
-        let csv = servers.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
-        apply::run(&["powershell", "-NoProfile", "-Command", &format!("$ErrorActionPreference='Stop'; Set-DnsClientServerAddress -InterfaceAlias '{iface}' -ServerAddresses {csv}")])?;
-    }
-    tracing::info!(?servers, "applied DNS");
-    Ok(())
+/// Exit DNS is contingent on an applied exit, including when an admin override
+/// exists. Split-mode admin DNS uses the same owned backend and cleanup path.
+fn desired_dns(peers: &[control::PeerInfo], overrides: &[String], exit_ready: bool, manage_admin: bool) -> Option<String> {
+    if let Some(pk) = selected_exit(peers) {
+        if !exit_ready { return None; }
+        overrides.first().cloned().or_else(|| peers.iter().find(|p| p.pubkey == pk)?.overlay.map(|a| a.to_string()))
+    } else if manage_admin && !overrides.is_empty() {
+        Some(overrides.join(" "))
+    } else { None }
 }
 
 #[cfg(test)]
@@ -1463,10 +1559,121 @@ mod exit_contract_tests {
     use super::*;
 
     fn test_host() -> HostEffects {
-        HostEffects { tun_name: "fp-test".into(), own_cidr: "100.72.16.0/24".into(), control_host: String::new(), relay_ips: vec![],
+        HostEffects { tun_name: "fp-test".into(), own_cidr: "100.72.16.0/24".into(), control_host: String::new(), relay_ips: parking_lot::Mutex::new(vec![]),
             exclude_routes: vec![], dns_override: vec![], exit_state: Arc::default(), exit_progress: Arc::default(), nat_state: Arc::default(),
             provider: ProviderPolicy { enabled: false, force: None, veto: false, trust_external: false }, manage_host_routes: false,
             shutdown: Arc::default(), runtime: parking_lot::Mutex::default(), probe: None }
+    }
+
+    fn directory_config(relay: Option<&str>, forced: bool) -> Config {
+        serde_json::from_value(serde_json::json!({"private_key":"00".repeat(32),"device_id":"test", "control_server":"http://127.0.0.1",
+            "listen_port":0,"tun_name":"test","prefix_len":24,"relay":relay,"force_relay":forced})).unwrap()
+    }
+    #[tokio::test]
+    async fn directory_dns_failure_does_not_block_explicit_relay_or_auto_startup() {
+        for (relay, forced) in [(Some("192.0.2.1:443"), true), (Some("192.0.2.1:443"), false), (None, false)] {
+            let cfg = directory_config(relay, forced);
+            let mut calls = 0;
+            let (_, targets, background) = bootstrap_directory_with(&cfg, || {
+                calls += 1;
+                std::future::ready(Err(std::io::Error::other("directory has no usable entries after DNS failures")))
+            }).await.unwrap();
+            assert_eq!(calls, 1); assert!(background); assert_eq!(targets.len(), usize::from(relay.is_some()));
+        }
+    }
+    #[tokio::test]
+    async fn recovered_directory_updates_bypasses_and_selects_auto_exit_at_same_epoch() {
+        use axum::{routing::get, Json, Router};
+        let response = serde_json::json!({"config_epoch":1,"peers":[{"wg_public_key":hex::encode([1;32]),
+            "allowed_ips":["100.72.16.2/32","0.0.0.0/0"],"exit":true}],
+            "relays":[{"id":"relay-1","node_id":"edge","url":"127.0.0.1:4444","anytls":false}]});
+        let app = Router::new().route("/api/v1/devices/test/config", get(move || { let response = response.clone(); async move { Json(response) } }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let mut cfg = directory_config(None, false); cfg.control_server = format!("http://{addr}");
+        let (targets, mut updates) = tokio::sync::watch::channel(vec![]);
+        let mut directory = DirectoryRefresh::new(cfg.clone(), targets.clone()); directory.next = Instant::now();
+        let (tx, _rx) = mpsc::channel(16);
+        let mut old = peer(1, "192.0.2.1:1", &["100.72.16.2/32"]); old.candidates.clear();
+        let mut r = test_reconciler(test_host(), old.clone(), old, tx);
+        r.client = control::mk_client(&cfg); r.pending = None; r.use_exit = Some("auto".into());
+        r.apply_status.lock().complete(1, Ok(()));
+        r.directory = Some(directory);
+        r.reconcile_tick().await.unwrap();
+        assert!(r.directory.is_none()); assert!(r.relay_available);
+        assert_eq!(selected_exit(&r.desired), Some([1; 32]));
+        assert_eq!(*r.host.relay_ips.lock(), ["127.0.0.1"]);
+        assert!(updates.has_changed().unwrap());
+        assert_eq!(updates.borrow_and_update().first().unwrap().node_id, "edge");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn forced_mode_without_usable_relay_retries_and_terminal_error_stops() {
+        let cfg = directory_config(None, true);
+        let mut calls = 0;
+        let (_, targets, background) = bootstrap_directory_with(&cfg, || {
+            calls += 1;
+            std::future::ready(if calls == 1 { Err(std::io::Error::other("directory DNS failed")) } else {
+                Ok(vec![control::RelayDir { addresses: vec!["192.0.2.1:443".parse().unwrap()], anytls: false, node_id: "edge".into(), stun: None }])
+            })
+        }).await.unwrap();
+        assert_eq!(calls, 2); assert_eq!(targets.len(), 1); assert!(!background);
+        let error = bootstrap_directory_with(&cfg, || std::future::ready(Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "HTTP 403")))).await.err().unwrap();
+        assert!(control::terminal_control_error(&error));
+    }
+    #[tokio::test]
+    async fn exit_retry_backoff_skips_bypass_dns_until_new_epoch() {
+        let mut host = test_host(); host.manage_host_routes = true; host.control_host = "control.test".into();
+        let peers = vec![peer(1, "192.0.2.1:1", &["0.0.0.0/0"])];
+        host.runtime.lock().retries[1].run(1, Instant::now(), || Err(ApplyError::new(&["route"], "injected failure"))).unwrap_err();
+        assert!(host.prepare_bypass(1, &peers, |_| -> std::future::Ready<std::io::Result<Vec<std::net::IpAddr>>> { panic!("backoff must skip DNS") }).await.is_empty());
+        let calls = std::cell::Cell::new(0);
+        let resolved = host.prepare_bypass(2, &peers, |_| {
+            calls.set(calls.get() + 1);
+            std::future::ready(Ok(vec!["192.0.2.9".parse().unwrap()]))
+        }).await;
+        assert_eq!(calls.get(), 1); assert!(!resolved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocked_bypass_lookup_does_not_hold_shutdown_or_runtime_locks() {
+        let mut host = test_host(); host.manage_host_routes = true; host.control_host = "control.test".into();
+        let host = Arc::new(host);
+        let peers = vec![peer(1, "192.0.2.1:1", &["0.0.0.0/0"])];
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let capture = entered.clone(); let preparing = host.clone();
+        let task = tokio::spawn(async move {
+            preparing.prepare_bypass(1, &peers, |_| {
+                capture.notify_one();
+                std::future::pending::<std::io::Result<Vec<std::net::IpAddr>>>()
+            }).await
+        });
+        entered.notified().await;
+        assert!(host.runtime.try_lock().is_some());
+        assert!(host.shutdown.try_lock().is_some());
+        assert!(host.exit_state.try_lock().is_some());
+        host.cleanup().unwrap();
+        assert!(*host.shutdown.lock());
+        task.abort();
+    }
+
+    #[test]
+    fn failed_exit_stage_clears_dns_and_success_retries_without_touching_routes() {
+        let peers = vec![peer(1, "192.0.2.1:1", &["0.0.0.0/0"])];
+        let overrides = vec!["192.0.2.53".into()];
+        let mut state = DnsInstall { applied: Some("192.0.2.99".into()), dirty: false };
+        let clears = std::cell::Cell::new(0);
+        let desired = desired_dns(&peers, &overrides, false, true);
+        assert_eq!(desired, None); // Admin override must not bypass the exit gate.
+        sync_dns_with(&mut state, desired.as_deref(), |_| panic!("failed exit must not set DNS"), || { clears.set(clears.get() + 1); Ok(()) }).unwrap();
+        assert_eq!(clears.get(), 1); assert_eq!(state.applied, None);
+        let desired = desired_dns(&peers, &overrides, true, true);
+        sync_dns_with(&mut state, desired.as_deref(), |_| Ok(()), || panic!("unexpected clear")).unwrap();
+        assert_eq!(state.applied.as_deref(), Some("192.0.2.53"));
+        assert_eq!(desired_dns(&[], &["192.0.2.53".into(), "2001:db8::53".into()], false, true).as_deref(), Some("192.0.2.53 2001:db8::53"));
+        assert_eq!(desired_dns(&[], &overrides, false, false), None);
     }
 
     fn test_reconciler(host: HostEffects, old: control::PeerInfo, new: control::PeerInfo, tx: mpsc::Sender<worker::WorkerMsg>) -> Reconciler {
@@ -1481,7 +1688,7 @@ mod exit_contract_tests {
             allowed: Arc::new(arc_swap::ArcSwap::from_pointee(worker::RouteTable::default().with_peer(old.pubkey, 0, &old.allowed_ips))),
             status_reg: reg, wtxs: vec![tx], ordinal: 1,
             known: KnownPeers::from([(old.pubkey, (0, old.candidates.clone(), old.allowed_ips.clone()))]),
-            desired_epoch: 1, apply_status: Arc::default(), host: Arc::new(host), use_exit: None, relay_available: false,
+            desired_epoch: 1, apply_status: Arc::default(), host: Arc::new(host), use_exit: None, relay_available: false, directory: None,
             desired: vec![old], pending: Some(control::Snapshot { platform: serde_json::Value::Null, epoch: 2, peers: vec![new], self_exit: false }), self_exit: false,
         }
     }
@@ -1632,7 +1839,7 @@ mod exit_contract_tests {
             allowed: Arc::new(arc_swap::ArcSwap::from_pointee(worker::RouteTable::default().with_peer(old.pubkey, 0, &old.allowed_ips))),
             status_reg: reg, wtxs: vec![tx], ordinal: 1,
             known: KnownPeers::from([(old.pubkey, (0, old.candidates.clone(), old.allowed_ips.clone()))]),
-            desired_epoch: 1, apply_status: Arc::default(), host: Arc::new(test_host()), use_exit: None, relay_available: false,
+            desired_epoch: 1, apply_status: Arc::default(), host: Arc::new(test_host()), use_exit: None, relay_available: false, directory: None,
             desired: vec![old.clone()], pending: Some(control::Snapshot { platform: serde_json::Value::Null, epoch: 2, peers: vec![new.clone()], self_exit: false }), self_exit: false,
         };
         r.apply_status.lock().complete(1, Ok(()));
@@ -1848,6 +2055,61 @@ mod exit_contract_tests {
         assert_eq!(host, "2001:db8::1");
         assert_eq!(exit_bypass_candidates(&host, &["2001:db8::2".into()], &exit, &[]),
             ["2001:db8::1", "2001:db8::2", "2001:db8::3"]);
+    }
+
+    #[test]
+    fn stable_full_tunnel_ticks_do_not_repeat_native_dns_set() {
+        let writes = std::cell::Cell::new(0); let checks = std::cell::Cell::new(0);
+        let mut state = DnsInstall::default(); let mut full = false;
+        for _ in 0..10 {
+            sync_dns_mode_with(&mut state, &mut full, Some("192.0.2.53"), true,
+                |_, _| { writes.set(writes.get() + 1); Ok(()) }, || panic!("unexpected clear"),
+                || { checks.set(checks.get() + 1); Ok(()) }).unwrap();
+        }
+        assert_eq!(writes.get(), 1); assert_eq!(checks.get(), 10);
+        sync_dns_mode_with(&mut state, &mut full, Some("192.0.2.53"), false,
+            |_, mode| { assert!(!mode); writes.set(writes.get() + 1); Ok(()) }, || panic!("unexpected clear"),
+            || panic!("split mode must not check drift")).unwrap();
+        assert_eq!(writes.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn refreshed_stun_reports_reflexive_endpoint_from_existing_data_socket() {
+        use axum::{routing::post, Json, Router};
+        use fp_disco::Disco;
+        let saved = Arc::new(parking_lot::Mutex::new(serde_json::Value::Null)); let captured = saved.clone();
+        let app = Router::new().route("/api/v1/devices/test/endpoints", post(move |Json(value): Json<serde_json::Value>| {
+            *captured.lock() = value;
+            async { axum::http::StatusCode::OK }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(); let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()); let client_address = udp.local_addr().unwrap();
+        let stun = UdpSocket::bind("127.0.0.1:0").await.unwrap(); let stun_address = stun.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let mut buffer = [0; 512]; let (len, from) = stun.recv_from(&mut buffer).await.unwrap();
+            assert_eq!(from, client_address);
+            let (Disco::Ping { tx_id, .. }, _) = Disco::decode(buffer[..len].strip_prefix(util::DISCO_MAGIC).unwrap()).unwrap() else { panic!("expected ping"); };
+            let response = util::disco_dgram(&Disco::Pong { tx_id, observed: "198.51.100.42:4567".parse().unwrap() });
+            stun.send_to(&response, from).await.unwrap();
+        });
+        let replies = Arc::new(control::StunRefresh::default());
+        let reader_udp = udp.clone(); let reader_replies = replies.clone();
+        let reader = tokio::spawn(async move {
+            let mut buffer = [0; 512]; let (len, from) = reader_udp.recv_from(&mut buffer).await.unwrap();
+            assert!(!reader_replies.receive(&buffer[..len], "127.0.0.1:1".parse().unwrap()));
+            assert!(reader_replies.receive(&buffer[..len], from));
+        });
+        let mut cfg = directory_config(Some("192.0.2.1:443"), false); cfg.control_server = format!("http://{address}");
+        let (targets, _rx) = tokio::sync::watch::channel(vec![]);
+        let mut refresh = DirectoryRefresh::new(cfg, targets);
+        refresh.stun = Some((udp, replies, vec![client_address.to_string()]));
+        let entries = vec![control::RelayDir { addresses: vec!["192.0.2.1:443".parse().unwrap()], anytls: false, node_id: "edge".into(), stun: Some(stun_address) }];
+        refresh.refresh_stun(&entries).await.unwrap();
+        assert_eq!(saved.lock()["endpoints"], serde_json::json!([client_address.to_string(), "198.51.100.42:4567"]));
+        reader.await.unwrap(); fixture.await.unwrap(); server.abort();
+        refresh.config.advertise.push("192.0.2.9:9876".into());
+        refresh.refresh_stun(&entries).await.unwrap(); // Explicit advertisements skip query/report.
     }
 
 }

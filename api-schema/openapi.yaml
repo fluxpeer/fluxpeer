@@ -179,9 +179,11 @@ paths:
                   type: string
                   nullable: true
                   minLength: 1
+                  maxLength: 128
+                  pattern: '^[!-~]{1,128}$'
                   description: "Actual relay transport identity, matching FLUXPEER_RELAY_NODE_ID. Omitted/null preserves legacy client fallback."
       responses:
-        "400": { description: explicitly empty transport identity }
+        "400": { description: invalid transport identity (requires 1-128 visible ASCII characters) }
         "201":
           description: created
           content: { application/json: { schema: { $ref: "#/components/schemas/RelayNode" } } }
@@ -242,6 +244,9 @@ components:
         node_id:
           type: string
           nullable: true
+          minLength: 1
+          maxLength: 128
+          pattern: '^[!-~]{1,128}$'
           description: "Relay-reported transport identity, distinct from id; null on legacy registrations"
     PeerConfig:
       type: object

@@ -106,10 +106,13 @@ pub(crate) fn relay_transport_matches(force: bool, anytls: bool, require_anytls:
 /// Fetch the relay directory for this device from the control-server (one GET,
 /// before STUN, so we can learn the STUN address from it too). Preserve errors
 /// so mobile and forced-relay bootstrap can retry without ending the session.
-pub(crate) async fn fetch_relays(cfg: &Config) -> std::io::Result<Vec<RelayDir>> {
-    let client = mk_client(cfg);
-    let conf = client.device_config(&cfg.device_id).await.map_err(request_error)?;
-    Ok(resolve_relay_directory(&conf).await)
+pub(crate) fn fetch_relays(cfg: &Config) -> futures::future::BoxFuture<'_, std::io::Result<Vec<RelayDir>>> {
+    use futures::FutureExt;
+    async move {
+        let client = mk_client(cfg);
+        let conf = client.device_config(&cfg.device_id).await.map_err(request_error)?;
+        resolve_relay_directory(&conf).await
+    }.boxed()
 }
 
 /// Directory endpoints are host:port (including bracketed IPv6), not HTTP URLs.
@@ -126,33 +129,34 @@ async fn resolve_directory_endpoint(endpoint: &str) -> std::io::Result<Vec<Socke
     Ok(addresses)
 }
 
-async fn resolve_relay_entry(entry: &serde_json::Value) -> Option<RelayDir> {
+async fn resolve_relay_entry<F, Fut>(entry: &serde_json::Value, resolve: &F) -> std::io::Result<Option<RelayDir>>
+where F: Fn(String) -> Fut + Sync, Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send {
     let id = entry["id"].as_str().unwrap_or("fluxpeer-relay");
     let Some(url) = entry["url"].as_str() else {
         tracing::warn!(relay = id, "relay directory entry has no endpoint; skipping");
-        return None;
+        return Ok(None);
     };
     let node_id = match entry.get("node_id") {
         None | Some(serde_json::Value::Null) => {
             tracing::warn!(relay = id, "relay directory lacks transport identity; using legacy directory id");
             id
         }
-        Some(serde_json::Value::String(value)) if !value.trim().is_empty() => value,
+        Some(serde_json::Value::String(value)) if fluxpeer_sdk::valid_relay_identity(value) => value,
         _ => {
             tracing::warn!(relay = id, "relay directory has invalid transport identity; skipping");
-            return None;
+            return Ok(None);
         }
     };
-    let addresses = match resolve_directory_endpoint(url).await {
+    let addresses = match resolve(url.to_owned()).await {
         Ok(addresses) => addresses,
         Err(error) => {
             tracing::warn!(relay = id, endpoint = url, %error, "relay directory resolution failed; skipping");
-            return None;
+            return Err(error);
         }
     };
     let stun = match entry.get("stun_url") {
         None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(endpoint)) => match resolve_directory_endpoint(endpoint).await {
+        Some(serde_json::Value::String(endpoint)) => match resolve(endpoint.to_owned()).await {
             // The node's STUN socket is IPv4. Prefer a usable A record even if
             // the OS resolver returned AAAA first; relay TCP can use both.
             Ok(addresses) => {
@@ -164,25 +168,46 @@ async fn resolve_relay_entry(entry: &serde_json::Value) -> Option<RelayDir> {
             }
             Err(error) => {
                 tracing::warn!(relay = id, %endpoint, %error, "directory STUN resolution failed; skipping entry");
-                return None;
+                return Err(error);
             }
         },
         _ => {
             tracing::warn!(relay = id, "relay directory has invalid STUN endpoint; skipping");
-            return None;
+            return Ok(None);
         }
     };
-    Some(RelayDir { addresses, anytls: entry["anytls"].as_bool().unwrap_or(false), node_id: node_id.to_owned(), stun })
+    Ok(Some(RelayDir { addresses, anytls: entry["anytls"].as_bool().unwrap_or(false), node_id: node_id.to_owned(), stun }))
 }
 
-async fn resolve_relay_directory(conf: &serde_json::Value) -> Vec<RelayDir> {
-    use futures::StreamExt;
-    let Some(entries) = conf["relays"].as_array() else { return Vec::new(); };
-    // Resolve a bounded number concurrently without changing directory order.
-    futures::stream::iter(entries.iter().map(resolve_relay_entry))
-        .buffered(8)
-        .filter_map(|relay| async { relay })
-        .collect().await
+#[derive(Debug)]
+struct DirectoryResolutionFailed;
+impl std::fmt::Display for DirectoryResolutionFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("relay directory has no usable entries after DNS failures") }
+}
+impl std::error::Error for DirectoryResolutionFailed {}
+
+async fn resolve_relay_directory(conf: &serde_json::Value) -> std::io::Result<Vec<RelayDir>> {
+    resolve_directory_with(conf, |endpoint| async move { resolve_directory_endpoint(&endpoint).await }).await
+}
+
+async fn resolve_directory_with<F, Fut>(conf: &serde_json::Value, resolve: F) -> std::io::Result<Vec<RelayDir>>
+where F: Fn(String) -> Fut + Sync, Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send {
+    use futures::{FutureExt, StreamExt};
+    let Some(entries) = conf["relays"].as_array() else { return Ok(Vec::new()); };
+    let mut pending = Vec::with_capacity(entries.len());
+    for entry in entries { pending.push(resolve_relay_entry(entry, &resolve).boxed()); }
+    let results: Vec<_> = futures::stream::iter(pending).buffered(8).collect().await;
+    let mut relays = Vec::new();
+    let mut dns_failed = false;
+    for result in results {
+        match result {
+            Ok(Some(relay)) => relays.push(relay),
+            Ok(None) => {},
+            Err(error) => dns_failed |= error.kind() != std::io::ErrorKind::InvalidInput,
+        }
+    }
+    if relays.is_empty() && dns_failed { return Err(std::io::Error::other(DirectoryResolutionFailed)); }
+    Ok(relays)
 }
 
 /// STUN: send a disco Ping to `stun` and return the reflexive (public) `ip:port`
@@ -210,6 +235,37 @@ pub(crate) async fn stun_query(udp: &UdpSocket, stun: SocketAddr) -> Option<Sock
         }
     }
     None
+}
+
+// A refresh uses the existing data-plane socket. Its sole reader dispatches a
+// matching STUN reply here rather than racing a second recv_from consumer.
+type PendingStun = (SocketAddr, [u8; 12], tokio::sync::oneshot::Sender<SocketAddr>);
+#[derive(Default)]
+pub(crate) struct StunRefresh {
+    pending: parking_lot::Mutex<Option<PendingStun>>,
+}
+impl StunRefresh {
+    pub(crate) fn receive(&self, bytes: &[u8], from: SocketAddr) -> bool {
+        let Some(body) = bytes.strip_prefix(DISCO_MAGIC) else { return false; };
+        let Ok((Disco::Pong { tx_id, observed }, _)) = Disco::decode(body) else { return false; };
+        let mut pending = self.pending.lock();
+        if !pending.as_ref().is_some_and(|(server, id, _)| *server == from && *id == tx_id) { return false; }
+        if let Some((_, _, reply)) = pending.take() { let _ = reply.send(observed); }
+        true
+    }
+    pub(crate) async fn query(&self, udp: &UdpSocket, server: SocketAddr) -> Option<SocketAddr> {
+        let mut tx_id = [0; 12]; getrandom::getrandom(&mut tx_id).ok()?;
+        let (send, mut recv) = tokio::sync::oneshot::channel();
+        *self.pending.lock() = Some((server, tx_id, send));
+        let ping = disco_dgram(&Disco::Ping { tx_id, sender: [0; 32] });
+        let mut observed = None;
+        for _ in 0..5 {
+            if udp.send_to(&ping, server).await.is_err() { break; }
+            if let Ok(result) = tokio::time::timeout(Duration::from_millis(500), &mut recv).await { observed = result.ok(); break; }
+        }
+        self.pending.lock().take();
+        observed
+    }
 }
 
 /// Parse the peer list out of a control-server `device_config` JSON. Shared by the
@@ -428,6 +484,30 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn all_directory_dns_failures_are_nonterminal_and_can_recover() {
+        let conf = serde_json::json!({"relays":[{"id":"relay-1", "node_id":"edge", "url":"relay.test:443"}]});
+        let error = resolve_directory_with(&conf, |_| std::future::ready(Err(std::io::Error::new(std::io::ErrorKind::NotFound, "DNS unavailable"))))
+            .await.err().unwrap();
+        assert!(!terminal_control_error(&error));
+        let directory = resolve_directory_with(&conf, |_| std::future::ready(Ok(vec!["192.0.2.1:443".parse().unwrap()]))).await.unwrap();
+        assert_eq!(directory.len(), 1); assert_eq!(directory[0].node_id, "edge");
+    }
+
+    #[tokio::test]
+    async fn empty_or_partially_resolved_directories_do_not_request_dns_retry() {
+        let empty = resolve_directory_with(&serde_json::json!({"relays":[]}), |_| std::future::ready(Err(std::io::Error::other("unexpected lookup")))).await.unwrap();
+        assert!(empty.is_empty());
+        let conf = serde_json::json!({"relays":[
+            {"id":"relay-1", "node_id":"edge", "url":"good.test:443"},
+            {"id":"relay-2", "node_id":"edge", "url":"bad.test:443"}
+        ]});
+        let relays = resolve_directory_with(&conf, |endpoint| std::future::ready(if endpoint.starts_with("good") {
+            Ok(vec!["192.0.2.1:443".parse().unwrap()])
+        } else { Err(std::io::Error::other("DNS unavailable")) })).await.unwrap();
+        assert_eq!(relays.len(), 1);
+    }
+
+    #[tokio::test]
     async fn registered_anytls_identity_reaches_client_with_matching_password() {
         use fluxpeer_control_server::{router, state::Store};
         use fp_transport_anytls::AnytlsConfig;
@@ -459,7 +539,10 @@ mod tests {
             assert!(entry.addresses.iter().all(|a| a.ip().is_loopback() && a.port() == 443));
             assert!(entry.stun.is_some_and(|a| a.is_ipv4() && a.ip().is_loopback() && a.port() == 3478));
         }
-        assert!(client.register_relay_with_identity("eu", "localhost:443", None, true, None, Some(" ")).await.is_err());
+        for invalid in ["".into(), " edge".into(), "edge ".into(), "edge name".into(), "edge\n".into(), "é".into(), "x".repeat(129)] {
+            assert!(client.register_relay_with_identity("eu", "localhost:443", None, true, None, Some(&invalid)).await.is_err());
+        }
+        assert!(client.register_relay_with_identity("eu", "localhost:443", None, true, None, Some(&"x".repeat(128))).await.is_ok());
         server.abort();
     }
 
@@ -469,7 +552,7 @@ mod tests {
             {"id":"relay-42", "url":"127.0.0.1:443", "stun_url":"127.0.0.1:3478", "anytls":true},
             {"id":"relay-43", "node_id":null, "url":"[::1]:443"},
             {"url":"127.0.0.1:444"}
-        ]})).await;
+        ]})).await.unwrap();
         assert_eq!(directory.len(), 3);
         assert_eq!(directory[0].node_id, "relay-42");
         assert_eq!(directory[0].addresses, vec!["127.0.0.1:443".parse::<SocketAddr>().unwrap()]);
@@ -488,7 +571,7 @@ mod tests {
             {"id":"bad-id", "node_id":12, "url":"localhost:443"},
             {"id":"empty-id", "node_id":" ", "url":"localhost:443"},
             {"id":"good", "node_id":"edge", "url":"localhost:443", "stun_url":"localhost:3478"}
-        ]})).await;
+        ]})).await.unwrap();
         assert_eq!(directory.len(), 1);
         assert_eq!(directory[0].node_id, "edge");
         assert!(directory[0].stun.is_some());

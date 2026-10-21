@@ -12,6 +12,9 @@ RestartSec=3
 # Sockets + daemon token live under /run/fluxpeer.
 RuntimeDirectory=fluxpeer
 RuntimeDirectoryMode=0755
+# Durable DNS ownership must remain writable with ProtectSystem=strict.
+StateDirectory=fluxpeer
+StateDirectoryMode=0700
 # Runs as root: the TUN device, routes, and DNS need CAP_NET_ADMIN. The config dir
 # (/etc/fluxpeer) holds per-network configs + the daemon token the GUI reads.
 #

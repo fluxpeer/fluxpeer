@@ -380,7 +380,7 @@ impl WorkerState {
                 status::T_UDP_DIRECT
             } else if !self.force_relay && peer.tcp_out.is_some() {
                 status::T_TCP_DIRECT
-            } else if self.relay_out.is_some() {
+            } else if self.relay_out.as_ref().is_some_and(RelayOut::available) {
                 status::T_RELAY
             } else if peer.direct_addr.is_some() {
                 status::T_UDP_DIRECT
@@ -407,7 +407,7 @@ impl WorkerState {
                 if !self.force_relay
                     && !peer.disco_validated
                     && !peer.prefer_relay
-                    && self.relay_out.is_some()
+                    && self.relay_out.as_ref().is_some_and(RelayOut::available)
                     && peer.retries >= 6
                 {
                     peer.prefer_relay = true;
@@ -471,7 +471,7 @@ impl WorkerState {
                 .last_recv_direct
                 .map(|t| now.duration_since(t) >= dead)
                 .unwrap_or(true);
-            if silent && !peer.prefer_relay && !self.force_relay && self.relay_out.is_some() {
+            if silent && !peer.prefer_relay && !self.force_relay && self.relay_out.as_ref().is_some_and(RelayOut::available) {
                 // Move to relay but keep the LIVE session and rekey GAPLESSLY
                 // (rekey_init, not a rebuild): the old session keeps decrypting
                 // in-flight direct packets, so the peer doesn't desync and
@@ -518,7 +518,7 @@ impl WorkerState {
             // initiator re-keys a session older than REKEY_AFTER_SECS over its
             // CURRENT path, keeping the live session encrypting until the new one
             // is confirmed (handle_handshake_response).
-            if rekey_due(peer, self.own_pub.as_bytes(), now, self.relay_out.is_some())
+            if rekey_due(peer, self.own_pub.as_bytes(), now, self.relay_out.as_ref().is_some_and(RelayOut::available))
                 && emit_rekey(peer, &self.udp, self.force_relay, &self.relay_out, &mut self.index_map).await
             {
                 peer.init_sent_at = Some(now);
@@ -1112,4 +1112,45 @@ mod tests {
         assert_eq!(lookup(&[], &[entry(1, 1, &["0.0.0.0/0"])]), None);
         assert_eq!(lookup(&[0x45, 0, 0], &[entry(1, 1, &["0.0.0.0/0"])]), None);
     }
+    #[tokio::test]
+    async fn empty_relay_directory_keeps_delayed_handshake_direct_and_recovers_rekey() {
+        let first = StaticSecret::from([11; 32]); let second = StaticSecret::from([12; 32]);
+        let (own, remote) = if PublicKey::from(&first).as_bytes() < PublicKey::from(&second).as_bytes() { (first, second) } else { (second, first) };
+        let own_pub = PublicKey::from(&own); let remote_pub = PublicKey::from(&remote);
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap(); let endpoint = receiver.local_addr().unwrap();
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut peer = Peer::fresh(*remote_pub.as_bytes(), vec![endpoint], false, PeerStat::new(vec![]), &own);
+        let init = peer.raw.init_handshake(own.clone(), remote_pub).unwrap();
+        peer.init_packet = Some(init.clone());
+        let (sender, mut relay_rx) = mpsc::channel(16);
+        let (targets, updates) = tokio::sync::watch::channel(vec![]);
+        let (tun_out, _tun_in) = mpsc::channel(16);
+        let mut state = WorkerState { peers: vec![peer], index_map: IndexTable::new(HashMap::from([(le_u32(&init,4).unwrap(), *remote_pub.as_bytes())]), Arc::default(), 0),
+            udp, relay_out: Some(RelayOut::new(sender, updates)), own_priv: own, own_pub, force_relay: false, tun_out, status: Arc::default() };
+        let mut wire = [0; 2048];
+        for _ in 0..8 { state.on_tick(&mut wire).await; }
+        assert!(!state.peers[0].prefer_relay); assert!(relay_rx.try_recv().is_err());
+        let mut received_inits = 0;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while received_inits < 8 {
+                let (n, _) = receiver.recv_from(&mut wire).await.unwrap();
+                if wire[..n] == init { received_inits += 1; }
+            }
+        }).await.unwrap();
+        assert_eq!(received_inits, 8);
+        let mut responder = fp_crypto::RawCryptor::new::<fp_crypto_noise::Cryptor>();
+        let resp = responder.handle_handshake(remote, remote_pub, &init).unwrap().unwrap();
+        state.on_udp_in(endpoint, &resp, &mut wire).await;
+        assert!(state.peers[0].handshaked);
+        let stale = Instant::now() - Duration::from_secs(LIVENESS_DEAD_SECS + 1);
+        state.peers[0].last_recv = Some(stale); state.peers[0].last_recv_direct = Some(stale); state.peers[0].init_sent_at = None;
+        state.peers[0].prefer_relay = true; // Even a previously pinned peer gets direct last resort.
+        state.on_tick(&mut wire).await;
+        assert_eq!(state.peers[0].stat.transport.load(Ordering::Relaxed), status::T_UDP_DIRECT);
+        assert!(state.peers[0].init_sent_at.is_some()); assert!(relay_rx.try_recv().is_err());
+        assert!(!state.relay_out.as_ref().unwrap().available());
+        targets.send_replace(vec![crate::relay::RelayTarget { addr: "192.0.2.1:443".parse().unwrap(), anytls: false, bond: false, bond_links: None, node_id: "edge".into() }]);
+        assert!(state.relay_out.as_ref().unwrap().available());
+    }
+
 }

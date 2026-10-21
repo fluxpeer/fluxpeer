@@ -3,6 +3,8 @@
 //! OpenWrt manages resolver state through UCI/dnsmasq, while generic Linux uses
 //! systemd-resolved when available and falls back to direct `/etc/resolv.conf`.
 
+mod managed;
+use managed::Managed;
 use std::collections::HashMap;
 use crate::apply::{self, Result};
 
@@ -12,13 +14,15 @@ pub trait Dns {
     fn name(&self) -> &'static str;
     fn set(&self, dns: &str) -> Result;
     fn clear(&self) -> Result;
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn set_mode(&self, dns: &str, _full_tunnel: bool) -> Result { self.set(dns) }
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn owned(&self) -> Result<bool> { Ok(!read_state()?.is_empty()) }
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn verify_file(&self) -> Result { Ok(()) }
 }
 
 pub struct OpenWrtDnsmasq;
-pub struct Resolvectl {
-    iface: Option<String>,
-}
-pub struct ResolvConf;
 
 pub fn detect() -> Box<dyn Dns> {
     detect_for_iface(None)
@@ -27,8 +31,8 @@ pub fn detect() -> Box<dyn Dns> {
 pub(crate) fn detect_for_iface(iface: Option<&str>) -> Box<dyn Dns> {
     match std::env::var("FLUXPEER_DNS_BACKEND").ok().as_deref() {
         Some("openwrt" | "dnsmasq" | "uci") => return Box::new(OpenWrtDnsmasq),
-        Some("resolvectl") => return Box::new(Resolvectl::new(iface)),
-        Some("resolv" | "resolvconf") => return Box::new(ResolvConf),
+        Some("resolvectl") => return Box::new(Managed::new(iface, true)),
+        Some("resolv" | "resolvconf") => return Box::new(Managed::new(iface, false)),
         Some(other) if !other.is_empty() => tracing::warn!(backend = other, "unknown FLUXPEER_DNS_BACKEND"),
         _ => {}
     }
@@ -37,24 +41,23 @@ pub(crate) fn detect_for_iface(iface: Option<&str>) -> Box<dyn Dns> {
         return Box::new(OpenWrtDnsmasq);
     }
     if command_exists("resolvectl") {
-        return Box::new(Resolvectl::new(iface));
+        return Box::new(Managed::new(iface, true));
     }
-    Box::new(ResolvConf)
+    Box::new(Managed::new(iface, false))
 }
 
 fn command_exists(bin: &str) -> bool {
     apply::output(&["sh", "-c", &format!("command -v {bin}")]).is_ok()
 }
 
-fn uci_get(key: &str) -> Result<Option<String>> {
-    match apply::output(&["uci", "get", key]) {
+fn uci_get_with(key: &str, runner: &mut impl apply::Runner) -> Result<Option<String>> {
+    match runner.run(&["uci", "get", key], None) {
         Ok(value) => Ok(Some(value.trim().to_string()).filter(|s| !s.is_empty())),
         Err(e) if e.exit_code == Some(1) && e.stderr.contains("Entry not found") => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-fn restart_dnsmasq() -> Result { apply::run(&["/etc/init.d/dnsmasq", "restart"]) }
 
 fn read_state() -> Result<HashMap<String, String>> {
     let mut state = HashMap::new();
@@ -83,6 +86,10 @@ fn write_state(state: &HashMap<String, String>) -> Result {
 
 fn remove_state() -> Result { apply::remove(STATE_PATH) }
 
+fn openwrt_unchanged(state: &HashMap<String, String>, dns: &str) -> bool {
+    state.get("applied").is_some_and(|v| v == "1") && state.get("dns").is_some_and(|value| value == dns)
+}
+
 impl Dns for OpenWrtDnsmasq {
     fn name(&self) -> &'static str {
         "openwrt-dnsmasq"
@@ -90,52 +97,68 @@ impl Dns for OpenWrtDnsmasq {
 
     fn set(&self, dns: &str) -> Result {
         let mut state = read_state()?;
-        if !state.contains_key("had_noresolv") {
-            if let Some(value) = uci_get("dhcp.@dnsmasq[0].noresolv")? {
-                state.insert("had_noresolv".to_string(), "1".to_string());
-                state.insert("noresolv".to_string(), value);
-            } else {
-                state.insert("had_noresolv".to_string(), "0".to_string());
-            }
-        }
-        state.insert("dns".to_string(), dns.to_string());
-        write_state(&state)?;
-
-        apply::run(&["uci", "set", "dhcp.@dnsmasq[0].noresolv=1"])?;
-        let servers = uci_get("dhcp.@dnsmasq[0].server")?.unwrap_or_default();
-        if !servers.split_whitespace().any(|server| server == dns) {
-            let arg = format!("dhcp.@dnsmasq[0].server={dns}");
-            apply::run(&["uci", "add_list", &arg])?;
-        }
-        apply::run(&["uci", "commit", "dhcp"])?;
-        restart_dnsmasq()?;
-        tracing::info!(dns, "exit DNS via OpenWrt dnsmasq");
-        Ok(())
+        set_openwrt_with(&mut state, dns, &mut apply::System, write_state)
     }
 
     fn clear(&self) -> Result {
         let state = read_state()?;
-        if let Some(dns) = state.get("dns") {
-            let arg = format!("dhcp.@dnsmasq[0].server={dns}");
-            apply::run(&["uci", "del_list", &arg])?;
-        }
-        match state.get("had_noresolv").map(String::as_str) {
-            Some("1") => {
-                let value = state.get("noresolv").map(String::as_str).unwrap_or("0");
-                let arg = format!("dhcp.@dnsmasq[0].noresolv={value}");
-                apply::run(&["uci", "set", &arg])?;
-            }
-            Some("0") => {
-                apply::run(&["uci", "delete", "dhcp.@dnsmasq[0].noresolv"])?;
-            }
-            _ => {}
-        }
-        apply::run(&["uci", "commit", "dhcp"])?;
-        restart_dnsmasq()?;
-        remove_state()?;
-        tracing::info!("exit DNS cleared via OpenWrt dnsmasq");
+        clear_openwrt_with(&state, &mut apply::System)?;
+        if !state.is_empty() { remove_state()?; }
         Ok(())
     }
+
+}
+
+fn set_openwrt_with(state: &mut HashMap<String, String>, dns: &str, runner: &mut impl apply::Runner,
+    mut save: impl FnMut(&HashMap<String, String>) -> Result) -> Result {
+    // Only a completed apply can skip commands; a saved partial operation
+    // must retry even if its requested address has not changed.
+    if openwrt_unchanged(state, dns) { return Ok(()); }
+    state.remove("applied");
+    if !state.contains_key("had_noresolv") {
+        if let Some(value) = uci_get_with("dhcp.@dnsmasq[0].noresolv", runner)? {
+            state.insert("had_noresolv".to_string(), "1".to_string());
+            state.insert("noresolv".to_string(), value);
+        } else {
+            state.insert("had_noresolv".to_string(), "0".to_string());
+        }
+    }
+    state.insert("dns".to_string(), dns.to_string());
+    save(state)?;
+
+    runner.run(&["uci", "set", "dhcp.@dnsmasq[0].noresolv=1"], None)?;
+    let servers = uci_get_with("dhcp.@dnsmasq[0].server", runner)?.unwrap_or_default();
+    if !servers.split_whitespace().any(|server| server == dns) {
+        let arg = format!("dhcp.@dnsmasq[0].server={dns}");
+        runner.run(&["uci", "add_list", &arg], None)?;
+    }
+    runner.run(&["uci", "commit", "dhcp"], None)?;
+    runner.run(&["/etc/init.d/dnsmasq", "restart"], None)?;
+    state.insert("applied".into(), "1".into());
+    save(state)?;
+    tracing::info!(dns, "exit DNS via OpenWrt dnsmasq");
+    Ok(())
+}
+
+fn clear_openwrt_with(state: &HashMap<String, String>, runner: &mut impl apply::Runner) -> Result {
+    if state.is_empty() { return Ok(()); }
+    if let Some(dns) = state.get("dns") {
+        let arg = format!("dhcp.@dnsmasq[0].server={dns}");
+        runner.run(&["uci", "del_list", &arg], None)?;
+    }
+    match state.get("had_noresolv").map(String::as_str) {
+        Some("1") => {
+            let value = state.get("noresolv").map(String::as_str).unwrap_or("0");
+            let arg = format!("dhcp.@dnsmasq[0].noresolv={value}");
+            runner.run(&["uci", "set", &arg], None)?;
+        }
+        Some("0") => { runner.run(&["uci", "delete", "dhcp.@dnsmasq[0].noresolv"], None)?; }
+        _ => {}
+    }
+    runner.run(&["uci", "commit", "dhcp"], None)?;
+    runner.run(&["/etc/init.d/dnsmasq", "restart"], None)?;
+    tracing::info!("exit DNS cleared via OpenWrt dnsmasq");
+    Ok(())
 }
 
 fn resolved_unavailable(error: &apply::ApplyError) -> bool {
@@ -145,113 +168,26 @@ fn resolved_unavailable(error: &apply::ApplyError) -> bool {
         .iter().any(|needle| message.contains(needle))
 }
 
-fn resolv_conf_with(runner: &mut impl apply::Runner, dns: &str) -> Result {
-    runner.write("/etc/resolv.conf", &format!("# fluxpeer exit-node\nnameserver {dns}\n"))
-}
-
-impl Resolvectl {
-    fn new(iface: Option<&str>) -> Self {
-        Self {
-            iface: iface.map(ToString::to_string),
-        }
-    }
-
-    fn set_with(&self, dns: &str, runner: &mut impl apply::Runner) -> Result {
-        let iface = self.iface();
-        let result = runner.run(&["resolvectl", "dns", iface, dns], None)
-            .and_then(|_| runner.run(&["resolvectl", "domain", iface, "~."], None));
-        match result {
-            Ok(_) => { tracing::info!(iface, dns, "exit DNS via resolvectl"); Ok(()) }
-            Err(e) if resolved_unavailable(&e) => {
-                tracing::warn!(%e, "resolved unavailable; using resolv.conf fallback");
-                resolv_conf_with(runner, dns)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn iface(&self) -> &str {
-        self.iface.as_deref().unwrap_or("fluxpeer")
-    }
-}
-
-impl Dns for Resolvectl {
-    fn name(&self) -> &'static str {
-        "resolvectl"
-    }
-
-    fn set(&self, dns: &str) -> Result {
-        self.set_with(dns, &mut apply::System)
-    }
-
-    fn clear(&self) -> Result {
-        let iface = self.iface();
-        match apply::run(&["resolvectl", "revert", iface]) {
-            Err(e) if resolved_unavailable(&e) => { tracing::warn!(%e, "resolved unavailable during cleanup"); ResolvConf.clear() }
-            result => result,
-        }
-    }
-}
-
-impl Dns for ResolvConf {
-    fn name(&self) -> &'static str {
-        "resolv"
-    }
-
-    fn set(&self, dns: &str) -> Result {
-        resolv_conf_with(&mut apply::System, dns)?;
-        tracing::info!(dns, "exit DNS via /etc/resolv.conf");
-        Ok(())
-    }
-
-    fn clear(&self) -> Result {
-        tracing::warn!("resolv.conf DNS backend has no saved previous resolver state (T-0028)");
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    struct FailingRunner { fail: bool, commands: Vec<Vec<String>> }
-    impl apply::Runner for FailingRunner {
-        fn run(&mut self, command: &[&str], _: Option<&str>) -> Result<String> {
-            self.commands.push(command.iter().map(|s| s.to_string()).collect());
-            if self.fail && command.get(1) == Some(&"domain") {
-                Err(apply::ApplyError::new(command, "resolver unavailable"))
-            } else { Ok(String::new()) }
-        }
+    #[test]
+    fn openwrt_empty_state_performs_no_commands() {
+        let mut runner = crate::apply::test_support::Scripted::new(vec![]);
+        super::clear_openwrt_with(&Default::default(), &mut runner).unwrap();
+        assert!(runner.commands.is_empty());
+    }
+    #[test]
+    fn openwrt_unchanged_completed_set_has_no_commands_or_state_writes() {
+        let mut state = std::collections::HashMap::from([("dns".into(), "192.0.2.53".into()), ("applied".into(), "1".into()), ("had_noresolv".into(), "0".into())]);
+        let mut runner = crate::apply::test_support::Scripted::new(vec![]);
+        for _ in 0..10 { super::set_openwrt_with(&mut state, "192.0.2.53", &mut runner, |_| panic!("unchanged state must not be saved")).unwrap(); }
+        assert!(runner.commands.is_empty());
+        state.remove("applied");
+        assert!(!super::openwrt_unchanged(&state, "192.0.2.53"));
+        let mut retry = crate::apply::test_support::Scripted::new(vec![Ok("".into()), Ok("192.0.2.53".into()), Ok("".into()), Ok("".into())]);
+        super::set_openwrt_with(&mut state, "192.0.2.53", &mut retry, |_| Ok(())).unwrap();
+        assert_eq!(retry.commands.len(), 4);
+        assert!(super::openwrt_unchanged(&state, "192.0.2.53"));
     }
 
-    #[test]
-    fn unavailable_resolved_falls_back_but_permission_errors_remain_visible() {
-        use apply::test_support::{Scripted, error};
-        for replies in [vec![Err(error(Some(1), "Failed to connect to bus: No such file or directory"))],
-            vec![Ok("".into()), Err(error(Some(1), "org.freedesktop.DBus.Error.ServiceUnknown"))]] {
-            let mut runner = Scripted::new(replies);
-            Resolvectl::new(Some("fp0")).set_with("100.72.16.1", &mut runner).unwrap();
-            assert_eq!(runner.commands[0], ["resolvectl", "dns", "fp0", "100.72.16.1"]);
-            assert_eq!(runner.writes, [("/etc/resolv.conf".into(), "# fluxpeer exit-node\nnameserver 100.72.16.1\n".into())]);
-        }
-        let mut runner = Scripted::new(vec![Err(error(Some(1), "Access denied"))]);
-        assert!(Resolvectl::new(Some("fp0")).set_with("100.72.16.1", &mut runner).is_err());
-        assert!(runner.writes.is_empty());
-        let mut runner = Scripted::new(vec![Err(error(Some(1), "Connection refused"))]);
-        runner.write_error = Some(apply::ApplyError::new(&["write", "/etc/resolv.conf"], "read-only file system"));
-        assert_eq!(Resolvectl::new(Some("fp0")).set_with("100.72.16.1", &mut runner).unwrap_err().command, ["write", "/etc/resolv.conf"]);
-    }
-
-    #[test]
-    fn dns_domain_failure_is_visible_and_retry_replays_both_commands() {
-        let backend = Resolvectl::new(Some("fp-test"));
-        let mut runner = FailingRunner { fail: true, commands: vec![] };
-        let error = backend.set_with("100.72.16.1", &mut runner).unwrap_err();
-        assert_eq!(error.command, ["resolvectl", "domain", "fp-test", "~."]);
-        assert_eq!(runner.commands.len(), 2);
-        runner.fail = false;
-        backend.set_with("100.72.16.1", &mut runner).unwrap();
-        assert_eq!(runner.commands.len(), 4);
-        assert_eq!(runner.commands[0], runner.commands[2]);
-        assert_eq!(runner.commands[1], runner.commands[3]);
-    }
 }

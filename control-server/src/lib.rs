@@ -356,9 +356,9 @@ struct RegisterRelayReq {
     node_id: Option<String>,
 }
 
-// Missing identity is a legacy request; an explicitly empty identity is invalid.
+// Missing identity is a legacy request; an explicit identity must be bounded visible ASCII.
 fn validate_relay_identity(req: &RegisterRelayReq) -> Result<(), StatusCode> {
-    if req.node_id.as_ref().is_some_and(|id| id.trim().is_empty()) {
+    if req.node_id.as_ref().is_some_and(|id| !fluxpeer_sdk::valid_relay_identity(id)) {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok(())

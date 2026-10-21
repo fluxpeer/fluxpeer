@@ -12,11 +12,24 @@ use tokio::sync::mpsc;
 /// Relay channels are keyed by peer pubkey so ONE relay connection multiplexes
 /// every peer: inbound `(src, payload)`, outbound `(dst, payload)`.
 pub(crate) type RelayIn = mpsc::Receiver<([u8; 32], Vec<u8>)>;
-pub(crate) type RelayOut = mpsc::Sender<([u8; 32], Vec<u8>)>;
+type RelayPacket = ([u8; 32], Vec<u8>);
+type RelaySender = mpsc::Sender<RelayPacket>;
+#[derive(Clone)]
+pub(crate) struct RelayOut {
+    sender: RelaySender,
+    targets: tokio::sync::watch::Receiver<Vec<RelayTarget>>,
+}
+impl RelayOut {
+    pub(crate) fn new(sender: RelaySender, targets: tokio::sync::watch::Receiver<Vec<RelayTarget>>) -> Self { Self { sender, targets } }
+    pub(crate) fn available(&self) -> bool { !self.targets.borrow().is_empty() && !self.sender.is_closed() }
+    pub(crate) fn try_send(&self, packet: RelayPacket) -> Result<(), mpsc::error::TrySendError<RelayPacket>> {
+        self.sender.try_send(packet)
+    }
+}
 
 /// Drive the relay protocol over a byte stream (TCP or AnyTLS): handshake, then
 /// spawn reader/writer tasks keyed by peer pubkey. Returns keyed channels.
-pub(crate) async fn connect_relay<S>(stream: S, own_pub: [u8; 32]) -> std::io::Result<(RelayIn, RelayOut)>
+pub(crate) async fn connect_relay<S>(stream: S, own_pub: [u8; 32]) -> std::io::Result<(RelayIn, RelaySender)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -102,7 +115,7 @@ pub(crate) async fn connect_relay_bonded(
     mut sender: Box<dyn TransportSender>,
     mut receiver: Box<dyn TransportReceiver>,
     own_pub: [u8; 32],
-) -> std::io::Result<(RelayIn, RelayOut)> {
+) -> std::io::Result<(RelayIn, RelaySender)> {
     sender
         .send(
             RelayFrame::ClientInfo {
@@ -154,7 +167,7 @@ pub(crate) async fn connect_relay_bonded(
 }
 
 /// One relay the node can connect to (from the directory or hand-written cfg).
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RelayTarget {
     pub(crate) addr: SocketAddr,
     pub(crate) anytls: bool,
@@ -167,7 +180,7 @@ pub(crate) struct RelayTarget {
 
 /// Dial one relay (AnyTLS/443 or plain TCP) and run the framing handshake, with a
 /// timeout so a black-holed target can't stall failover.
-pub(crate) async fn dial_relay(t: &RelayTarget, own_pub: [u8; 32]) -> std::io::Result<(RelayIn, RelayOut)> {
+pub(crate) async fn dial_relay(t: &RelayTarget, own_pub: [u8; 32]) -> std::io::Result<(RelayIn, RelaySender)> {
     // The bond paths (anytls/443 and tcp-bond) establish N links + an N-way join
     // handshake, so they need a longer ceiling than a single plain-TCP connect
     // (default 10s join timeout). Keep the plain path snappy so a black-holed
@@ -232,15 +245,26 @@ pub(crate) async fn dial_relay(t: &RelayTarget, own_pub: [u8; 32]) -> std::io::R
 /// to the app's stable `app_in`/`app_out` so the data-plane loop is oblivious to
 /// reconnects. Returns only when the app shuts down (its channels close).
 pub(crate) async fn relay_supervisor(
-    targets: Vec<RelayTarget>,
+    mut targets: tokio::sync::watch::Receiver<Vec<RelayTarget>>,
     own_pub: [u8; 32],
     mut app_out_rx: mpsc::Receiver<([u8; 32], Vec<u8>)>,
     app_in_tx: mpsc::Sender<([u8; 32], Vec<u8>)>,
 ) {
     let mut idx = 0usize;
     loop {
-        let t = targets[idx % targets.len()].clone();
-        idx += 1;
+        let target = {
+            let snapshot = targets.borrow_and_update();
+            snapshot.get(idx.checked_rem(snapshot.len()).unwrap_or(0)).cloned()
+        };
+        let Some(t) = target else {
+            tokio::select! {
+                changed = targets.changed() => if changed.is_err() { return; },
+                _ = app_in_tx.closed() => return,
+                out = app_out_rx.recv() => if out.is_none() { return; },
+            }
+            continue;
+        };
+        idx = idx.wrapping_add(1);
         let (mut conn_in, conn_out) = match dial_relay(&t, own_pub).await {
             Ok(c) => {
                 let transport = if t.anytls {
@@ -291,5 +315,38 @@ pub(crate) async fn relay_supervisor(
             return;
         }
         tokio::time::sleep(Duration::from_millis(500)).await; // backoff before failover dial
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initially_empty_supervisor_connects_after_directory_publication() {
+        // A loopback protocol fixture, without a live node or relay daemon.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 41];
+            stream.read_exact(&mut request).await.unwrap();
+            assert!(matches!(RelayFrame::decode(&request).unwrap().0, RelayFrame::ClientInfo { .. }));
+            stream.write_all(&RelayFrame::ServerInfo { protocol_version: RELAY_PROTOCOL_VERSION }.encode()).await.unwrap();
+            stream.write_all(&RelayFrame::RecvPacket { src: [3; 32], payload: b"recovered".to_vec() }.encode()).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (targets, updates) = tokio::sync::watch::channel(vec![]);
+        let (app_out, outgoing) = mpsc::channel(8);
+        let (incoming, mut app_in) = mpsc::channel(8);
+        let supervisor = tokio::spawn(relay_supervisor(updates, [1; 32], outgoing, incoming));
+        tokio::task::yield_now().await;
+        assert!(!supervisor.is_finished());
+        targets.send_replace(vec![RelayTarget { addr, anytls: false, bond: false, bond_links: None, node_id: "edge".into() }]);
+        let received = tokio::time::timeout(Duration::from_secs(2), app_in.recv()).await.unwrap().unwrap();
+        assert_eq!(received, ([3; 32], b"recovered".to_vec()));
+        drop(app_out); drop(app_in);
+        tokio::time::timeout(Duration::from_secs(2), supervisor).await.unwrap().unwrap();
+        fixture.abort();
     }
 }

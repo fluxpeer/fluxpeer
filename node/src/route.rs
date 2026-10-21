@@ -500,14 +500,36 @@ pub(crate) fn exit_gateway_down(phys: &str, tun: &str, _backend: Option<&dyn cra
     Ok(())
 }
 
-pub(crate) fn set_dns(dev: &str, dns: &str) -> Result {
+pub(crate) fn set_dns(dev: &str, dns: &str, full_tunnel: bool) -> Result {
+    if dns.split_whitespace().next().is_none() || dns.split_whitespace().any(|s| s.parse::<std::net::IpAddr>().is_err()) {
+        return Err(ApplyError::new(&["DNS", "set"], "DNS servers must be IP addresses"));
+    }
+    #[cfg(any(target_os = "macos", windows))]
+    let _ = full_tunnel;
     #[cfg(target_os = "macos")]
     { apply::input(&["scutil"], &format!("d.init\nd.add ServerAddresses * {dns}\nset State:/Network/Service/fluxpeer-{dev}/DNS\nquit\n"))?; }
     #[cfg(all(unix, not(target_os = "macos")))]
-    crate::dns::detect_for_iface(Some(dev)).set(dns)?;
+    crate::dns::detect_for_iface(Some(dev)).set_mode(dns, full_tunnel)?;
     #[cfg(windows)]
-    win_ps(&format!("Set-DnsClientServerAddress -InterfaceAlias '{dev}' -ServerAddresses '{dns}'"))?;
+    {
+        let servers = dns.split_whitespace().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
+        win_ps(&format!("Set-DnsClientServerAddress -InterfaceAlias '{dev}' -ServerAddresses {servers}"))?;
+    }
     Ok(())
+}
+
+pub(crate) fn verify_dns_file(dev: &str) -> Result {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    { crate::dns::detect_for_iface(Some(dev)).verify_file() }
+    #[cfg(any(target_os = "macos", windows))]
+    { let _ = dev; Ok(()) }
+}
+
+pub(crate) fn dns_restore_pending(dev: &str) -> Result<bool> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    { crate::dns::detect_for_iface(Some(dev)).owned() }
+    #[cfg(any(target_os = "macos", windows))]
+    { let _ = dev; Ok(false) }
 }
 
 pub(crate) fn reset_dns(dev: &str) -> Result {
@@ -541,15 +563,15 @@ mod tests {
         assert!(runner.commands.iter().all(|c| c == &["ip", "-6", "route", "replace", "fd00::/64", "dev", "fp0"]));
     }
 
-    #[test]
-    fn resolved_hostname_bypasses_cover_all_ips_and_resolution_failure_keeps_exit_up() {
-        let mut queried = Vec::new();
+    #[tokio::test]
+    async fn resolved_hostname_bypasses_cover_all_ips_and_resolution_failure_keeps_exit_up() {
+        let queried = std::cell::RefCell::new(Vec::new());
         let candidates = crate::resolve_bypass_candidates(vec!["control.example".into(), "relay.example".into(), "missing.example".into()], |host| {
-            queried.push(host.to_string());
-            if host == "missing.example" { return Err(std::io::Error::other("resolver offline")); }
-            Ok(vec!["192.0.2.2".parse().unwrap(), "2001:db8::2".parse().unwrap()])
-        });
-        assert_eq!(queried.len(), 3);
+            queried.borrow_mut().push(host.to_string());
+            std::future::ready(if host == "missing.example" { Err(std::io::Error::other("resolver offline")) }
+                else { Ok(vec!["192.0.2.2".parse().unwrap(), "2001:db8::2".parse().unwrap()]) })
+        }).await;
+        assert_eq!(queried.borrow().len(), 3);
         assert_eq!(candidates, ["192.0.2.2", "2001:db8::2"]);
         let mut progress = ExitProgress::default();
         let mut installed = Vec::new();
@@ -558,7 +580,7 @@ mod tests {
             Ok(true)
         }).unwrap();
         assert_eq!(installed, candidates);
-        let empty = crate::resolve_bypass_candidates(vec!["missing.example".into()], |_| Err(std::io::Error::other("unresolved")));
+        let empty = crate::resolve_bypass_candidates(vec!["missing.example".into()], |_| std::future::ready(Err(std::io::Error::other("unresolved")))).await;
         let mut progress = ExitProgress::default();
         exit_up_with(&mut progress, &empty, |_| Ok(false)).unwrap();
         assert_eq!(progress.defaults.len(), 2);
