@@ -93,29 +93,88 @@ paths:
       responses:
         "200": { description: resolved }
         "404": { description: name not found }
-  /enroll:
+  /enroll/challenge:
     post:
-      summary: Redeem an invite and enroll a device
+      summary: Begin proof of possession for an enrollment key
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [invite_code, name, wg_public_key]
+              required: [wg_public_key]
               properties:
+                wg_public_key: { type: string, description: Exactly 32 bytes in hex or padded WireGuard base64 }
+      responses:
+        "200":
+          description: Single-use challenge with 60-second expiry
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  challenge_id: { type: string }
+                  server_pub: { type: string, description: Server ephemeral public key in lowercase hex }
+        "400": { description: invalid key or challenge capacity exhausted }
+  /networks/{id}/devices/import:
+    post:
+      summary: Atomically import devices with canonical public keys (administrator only)
+      description: Accepts exactly 32-byte keys in hex or padded WireGuard base64. Stores lowercase hex and skips existing active keys. Revoked identities do not block imports.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [devices]
+              properties:
+                devices:
+                  type: array
+                  items:
+                    type: object
+                    required: [name, wg_public_key]
+                    properties:
+                      name: { type: string }
+                      wg_public_key: { type: string, description: Exactly 32 bytes in hex or padded WireGuard base64 }
+                      address_v4: { type: string, nullable: true }
+                      address_v6: { type: string, nullable: true }
+                      endpoints: { type: array, items: { type: string } }
+      responses:
+        "201": { description: Created devices and skipped canonical active keys }
+        "400": { description: invalid public key or IPv4 address }
+        "401": { description: administrator authentication required }
+        "404": { description: network not found }
+        "409": { description: active identity/address uniqueness conflict }
+  /enroll:
+    post:
+      summary: Enroll a device or rotate the token of its existing active identity
+      description: An existing unexpired network invite and proof of key possession are required. Active re-entry preserves the device and address without consuming another invite use. A revoked key may enroll a new device using a new valid invitation; it consumes a use and receives a new ID, token and address lease without inheriting old routes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invite_code, name, wg_public_key, challenge_id, proof]
+              properties:
+                challenge_id: { type: string }
+                proof: { type: string, description: Hex-encoded possession proof from the enrollment challenge }
                 invite_code: { type: string }
                 name: { type: string }
-                wg_public_key: { type: string, description: Curve25519 base64 }
+                wg_public_key: { type: string, description: 32-byte Curve25519 key in hex or padded WireGuard base64 }
       responses:
         "201":
           description: enrolled
           content: { application/json: { schema: { $ref: "#/components/schemas/Device" } } }
+        "400": { description: malformed public key or request }
+        "401": { description: missing or invalid possession proof }
         "403": { description: invalid/expired/used invite }
-        "409": { description: address pool exhausted }
+        "409": { description: address pool exhausted or active identity/address uniqueness conflict }
   /devices/{id}:
     delete:
       summary: Revoke a device
+      description: Invalidates its token and releases addresses while retaining a tombstone. The same key can re-enroll as a new device with a new valid invitation and proof of possession.
       parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
       responses:
         "204": { description: revoked }
@@ -212,7 +271,7 @@ components:
         id: { type: string }
         network_id: { type: string }
         name: { type: string }
-        wg_public_key: { type: string }
+        wg_public_key: { type: string, description: Canonical lowercase hex for active devices; revoked legacy records may retain malformed original keys }
         address_v4: { type: string, nullable: true }
         address_v6: { type: string, nullable: true }
         status: { type: string, enum: [active, revoked] }
@@ -251,7 +310,7 @@ components:
     PeerConfig:
       type: object
       properties:
-        wg_public_key: { type: string }
+        wg_public_key: { type: string, pattern: "^[0-9a-f]{64}$", description: Canonical lowercase hex public key }
         allowed_ips: { type: array, items: { type: string } }
         endpoints: { type: array, items: { type: string } }
         exit:

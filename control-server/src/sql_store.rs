@@ -31,6 +31,10 @@ pub enum SqlStoreError {
     RouteNotFound,
     #[error("invalid route prefix")]
     InvalidPrefix,
+    #[error("invalid 32-byte public key")]
+    InvalidKey,
+    #[error("invalid IPv4 address")]
+    InvalidAddress,
     #[error("invalid invite")]
     InvalidInvite,
     #[error("address pool exhausted")]
@@ -45,7 +49,6 @@ type Result<T> = std::result::Result<T, SqlStoreError>;
 
 pub struct SqlStore {
     pool: AnyPool,
-    seq: AtomicU64,
     net_index: AtomicU64,
     /// Per-network config-epoch broadcaster for WS push (ephemeral, in-process).
     epoch_tx: Mutex<HashMap<String, watch::Sender<u64>>>,
@@ -56,11 +59,9 @@ impl SqlStore {
     pub async fn connect(url: &str) -> Result<Self> {
         let pool = db::connect(url).await?;
         db::migrate(&pool).await?;
-        let seed = db::count_rows(&pool).await? as u64 + 1;
-        let nets = db::count_rows(&pool).await?; // coarse; net_index only affects pool spread
+        let nets = db::count_networks(&pool).await?; // pool spread only; IDs use the durable sequence
         Ok(Self {
             pool,
-            seq: AtomicU64::new(seed),
             net_index: AtomicU64::new(nets.max(0) as u64),
             epoch_tx: Mutex::new(HashMap::new()),
         })
@@ -90,15 +91,49 @@ impl SqlStore {
         Ok(db::get_device(&self.pool, device_id).await?.map(|d| d.network_id))
     }
 
-    fn next_seq(&self) -> u64 {
-        self.seq.fetch_add(1, Ordering::Relaxed)
+    async fn next_seq(&self) -> Result<i64> {
+        let mut attempt = 0;
+        loop {
+            match self.next_seq_once().await {
+                Err(SqlStoreError::Db(error)) if crate::integrity::retryable(&error) && attempt < 7 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10 << attempt)).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn next_seq_once(&self) -> Result<i64> {
+        let mut tx = crate::integrity::begin(&self.pool).await?;
+        let id = crate::integrity::next(&mut tx).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    async fn notify(&self, network_id: &str) {
+        // The durable epoch is already committed. A failed optional notification
+        // must not turn a successful enrollment/token rotation into an error.
+        match db::get_network(&self.pool, network_id).await {
+            Ok(Some(net)) => {
+                if let Some(tx) = self.epoch_tx.lock().get(network_id) {
+                    tx.send_if_modified(|epoch| {
+                        if *epoch >= net.config_epoch { return false; }
+                        *epoch = net.config_epoch;
+                        true
+                    });
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "committed epoch notification failed"),
+        }
     }
 
     pub async fn create_network(&self, name: &str) -> Result<Network> {
         let idx = self.net_index.fetch_add(1, Ordering::Relaxed);
         let octet = (idx % 200) as u8 + 16;
         let net = Network {
-            id: format!("net-{}", self.next_seq()),
+            id: format!("net-{}", self.next_seq().await?),
             name: name.to_string(),
             ipv4_pool: format!("100.72.{octet}.0/24"),
             ipv6_ula: format!("fd72:15ab:{:04x}::/48", idx & 0xffff),
@@ -136,32 +171,59 @@ impl SqlStore {
     /// endpoint writes (so a guessable `dev-N` id is no longer authority). The token
     /// is returned ONCE here and never echoed by any other endpoint.
     pub async fn enroll(&self, invite_code: &str, name: &str, wg_public_key: &str, now: i64) -> Result<(Device, String)> {
-        let invite = db::get_invite(&self.pool, invite_code)
-            .await?
-            .ok_or(SqlStoreError::InvalidInvite)?;
-        if !invite.is_redeemable(now) {
-            return Err(SqlStoreError::InvalidInvite);
+        let key = fluxpeer_sdk::key::normalize(wg_public_key).ok_or(SqlStoreError::InvalidKey)?;
+        let mut attempt = 0;
+        loop {
+            match self.enroll_once(invite_code, name, &key, now).await {
+                Err(SqlStoreError::Db(error)) if crate::integrity::retryable(&error) && attempt < 7 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10 << attempt)).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
         }
-        let net = db::get_network(&self.pool, &invite.network_id)
-            .await?
-            .ok_or(SqlStoreError::NetworkNotFound)?;
+    }
 
-        let (v4, v6) = self.allocate_address(&net).await?;
-        let device = Device {
-            id: format!("dev-{}", self.next_seq()),
-            network_id: net.id.clone(),
-            name: name.to_string(),
-            wg_public_key: wg_public_key.to_string(),
-            address_v4: Some(v4.to_string()),
-            address_v6: Some(v6.to_string()),
-            status: DeviceStatus::Active,
-        };
-        let token = crate::auth::random_hex(32);
-        db::insert_device(&self.pool, &device).await?;
-        db::set_device_token(&self.pool, &device.id, &token).await?;
-        db::incr_invite_uses(&self.pool, invite_code).await?;
-        self.bump_and_notify(&net.id).await?;
-        Ok((device, token))
+    async fn enroll_once(&self, invite_code: &str, name: &str, key: &str, now: i64) -> Result<(Device, String)> {
+        let mut tx = crate::integrity::begin(&self.pool).await?;
+        let result = async {
+            let invite = db::get_invite(&mut *tx, invite_code).await?.ok_or(SqlStoreError::InvalidInvite)?;
+            if invite.expires_at.is_some_and(|expiry| now >= expiry) {
+                return Err(SqlStoreError::InvalidInvite);
+            }
+            let net = db::get_network(&mut *tx, &invite.network_id).await?.ok_or(SqlStoreError::NetworkNotFound)?;
+            let devices = db::list_devices(&mut *tx, &net.id).await?;
+            let token = crate::auth::random_hex(32);
+            if let Some(device) = devices.iter().find(|device| device.status == DeviceStatus::Active && device.wg_public_key == key) {
+                // Only active identities are idempotent; tombstones remain intact.
+                db::set_device_token(&mut *tx, &device.id, &token).await?;
+                return Ok((device.clone(), token));
+            }
+            let consumed = sqlx::query("UPDATE invite SET uses = uses + 1 WHERE code = $1 AND (expires_at IS NULL OR expires_at > $2) AND (max_uses IS NULL OR uses < max_uses)")
+                .bind(invite_code).bind(now).execute(&mut *tx).await?.rows_affected();
+            if consumed != 1 { return Err(SqlStoreError::InvalidInvite); }
+            let (v4, v6) = Self::allocate_address(&net, &devices)?;
+            let device = Device {
+                id: format!("dev-{}", crate::integrity::next(&mut tx).await?),
+                network_id: net.id.clone(), name: name.to_owned(), wg_public_key: key.to_owned(),
+                address_v4: Some(v4.to_string()), address_v6: Some(v6.to_string()), status: DeviceStatus::Active,
+            };
+            db::insert_device(&mut *tx, &device).await?;
+            db::set_device_token(&mut *tx, &device.id, &token).await?;
+            db::bump_network_epoch(&mut *tx, &net.id).await?;
+            Ok((device, token))
+        }.await;
+        match result {
+            Ok(result) => {
+                tx.commit().await?;
+                self.notify(&result.0.network_id).await;
+                Ok(result)
+            }
+            Err(error) => {
+                if let Err(rollback) = tx.rollback().await { tracing::warn!(%rollback, "transaction rollback failed; preserving original error"); }
+                Err(error)
+            }
+        }
     }
 
     /// A device's enroll-issued auth token (None if unknown or pre-token).
@@ -171,12 +233,11 @@ impl SqlStore {
 
     /// Lowest-free dual-stack address in the device range, derived from the
     /// network's active devices (recycling-correct).
-    async fn allocate_address(&self, net: &Network) -> Result<(Ipv4Addr, Ipv6Addr)> {
+    fn allocate_address(net: &Network, devices: &[Device]) -> Result<(Ipv4Addr, Ipv6Addr)> {
         let base = parse_v4_base(&net.ipv4_pool)?;
         let v6p = parse_v6_prefix(&net.ipv6_ula)?;
-        let used: HashSet<u8> = db::active_device_v4s(&self.pool, &net.id)
-            .await?
-            .iter()
+        let used: HashSet<u8> = devices.iter().filter(|d| d.status == DeviceStatus::Active)
+            .filter_map(|d| d.address_v4.as_deref())
             .filter_map(|a| a.parse::<Ipv4Addr>().ok())
             .map(|ip| ip.octets()[3])
             .collect();
@@ -193,40 +254,56 @@ impl SqlStore {
     /// allocator on later enrolls); existing public keys are skipped (idempotent).
     /// One epoch bump for the whole batch. Admin-gated at the HTTP layer.
     pub async fn import_devices(&self, network_id: &str, devices: &[ImportDevice]) -> Result<ImportResult> {
-        if db::get_network(&self.pool, network_id).await?.is_none() {
-            return Err(SqlStoreError::NetworkNotFound);
-        }
-        let mut seen: HashSet<String> = db::list_devices(&self.pool, network_id)
-            .await?
-            .into_iter()
-            .map(|d| d.wg_public_key)
-            .collect();
-        let mut created = Vec::new();
-        let mut skipped = Vec::new();
-        for d in devices {
-            if d.wg_public_key.is_empty() || !seen.insert(d.wg_public_key.clone()) {
-                skipped.push(d.wg_public_key.clone());
-                continue;
+        // Validate all keys before opening the batch; malformed input creates no
+        // partial import. The same database lock coordinates imports with enroll.
+        let devices = devices.iter().cloned().map(|mut d| {
+            d.address_v4 = d.address_v4.as_deref().map(|address| address.parse::<Ipv4Addr>()
+                .map(|ip| ip.to_string()).map_err(|_| SqlStoreError::InvalidAddress)).transpose()?;
+            Ok(d)
+        }).collect::<Result<Vec<_>>>()?;
+        let keys = devices.iter().map(|d| fluxpeer_sdk::key::normalize(&d.wg_public_key)
+            .ok_or(SqlStoreError::InvalidKey)).collect::<Result<Vec<_>>>()?;
+        let mut attempt = 0;
+        loop {
+            match self.import_once(network_id, &devices, &keys).await {
+                Err(SqlStoreError::Db(error)) if crate::integrity::retryable(&error) && attempt < 7 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10 << attempt)).await;
+                    attempt += 1;
+                }
+                result => return result,
             }
-            let device = Device {
-                id: format!("dev-{}", self.next_seq()),
-                network_id: network_id.to_string(),
-                name: d.name.clone(),
-                wg_public_key: d.wg_public_key.clone(),
-                address_v4: d.address_v4.clone(),
-                address_v6: d.address_v6.clone(),
-                status: DeviceStatus::Active,
-            };
-            db::insert_device(&self.pool, &device).await?;
-            if !d.endpoints.is_empty() {
-                db::set_device_endpoints(&self.pool, &device.id, &d.endpoints).await?;
+        }
+    }
+
+    async fn import_once(&self, network_id: &str, devices: &[ImportDevice], keys: &[String]) -> Result<ImportResult> {
+        let mut tx = crate::integrity::begin(&self.pool).await?;
+        let result = async {
+            if db::get_network(&mut *tx, network_id).await?.is_none() { return Err(SqlStoreError::NetworkNotFound); }
+            let mut seen: HashSet<_> = db::list_devices(&mut *tx, network_id).await?
+                .into_iter().filter(|d| d.status == DeviceStatus::Active).map(|d| d.wg_public_key).collect();
+            let mut created = Vec::new();
+            let mut skipped = Vec::new();
+            for (d, key) in devices.iter().zip(keys) {
+                if !seen.insert(key.clone()) { skipped.push(key.clone()); continue; }
+                let device = Device {
+                    id: format!("dev-{}", crate::integrity::next(&mut tx).await?),
+                    network_id: network_id.to_owned(), name: d.name.clone(), wg_public_key: key.clone(),
+                    address_v4: d.address_v4.clone(), address_v6: d.address_v6.clone(), status: DeviceStatus::Active,
+                };
+                db::insert_device(&mut *tx, &device).await?;
+                db::set_device_endpoints(&mut *tx, &device.id, &d.endpoints).await?;
+                created.push(device);
             }
-            created.push(device);
+            if !created.is_empty() { db::bump_network_epoch(&mut *tx, network_id).await?; }
+            Ok(ImportResult { created, skipped })
+        }.await;
+        match result {
+            Ok(result) => { tx.commit().await?; self.notify(network_id).await; Ok(result) }
+            Err(error) => {
+                if let Err(rollback) = tx.rollback().await { tracing::warn!(%rollback, "transaction rollback failed; preserving original error"); }
+                Err(error)
+            }
         }
-        if !created.is_empty() {
-            self.bump_and_notify(network_id).await?;
-        }
-        Ok(ImportResult { created, skipped })
     }
 
     pub async fn list_networks(&self) -> Result<Vec<Network>> {
@@ -270,11 +347,27 @@ impl SqlStore {
     }
 
     pub async fn revoke_device(&self, device_id: &str) -> Result<()> {
-        let device = db::get_device(&self.pool, device_id)
-            .await?
-            .ok_or(SqlStoreError::DeviceNotFound)?;
-        db::set_device_status(&self.pool, device_id, "revoked").await?;
-        self.bump_and_notify(&device.network_id).await?;
+        let mut attempt = 0;
+        loop {
+            match self.revoke_device_once(device_id).await {
+                Err(SqlStoreError::Db(error)) if crate::integrity::retryable(&error) && attempt < 7 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10 << attempt)).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn revoke_device_once(&self, device_id: &str) -> Result<()> {
+        let mut tx = crate::integrity::begin(&self.pool).await?;
+        let device = db::get_device(&mut *tx, device_id).await?.ok_or(SqlStoreError::DeviceNotFound)?;
+        // Revoke the credential and release addresses while retaining the tombstone.
+        sqlx::query("UPDATE device SET status = 'revoked', address_v4 = NULL, address_v6 = NULL, auth_token = NULL WHERE id = $1")
+            .bind(device_id).execute(&mut *tx).await?;
+        db::bump_network_epoch(&mut *tx, &device.network_id).await?;
+        tx.commit().await?;
+        self.notify(&device.network_id).await;
         Ok(())
     }
 
@@ -320,7 +413,7 @@ impl SqlStore {
             .await?
             .ok_or(SqlStoreError::DeviceNotFound)?;
         let route = Route {
-            id: format!("route-{}", self.next_seq()),
+            id: format!("route-{}", self.next_seq().await?),
             network_id: dev.network_id,
             device_id: device_id.to_string(),
             prefix: normalize_prefix(prefix).ok_or(SqlStoreError::InvalidPrefix)?,
@@ -463,7 +556,7 @@ impl SqlStore {
         node_id: Option<String>,
     ) -> Result<RelayNode> {
         let relay = RelayNode {
-            id: format!("relay-{}", self.seq.fetch_add(1, Ordering::Relaxed)),
+            id: format!("relay-{}", self.next_seq().await?),
             region: region.to_string(),
             url: url.to_string(),
             network_id,
@@ -546,8 +639,8 @@ mod test {
             .import_devices(
                 &net.id,
                 &[
-                    dev("hub", "k-hub", "10.0.0.1", vec![]),
-                    dev("laptop", "k-laptop", "10.0.0.5", vec!["203.0.113.7:51820".into()]),
+                    dev("hub", "86962e9c29953406be643f81bdaee3f64000c0919d2857e7593f914d82c276ae", "10.0.0.1", vec![]),
+                    dev("laptop", "173c9ce184d2a3716657525df4491d0340476de3b133a1968a30067ac75b3ee0", "10.0.0.5", vec!["203.0.113.7:51820".into()]),
                 ],
             )
             .await
@@ -563,13 +656,13 @@ mod test {
         // The hub's pulled config sees laptop as a peer carrying its pinned endpoint.
         let hub = devs.iter().find(|d| d.name == "hub").unwrap();
         let cfg = s.device_config(&hub.id).await.unwrap();
-        let peer = cfg.peers.iter().find(|p| p.wg_public_key == "k-laptop").unwrap();
+        let peer = cfg.peers.iter().find(|p| p.wg_public_key == "173c9ce184d2a3716657525df4491d0340476de3b133a1968a30067ac75b3ee0").unwrap();
         assert_eq!(peer.endpoints, vec!["203.0.113.7:51820".to_string()]);
 
         // Re-import is idempotent.
-        let r2 = s.import_devices(&net.id, &[dev("dup", "k-laptop", "10.0.0.5", vec![])]).await.unwrap();
+        let r2 = s.import_devices(&net.id, &[dev("dup", "173c9ce184d2a3716657525df4491d0340476de3b133a1968a30067ac75b3ee0", "10.0.0.5", vec![])]).await.unwrap();
         assert!(r2.created.is_empty());
-        assert_eq!(r2.skipped, vec!["k-laptop".to_string()]);
+        assert_eq!(r2.skipped, vec!["173c9ce184d2a3716657525df4491d0340476de3b133a1968a30067ac75b3ee0".to_string()]);
         assert_eq!(s.list_devices(&net.id).await.unwrap().len(), 2);
     }
 
@@ -579,25 +672,25 @@ mod test {
         let net = s.create_network("home").await.unwrap();
         let inv = s.create_invite(&net.id, None, Some(5)).await.unwrap();
 
-        let (d1, _) = s.enroll(&inv.code, "laptop", "k1", 1000).await.unwrap();
+        let (d1, _) = s.enroll(&inv.code, "laptop", "6ab9f1eb8f7d3388f4f9d586f66e99fd54080df2c446f0e58668b09c08a16dd0", 1000).await.unwrap();
         assert_eq!(d1.address_v4.as_deref(), Some("100.72.16.100"));
         assert_eq!(d1.address_v6.as_deref(), Some("fd72:15ab:0:1::64"));
 
-        let (d2, _) = s.enroll(&inv.code, "phone", "k2", 1000).await.unwrap();
+        let (d2, _) = s.enroll(&inv.code, "phone", "015f7e6bc5aeaf483724089e9252cc13b50951a6b69412522765cff4d780306e", 1000).await.unwrap();
         assert_eq!(d2.address_v4.as_deref(), Some("100.72.16.101"));
 
         // config of d1 lists d2 as a peer
         let cfg = s.device_config(&d1.id).await.unwrap();
         assert_eq!(cfg.overlay_cidrs, vec![net.ipv4_pool.clone(), net.ipv6_ula.clone()]);
         assert_eq!(cfg.peers.len(), 1);
-        assert_eq!(cfg.peers[0].wg_public_key, "k2");
+        assert_eq!(cfg.peers[0].wg_public_key, "015f7e6bc5aeaf483724089e9252cc13b50951a6b69412522765cff4d780306e");
         assert!(cfg.config_epoch >= 2);
 
         // revoke d2 → freed addr reused, d2 cut off
         s.revoke_device(&d2.id).await.unwrap();
         assert_eq!(s.device_config(&d1.id).await.unwrap().overlay_cidrs, cfg.overlay_cidrs);
         assert!(s.device_config(&d2.id).await.is_err());
-        let (d3, _) = s.enroll(&inv.code, "tablet", "k3", 1000).await.unwrap();
+        let (d3, _) = s.enroll(&inv.code, "tablet", "2f5052c9fd15b19a18c584d01363568198613f0c34e84409ef7938709a159ec2", 1000).await.unwrap();
         assert_eq!(d3.address_v4.as_deref(), Some("100.72.16.101")); // recycled
         assert_eq!(s.list_devices(&net.id).await.unwrap().len(), 3); // soft-delete keeps rows
     }
@@ -609,8 +702,8 @@ mod test {
             .unwrap();
         let net = s.create_network("home").await.unwrap();
         let inv = s.create_invite(&net.id, None, None).await.unwrap();
-        let (a, _) = s.enroll(&inv.code, "A", "kA", 1000).await.unwrap();
-        let (b, _) = s.enroll(&inv.code, "B", "kB", 1000).await.unwrap();
+        let (a, _) = s.enroll(&inv.code, "A", "2f93927dcc75eadefc95d934fe3fda1226111b9d5464b5de2e3d6e0dc1422f67", 1000).await.unwrap();
+        let (b, _) = s.enroll(&inv.code, "B", "591e59cef10116c9a0d6ccf709d50c44a024ff5dbaa1e38841223c4027e9f584", 1000).await.unwrap();
 
         // before B reports, A sees no endpoints for peer B
         let cfg = s.device_config(&a.id).await.unwrap();
@@ -620,7 +713,7 @@ mod test {
         let eps = vec!["192.168.31.203:51820".to_string(), "100.72.16.2:51820".to_string()];
         s.set_endpoints(&b.id, &eps).await.unwrap();
         let cfg = s.device_config(&a.id).await.unwrap();
-        assert_eq!(cfg.peers[0].wg_public_key, "kB");
+        assert_eq!(cfg.peers[0].wg_public_key, "591e59cef10116c9a0d6ccf709d50c44a024ff5dbaa1e38841223c4027e9f584");
         assert_eq!(cfg.peers[0].endpoints, eps);
     }
 
@@ -631,7 +724,7 @@ mod test {
             .unwrap();
         let net = s.create_network("home").await.unwrap();
         let inv = s.create_invite(&net.id, None, None).await.unwrap();
-        let (a, _) = s.enroll(&inv.code, "A", "kA", 1000).await.unwrap();
+        let (a, _) = s.enroll(&inv.code, "A", "2f93927dcc75eadefc95d934fe3fda1226111b9d5464b5de2e3d6e0dc1422f67", 1000).await.unwrap();
 
         // shared/official relay (anytls, STUN defaults to url) + a network-scoped one
         let shared = s
@@ -676,8 +769,8 @@ mod test {
             .unwrap();
         let net = s.create_network("home").await.unwrap();
         let inv = s.create_invite(&net.id, None, None).await.unwrap();
-        let (exit_dev, _) = s.enroll(&inv.code, "exit", "kE", 1000).await.unwrap();
-        let (client, _) = s.enroll(&inv.code, "laptop", "kL", 1000).await.unwrap();
+        let (exit_dev, _) = s.enroll(&inv.code, "exit", "6219b8ea7c0a1c302822dbcfe356b4f86d9745391e2d30db8356fc7fd7aae4a2", 1000).await.unwrap();
+        let (client, _) = s.enroll(&inv.code, "laptop", "2e92a4cccb0d9b15ec77237ee16ec658ac4d45055818ec30cdc3dbf0c3db8092", 1000).await.unwrap();
 
         async fn peer_exit(s: &SqlStore, client_id: &str) -> bool {
             s.device_config(client_id)
@@ -685,7 +778,7 @@ mod test {
                 .unwrap()
                 .peers
                 .iter()
-                .find(|p| p.wg_public_key == "kE")
+                .find(|p| p.wg_public_key == "6219b8ea7c0a1c302822dbcfe356b4f86d9745391e2d30db8356fc7fd7aae4a2")
                 .map(|p| p.exit)
                 .unwrap_or(false)
         }
@@ -701,7 +794,7 @@ mod test {
         assert!(peer_exit(&s, &client.id).await);
         // The default prefix remains in allowed_ips (old-node compatibility).
         let cfg = s.device_config(&client.id).await.unwrap();
-        let p = cfg.peers.iter().find(|p| p.wg_public_key == "kE").unwrap();
+        let p = cfg.peers.iter().find(|p| p.wg_public_key == "6219b8ea7c0a1c302822dbcfe356b4f86d9745391e2d30db8356fc7fd7aae4a2").unwrap();
         assert!(p.allowed_ips.iter().any(|a| a == "0.0.0.0/0"));
 
         s.delete_route(&route.id).await.unwrap();
@@ -716,16 +809,20 @@ mod test {
             .unwrap();
         let net = s.create_network("n").await.unwrap();
         let inv = s.create_invite(&net.id, None, Some(1)).await.unwrap();
-        assert!(s.enroll(&inv.code, "a", "ka", 1000).await.is_ok());
+        assert!(s.enroll(&inv.code, "a", "3ebb1c99b12b77463e97c3a0f206e4fd46176cd1b8e183816a67338c04b25e5b", 1000).await.is_ok());
         // use limit hit
         assert!(matches!(
-            s.enroll(&inv.code, "b", "kb", 1000).await,
+            s.enroll(&inv.code, "b", "74fec0c33e96ab90ac88666979207a50a6ea7b9b3eea6ec0e8b916d64c0a0706", 1000).await,
             Err(SqlStoreError::InvalidInvite)
         ));
         // unknown invite
         assert!(matches!(
-            s.enroll("nope", "c", "kc", 1000).await,
+            s.enroll("nope", "c", "ad9cdbefb70da610b07dcc613934052a0996f5c0da58a2d9632ec966361de506", 1000).await,
             Err(SqlStoreError::InvalidInvite)
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "integrity_tests.rs"]
+mod integrity_tests;

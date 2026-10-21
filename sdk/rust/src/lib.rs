@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
+pub mod key;
 pub mod prefix;
 pub mod types;
 pub mod wgconf;
@@ -30,7 +31,8 @@ pub fn build_import_devices(conf: &wgconf::WgConf, default_name: &str, skip_inte
             .private_key
             .as_deref()
             .context("[Interface] has no PrivateKey — cannot derive its public key (use --skip-interface)")?;
-        let pubkey = wgconf::public_key_from_private(priv_b64)?;
+        let pubkey = key::normalize(&wgconf::public_key_from_private(priv_b64)?)
+            .context("invalid derived public key")?;
         let name = conf
             .interface
             .name
@@ -54,6 +56,7 @@ pub fn build_import_devices(conf: &wgconf::WgConf, default_name: &str, skip_inte
             .name
             .clone()
             .unwrap_or_else(|| format!("imported-{}", short_key(pubkey)));
+        let pubkey = key::normalize(pubkey).context("invalid peer public key")?;
         if peer.allowed_ips.is_empty() {
             warnings.push(format!("peer \"{name}\" has no AllowedIPs — imported with no fixed address"));
         }
@@ -68,7 +71,7 @@ pub fn build_import_devices(conf: &wgconf::WgConf, default_name: &str, skip_inte
     Ok((devices, warnings))
 }
 
-/// A short, filename-safe tag from a base64 public key (for auto-naming peers).
+/// A short, filename-safe tag from the input public key (for auto-naming peers).
 fn short_key(pubkey: &str) -> String {
     pubkey.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect()
 }
@@ -91,7 +94,7 @@ mod import_test {
         assert!(warns.is_empty());
         assert_eq!(devs[0]["name"], "hub");
         assert_eq!(devs[0]["address_v4"], "10.0.0.1");
-        assert!(devs[0]["wg_public_key"].as_str().unwrap().len() >= 40); // derived b64 pubkey
+        assert_eq!(devs[0]["wg_public_key"].as_str().unwrap().len(), 64); // canonical hex
         assert_eq!(devs[1]["name"], "laptop");
         assert_eq!(devs[1]["address_v4"], "10.0.0.5");
         assert_eq!(devs[1]["endpoints"][0], "203.0.113.7:51820");

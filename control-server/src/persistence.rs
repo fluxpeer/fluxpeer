@@ -12,7 +12,7 @@ use sqlx::{AnyPool, Row};
 /// Connect to a database by URL (e.g. `postgres://…` or `sqlite::memory:`).
 pub async fn connect(url: &str) -> Result<AnyPool, sqlx::Error> {
     sqlx::any::install_default_drivers();
-    AnyPoolOptions::new().connect(url).await
+    AnyPoolOptions::new().max_connections(if url == "sqlite::memory:" { 1 } else { 5 }).connect(url).await
 }
 
 /// Create the schema if absent (portable across SQLite + PostgreSQL).
@@ -93,6 +93,7 @@ pub async fn migrate(pool: &AnyPool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+    super::integrity::migrate(pool).await?;
     Ok(())
 }
 
@@ -261,7 +262,7 @@ pub async fn list_relays(pool: &AnyPool, network_id: &str) -> Result<Vec<RelayNo
 }
 
 /// Replace a device's reported candidate endpoints (comma-separated `ip:port`s).
-pub async fn set_device_endpoints(pool: &AnyPool, id: &str, endpoints: &[String]) -> Result<(), sqlx::Error> {
+pub async fn set_device_endpoints(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, id: &str, endpoints: &[String]) -> Result<(), sqlx::Error> {
     let csv = endpoints.join(",");
     sqlx::query("UPDATE device SET endpoints = $1 WHERE id = $2")
         .bind(csv)
@@ -295,7 +296,7 @@ pub async fn insert_network(pool: &AnyPool, n: &Network) -> Result<(), sqlx::Err
     Ok(())
 }
 
-pub async fn get_network(pool: &AnyPool, id: &str) -> Result<Option<Network>, sqlx::Error> {
+pub async fn get_network(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, id: &str) -> Result<Option<Network>, sqlx::Error> {
     let row = sqlx::query("SELECT id, name, ipv4_pool, ipv6_ula, config_epoch FROM network WHERE id = $1")
         .bind(id)
         .fetch_optional(pool)
@@ -309,7 +310,7 @@ pub async fn get_network(pool: &AnyPool, id: &str) -> Result<Option<Network>, sq
     }))
 }
 
-pub async fn bump_network_epoch(pool: &AnyPool, id: &str) -> Result<(), sqlx::Error> {
+pub async fn bump_network_epoch(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, id: &str) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE network SET config_epoch = config_epoch + 1 WHERE id = $1")
         .bind(id)
         .execute(pool)
@@ -329,7 +330,7 @@ pub async fn insert_invite(pool: &AnyPool, inv: &Invite) -> Result<(), sqlx::Err
     Ok(())
 }
 
-pub async fn get_invite(pool: &AnyPool, code: &str) -> Result<Option<Invite>, sqlx::Error> {
+pub async fn get_invite(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, code: &str) -> Result<Option<Invite>, sqlx::Error> {
     let row = sqlx::query("SELECT code, network_id, expires_at, max_uses, uses FROM invite WHERE code = $1")
         .bind(code)
         .fetch_optional(pool)
@@ -360,7 +361,9 @@ pub async fn list_invites(pool: &AnyPool, network_id: &str) -> Result<Vec<Invite
         .collect())
 }
 
-pub async fn insert_device(pool: &AnyPool, d: &Device) -> Result<(), sqlx::Error> {
+pub async fn insert_device(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, d: &Device) -> Result<(), sqlx::Error> {
+    let key = fluxpeer_sdk::key::normalize(&d.wg_public_key)
+        .ok_or_else(|| sqlx::Error::Protocol("invalid 32-byte public key".into()))?;
     let status = match d.status {
         DeviceStatus::Active => "active",
         DeviceStatus::Revoked => "revoked",
@@ -372,7 +375,7 @@ pub async fn insert_device(pool: &AnyPool, d: &Device) -> Result<(), sqlx::Error
     .bind(&d.id)
     .bind(&d.network_id)
     .bind(&d.name)
-    .bind(&d.wg_public_key)
+    .bind(&key)
     .bind(&d.address_v4)
     .bind(&d.address_v6)
     .bind(status)
@@ -382,7 +385,7 @@ pub async fn insert_device(pool: &AnyPool, d: &Device) -> Result<(), sqlx::Error
 }
 
 /// Store a device's enroll-issued auth token.
-pub async fn set_device_token(pool: &AnyPool, device_id: &str, token: &str) -> Result<(), sqlx::Error> {
+pub async fn set_device_token(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, device_id: &str, token: &str) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE device SET auth_token = $1 WHERE id = $2")
         .bind(token)
         .bind(device_id)
@@ -400,7 +403,7 @@ pub async fn get_device_token(pool: &AnyPool, device_id: &str) -> Result<Option<
     Ok(row.and_then(|r| r.get::<Option<String>, _>("auth_token")))
 }
 
-pub async fn list_devices(pool: &AnyPool, network_id: &str) -> Result<Vec<Device>, sqlx::Error> {
+pub async fn list_devices(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, network_id: &str) -> Result<Vec<Device>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, network_id, name, wg_public_key, address_v4, address_v6, status \
          FROM device WHERE network_id = $1 ORDER BY id",
@@ -417,10 +420,10 @@ pub async fn list_devices(pool: &AnyPool, network_id: &str) -> Result<Vec<Device
             wg_public_key: r.get::<String, _>("wg_public_key"),
             address_v4: r.get::<Option<String>, _>("address_v4"),
             address_v6: r.get::<Option<String>, _>("address_v6"),
-            status: if r.get::<String, _>("status") == "revoked" {
-                DeviceStatus::Revoked
-            } else {
+            status: if r.get::<String, _>("status") == "active" {
                 DeviceStatus::Active
+            } else {
+                DeviceStatus::Revoked
             },
         })
         .collect())
@@ -442,7 +445,7 @@ pub async fn list_networks(pool: &AnyPool) -> Result<Vec<Network>, sqlx::Error> 
         .collect())
 }
 
-pub async fn get_device(pool: &AnyPool, id: &str) -> Result<Option<Device>, sqlx::Error> {
+pub async fn get_device(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, id: &str) -> Result<Option<Device>, sqlx::Error> {
     let row = sqlx::query(
         "SELECT id, network_id, name, wg_public_key, address_v4, address_v6, status FROM device WHERE id = $1",
     )
@@ -456,10 +459,10 @@ pub async fn get_device(pool: &AnyPool, id: &str) -> Result<Option<Device>, sqlx
         wg_public_key: r.get::<String, _>("wg_public_key"),
         address_v4: r.get::<Option<String>, _>("address_v4"),
         address_v6: r.get::<Option<String>, _>("address_v6"),
-        status: if r.get::<String, _>("status") == "revoked" {
-            DeviceStatus::Revoked
-        } else {
+        status: if r.get::<String, _>("status") == "active" {
             DeviceStatus::Active
+        } else {
+            DeviceStatus::Revoked
         },
     }))
 }
@@ -467,15 +470,6 @@ pub async fn get_device(pool: &AnyPool, id: &str) -> Result<Option<Device>, sqlx
 pub async fn incr_invite_uses(pool: &AnyPool, code: &str) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE invite SET uses = uses + 1 WHERE code = $1")
         .bind(code)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-pub async fn set_device_status(pool: &AnyPool, id: &str, status: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE device SET status = $1 WHERE id = $2")
-        .bind(status)
-        .bind(id)
         .execute(pool)
         .await?;
     Ok(())
@@ -512,21 +506,10 @@ pub async fn set_device_name(pool: &AnyPool, id: &str, name: &str) -> Result<(),
     Ok(())
 }
 
-/// IPv4 addresses currently held by ACTIVE devices in a network (for allocation).
-pub async fn active_device_v4s(pool: &AnyPool, network_id: &str) -> Result<Vec<String>, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT address_v4 FROM device WHERE network_id = $1 AND status = 'active' AND address_v4 IS NOT NULL",
-    )
-    .bind(network_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(|r| r.get::<String, _>("address_v4")).collect())
-}
-
-/// Total rows across entity tables (used to seed monotonic id generation).
-pub async fn count_rows(pool: &AnyPool) -> Result<i64, sqlx::Error> {
+/// Network count for overlay pool spread; never used for entity IDs.
+pub async fn count_networks(pool: &AnyPool) -> Result<i64, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT (SELECT COUNT(*) FROM network) + (SELECT COUNT(*) FROM invite) + (SELECT COUNT(*) FROM device) AS n",
+        "SELECT COUNT(*) AS n FROM network",
     )
     .fetch_one(pool)
     .await?;
@@ -606,7 +589,7 @@ mod test {
             id: "dev-1".into(),
             network_id: "net-1".into(),
             name: "laptop".into(),
-            wg_public_key: "pk-A".into(),
+            wg_public_key: "7ff6874a5b9f7ded7d14fc4d566c9eedb04e99b2e6d6e09faeb4e8ec1f6d1b40".into(),
             address_v4: Some("100.72.16.100".into()),
             address_v6: Some("fd72:15ab:0:1::64".into()),
             status: DeviceStatus::Active,

@@ -25,6 +25,7 @@ pub enum StoreError {
     DeviceNotFound,
     RouteNotFound,
     InvalidPrefix,
+    InvalidKey,
     InvalidInvite,
     PoolExhausted,
 }
@@ -153,8 +154,14 @@ impl Store {
     /// Redeem an invite and enroll a device: allocates a stable dual-stack
     /// address, increments invite use, bumps the network epoch.
     pub fn enroll(&self, invite_code: &str, name: &str, wg_public_key: &str, now: i64) -> Result<Device, StoreError> {
+        let key = fluxpeer_sdk::key::normalize(wg_public_key).ok_or(StoreError::InvalidKey)?;
+        let wg_public_key = key.as_str();
         let mut g = self.inner.lock();
         let invite = g.invites.get(invite_code).cloned().ok_or(StoreError::InvalidInvite)?;
+        if invite.expires_at.is_some_and(|expiry| now >= expiry) { return Err(StoreError::InvalidInvite); }
+        if let Some(device) = g.devices.values().find(|d| d.network_id == invite.network_id && d.status == DeviceStatus::Active && d.wg_public_key == key) {
+            return Ok(device.clone());
+        }
         if !invite.is_redeemable(now) {
             return Err(StoreError::InvalidInvite);
         }
@@ -187,6 +194,8 @@ impl Store {
     /// won't collide); existing public keys are skipped (idempotent). One epoch
     /// bump for the whole batch. Admin-gated at the HTTP layer.
     pub fn import_devices(&self, network_id: &str, devices: &[ImportDevice]) -> Result<ImportResult, StoreError> {
+        let keys = devices.iter().map(|d| fluxpeer_sdk::key::normalize(&d.wg_public_key)
+            .ok_or(StoreError::InvalidKey)).collect::<Result<Vec<_>, _>>()?;
         let mut g = self.inner.lock();
         if !g.networks.contains_key(network_id) {
             return Err(StoreError::NetworkNotFound);
@@ -194,14 +203,14 @@ impl Store {
         let mut seen: std::collections::HashSet<String> = g
             .devices
             .values()
-            .filter(|d| d.network_id == network_id)
+            .filter(|d| d.network_id == network_id && d.status == DeviceStatus::Active)
             .map(|d| d.wg_public_key.clone())
             .collect();
         let mut created = Vec::new();
         let mut skipped = Vec::new();
-        for d in devices {
-            if d.wg_public_key.is_empty() || !seen.insert(d.wg_public_key.clone()) {
-                skipped.push(d.wg_public_key.clone());
+        for (d, key) in devices.iter().zip(keys) {
+            if !seen.insert(key.clone()) {
+                skipped.push(key.clone());
                 continue;
             }
             if let Some(host) = d
@@ -211,13 +220,13 @@ impl Store {
                 .map(|ip| ip.octets()[3])
                 && let Some(ipam) = g.ipams.get_mut(network_id)
             {
-                let _ = ipam.reserve(&d.wg_public_key, host);
+                let _ = ipam.reserve(&key, host);
             }
             let device = Device {
                 id: format!("dev-{}", self.next_seq()),
                 network_id: network_id.to_string(),
                 name: d.name.clone(),
-                wg_public_key: d.wg_public_key.clone(),
+                wg_public_key: key,
                 address_v4: d.address_v4.clone(),
                 address_v6: d.address_v6.clone(),
                 status: DeviceStatus::Active,
@@ -452,13 +461,48 @@ mod test {
     use super::*;
 
     #[test]
+    fn public_key_encodings_share_one_memory_identity_and_bad_import_is_atomic() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let store = Store::new();
+        let network = store.create_network("keys");
+        let invite = store.create_invite(&network.id, None, Some(1)).unwrap();
+        let first = store.enroll(&invite.code, "first", &STANDARD.encode([0xab; 32]), 0).unwrap();
+        let repeat = store.enroll(&invite.code, "repeat", &hex::encode([0xab; 32]).to_uppercase(), 0).unwrap();
+        assert_eq!(first, repeat);
+        assert_eq!(first.wg_public_key, hex::encode([0xab; 32]));
+        assert_eq!(store.list_devices(&network.id).unwrap().len(), 1);
+        let imports = [
+            ImportDevice { wg_public_key: hex::encode([2; 32]), ..Default::default() },
+            ImportDevice { wg_public_key: "invalid".into(), ..Default::default() },
+        ];
+        assert!(matches!(store.import_devices(&network.id, &imports), Err(StoreError::InvalidKey)));
+        assert_eq!(store.list_devices(&network.id).unwrap().len(), 1);
+    }
+
+
+    #[test]
+    fn revoked_key_can_enroll_again_without_reusing_its_device_id() {
+        let store = Store::new();
+        let network = store.create_network("rejoin");
+        let invite = store.create_invite(&network.id, None, Some(1)).unwrap();
+        let old = store.enroll(&invite.code, "old", &"11".repeat(32), 0).unwrap();
+        store.revoke_device(&old.id).unwrap();
+        let invite = store.create_invite(&network.id, None, Some(1)).unwrap();
+        let new = store.enroll(&invite.code, "new", &"11".repeat(32), 0).unwrap();
+        assert_ne!(old.id, new.id);
+        let repeat = store.enroll(&invite.code, "repeat", &"11".repeat(32), 0).unwrap();
+        assert_eq!(repeat.id, new.id);
+        assert_eq!(store.list_devices(&network.id).unwrap().len(), 2);
+    }
+
+    #[test]
     fn full_enroll_loop() {
         let s = Store::new();
         let net = s.create_network("home");
         assert_eq!(s.network_epoch(&net.id), Some(0));
 
         let inv = s.create_invite(&net.id, None, Some(2)).unwrap();
-        let dev = s.enroll(&inv.code, "laptop", "pubkey-A", 1000).unwrap();
+        let dev = s.enroll(&inv.code, "laptop", "6fe8dbc406f91c783843af06c2dc1495f565b3c65969a1dacb3958654f29fc0f", 1000).unwrap();
 
         assert_eq!(dev.network_id, net.id);
         assert_eq!(dev.address_v4.as_deref(), Some("100.72.16.100"));
@@ -485,11 +529,11 @@ mod test {
             .import_devices(
                 &net.id,
                 &[
-                    dev("hub", "k-hub", "10.0.0.1"),
-                    dev("laptop", "k-laptop", "10.0.0.5"),
+                    dev("hub", "86962e9c29953406be643f81bdaee3f64000c0919d2857e7593f914d82c276ae", "10.0.0.1"),
+                    dev("laptop", "173c9ce184d2a3716657525df4491d0340476de3b133a1968a30067ac75b3ee0", "10.0.0.5"),
                     // host octet.100 falls inside the auto-allocation range, so
                     // reserving it forces the next enroll off.100.
-                    dev("phone", "k-phone", "10.0.0.100"),
+                    dev("phone", "a7c35c5001bf6aec22657bf5811bf8badab744bc253da6665cab7584db18528e", "10.0.0.100"),
                 ],
             )
             .unwrap();
@@ -504,16 +548,16 @@ mod test {
 
         // Re-importing the same keys is idempotent (skipped, no new epoch).
         let r2 = s
-            .import_devices(&net.id, &[dev("laptop-again", "k-laptop", "10.0.0.5")])
+            .import_devices(&net.id, &[dev("laptop-again", "173c9ce184d2a3716657525df4491d0340476de3b133a1968a30067ac75b3ee0", "10.0.0.5")])
             .unwrap();
         assert!(r2.created.is_empty());
-        assert_eq!(r2.skipped, vec!["k-laptop".to_string()]);
+        assert_eq!(r2.skipped, vec!["173c9ce184d2a3716657525df4491d0340476de3b133a1968a30067ac75b3ee0".to_string()]);
         assert_eq!(s.network_epoch(&net.id), Some(1));
 
         // A subsequent auto-enroll skips the reserved.100 host (imported phone),
         // proving import reserved the octet in IPAM — it lands on.101.
         let inv = s.create_invite(&net.id, None, None).unwrap();
-        let new = s.enroll(&inv.code, "fresh", "k-fresh", 1000).unwrap();
+        let new = s.enroll(&inv.code, "fresh", "49c4bc5641c483985c728bf96cc596db108f870305c49843267121ff26bc0350", 1000).unwrap();
         assert_eq!(new.address_v4.as_deref(), Some("100.72.16.101"));
     }
 
@@ -528,8 +572,8 @@ mod test {
         let s = Store::new();
         let net = s.create_network("n");
         let inv = s.create_invite(&net.id, None, Some(1)).unwrap();
-        assert!(s.enroll(&inv.code, "d1", "k1", 1000).is_ok());
-        assert_eq!(s.enroll(&inv.code, "d2", "k2", 1000), Err(StoreError::InvalidInvite));
+        assert!(s.enroll(&inv.code, "d1", "6ab9f1eb8f7d3388f4f9d586f66e99fd54080df2c446f0e58668b09c08a16dd0", 1000).is_ok());
+        assert_eq!(s.enroll(&inv.code, "d2", "015f7e6bc5aeaf483724089e9252cc13b50951a6b69412522765cff4d780306e", 1000), Err(StoreError::InvalidInvite));
     }
 
     #[test]
@@ -537,7 +581,7 @@ mod test {
         let s = Store::new();
         let net = s.create_network("n");
         let inv = s.create_invite(&net.id, Some(500), None).unwrap();
-        assert_eq!(s.enroll(&inv.code, "d", "k", 1000), Err(StoreError::InvalidInvite));
+        assert_eq!(s.enroll(&inv.code, "d", "8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a", 1000), Err(StoreError::InvalidInvite));
     }
 
     #[test]
@@ -545,14 +589,14 @@ mod test {
         let s = Store::new();
         let net = s.create_network("n");
         let inv = s.create_invite(&net.id, None, None).unwrap();
-        let d1 = s.enroll(&inv.code, "d1", "k1", 1000).unwrap();
+        let d1 = s.enroll(&inv.code, "d1", "6ab9f1eb8f7d3388f4f9d586f66e99fd54080df2c446f0e58668b09c08a16dd0", 1000).unwrap();
         let epoch_before = s.network_epoch(&net.id).unwrap();
 
         s.revoke_device(&d1.id).unwrap();
         assert_eq!(s.network_epoch(&net.id), Some(epoch_before + 1));
 
         // recycled address is reused by the next enrollee
-        let d2 = s.enroll(&inv.code, "d2", "k2", 1000).unwrap();
+        let d2 = s.enroll(&inv.code, "d2", "015f7e6bc5aeaf483724089e9252cc13b50951a6b69412522765cff4d780306e", 1000).unwrap();
         assert_eq!(d2.address_v4, d1.address_v4);
     }
 
@@ -561,13 +605,13 @@ mod test {
         let s = Store::new();
         let net = s.create_network("n");
         let inv = s.create_invite(&net.id, None, None).unwrap();
-        let d1 = s.enroll(&inv.code, "d1", "k1", 1000).unwrap();
-        let d2 = s.enroll(&inv.code, "d2", "k2", 1000).unwrap();
+        let d1 = s.enroll(&inv.code, "d1", "6ab9f1eb8f7d3388f4f9d586f66e99fd54080df2c446f0e58668b09c08a16dd0", 1000).unwrap();
+        let d2 = s.enroll(&inv.code, "d2", "015f7e6bc5aeaf483724089e9252cc13b50951a6b69412522765cff4d780306e", 1000).unwrap();
 
         let cfg = s.device_config(&d1.id).unwrap();
         assert_eq!(cfg.overlay_cidrs, vec![net.ipv4_pool.clone(), net.ipv6_ula.clone()]);
         assert_eq!(cfg.peers.len(), 1);
-        assert_eq!(cfg.peers[0].wg_public_key, "k2");
+        assert_eq!(cfg.peers[0].wg_public_key, "015f7e6bc5aeaf483724089e9252cc13b50951a6b69412522765cff4d780306e");
         let v4 = d2.address_v4.unwrap();
         assert!(cfg.peers[0].allowed_ips.contains(&format!("{v4}/32")));
     }
@@ -577,8 +621,8 @@ mod test {
         let s = Store::new();
         let net = s.create_network("n");
         let inv = s.create_invite(&net.id, None, None).unwrap();
-        let d1 = s.enroll(&inv.code, "d1", "k1", 1000).unwrap();
-        let d2 = s.enroll(&inv.code, "d2", "k2", 1000).unwrap();
+        let d1 = s.enroll(&inv.code, "d1", "6ab9f1eb8f7d3388f4f9d586f66e99fd54080df2c446f0e58668b09c08a16dd0", 1000).unwrap();
+        let d2 = s.enroll(&inv.code, "d2", "015f7e6bc5aeaf483724089e9252cc13b50951a6b69412522765cff4d780306e", 1000).unwrap();
 
         let pools = s.device_config(&d1.id).unwrap().overlay_cidrs;
         s.revoke_device(&d2.id).unwrap();
@@ -601,8 +645,8 @@ mod test {
         let s = Store::new();
         let net = s.create_network("n");
         let inv = s.create_invite(&net.id, None, None).unwrap();
-        let router_dev = s.enroll(&inv.code, "router", "kr", 1000).unwrap();
-        let other = s.enroll(&inv.code, "laptop", "kl", 1000).unwrap();
+        let router_dev = s.enroll(&inv.code, "router", "d5647005d31dcbb66ff531c5e097544a03558bc538b9c65ee2539594886ffbc0", 1000).unwrap();
+        let other = s.enroll(&inv.code, "laptop", "d3f3fa6892497db10a2417fce9b553464cc5d07718419de8b67e73e460c7daab", 1000).unwrap();
 
         let route = s.advertise_route(&router_dev.id, "192.168.1.0/24").unwrap();
         let has_prefix = |s: &Store| {
@@ -610,7 +654,7 @@ mod test {
                 .unwrap()
                 .peers
                 .iter()
-                .find(|p| p.wg_public_key == "kr")
+                .find(|p| p.wg_public_key == "d5647005d31dcbb66ff531c5e097544a03558bc538b9c65ee2539594886ffbc0")
                 .map(|p| p.allowed_ips.iter().any(|a| a == "192.168.1.0/24"))
                 .unwrap_or(false)
         };
@@ -626,15 +670,15 @@ mod test {
         let s = Store::new();
         let net = s.create_network("n");
         let inv = s.create_invite(&net.id, None, None).unwrap();
-        let exit_dev = s.enroll(&inv.code, "exit", "ke", 1000).unwrap();
-        let client = s.enroll(&inv.code, "laptop", "kl", 1000).unwrap();
+        let exit_dev = s.enroll(&inv.code, "exit", "8e5202705183bd3a20a29e224499b0f77a8273ee33cd93cca71043c57ad4bdfc", 1000).unwrap();
+        let client = s.enroll(&inv.code, "laptop", "d3f3fa6892497db10a2417fce9b553464cc5d07718419de8b67e73e460c7daab", 1000).unwrap();
 
         let peer_exit = |s: &Store| {
             s.device_config(&client.id)
                 .unwrap()
                 .peers
                 .iter()
-                .find(|p| p.wg_public_key == "ke")
+                .find(|p| p.wg_public_key == "8e5202705183bd3a20a29e224499b0f77a8273ee33cd93cca71043c57ad4bdfc")
                 .map(|p| p.exit)
                 .unwrap_or(false)
         };
@@ -653,7 +697,7 @@ mod test {
         assert!(s.device_config(&exit_dev.id).unwrap().self_exit);
         assert!(peer_exit(&s));
         let cfg = s.device_config(&client.id).unwrap();
-        let p = cfg.peers.iter().find(|p| p.wg_public_key == "ke").unwrap();
+        let p = cfg.peers.iter().find(|p| p.wg_public_key == "8e5202705183bd3a20a29e224499b0f77a8273ee33cd93cca71043c57ad4bdfc").unwrap();
         assert!(p.allowed_ips.iter().any(|a| a == "0.0.0.0/0"));
 
         // Revoked (route deleted): both flags off again.
@@ -682,7 +726,7 @@ mod test {
         let s = Store::new();
         let net = s.create_network("n");
         let inv = s.create_invite(&net.id, None, None).unwrap();
-        let d = s.enroll(&inv.code, "home-nas", "k", 1000).unwrap();
+        let d = s.enroll(&inv.code, "home-nas", "8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a", 1000).unwrap();
         assert_eq!(s.resolve(&net.id, "home-nas"), d.address_v4);
         assert_eq!(s.resolve(&net.id, "HOME-NAS"), d.address_v4);
         assert_eq!(s.resolve(&net.id, "nope"), None);
@@ -705,9 +749,9 @@ mod test {
         let rx = s.subscribe(&net.id).unwrap();
         assert_eq!(*rx.borrow(), 0);
 
-        s.enroll(&inv.code, "d1", "k1", 1000).unwrap();
+        s.enroll(&inv.code, "d1", "6ab9f1eb8f7d3388f4f9d586f66e99fd54080df2c446f0e58668b09c08a16dd0", 1000).unwrap();
         assert_eq!(*rx.borrow(), 1); // enroll bumped + notified
-        let d2 = s.enroll(&inv.code, "d2", "k2", 1000).unwrap();
+        let d2 = s.enroll(&inv.code, "d2", "015f7e6bc5aeaf483724089e9252cc13b50951a6b69412522765cff4d780306e", 1000).unwrap();
         assert_eq!(*rx.borrow(), 2);
         s.revoke_device(&d2.id).unwrap();
         assert_eq!(*rx.borrow(), 3);

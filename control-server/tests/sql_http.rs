@@ -217,7 +217,7 @@ async fn persistent_http_enroll_loop_on_sqlite() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // revoke d2 → its config is cut off (404)
+    // revoke d2 invalidates its token as well as cutting off its config
     let resp = app
         .clone()
         .oneshot(del(&format!("/api/v1/devices/{d2_id}")))
@@ -232,7 +232,7 @@ async fn persistent_http_enroll_loop_on_sqlite() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // bad invite → 403 (PoP passes, but the invite is rejected)
     let (sk3, pub3) = keypair(3);
@@ -354,4 +354,76 @@ async fn exit_flags_over_http_follow_default_route_approval() {
     assert_eq!(cfg["self_exit"], false);
     let cfg = config(&app, &client_id, &client_token).await;
     assert!(!peer_exit(&cfg));
+}
+
+#[tokio::test]
+async fn canonical_enrollment_rotates_http_credential_and_rejects_old_token() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let store = Arc::new(SqlStore::connect("sqlite::memory:").await.unwrap());
+    let network = store.create_network("key-contract").await.unwrap();
+    let invite = store.create_invite(&network.id, None, Some(1)).await.unwrap();
+    let app = sql_router(store.clone());
+    let (private, public) = keypair(73);
+    let base64 = STANDARD.encode(hex::decode(&public).unwrap());
+    let mut responses = Vec::new();
+    for encoding in [base64, public.to_uppercase()] {
+        // Challenge and enrollment may use different encodings of the same bytes.
+        let challenge_key = if encoding.len() == 44 { &encoding } else { &public };
+        let (cid, proof) = pop_fields(&app, &private, challenge_key).await;
+        let response = app.clone().oneshot(post("/api/v1/enroll", json!({
+            "invite_code": invite.code, "name": "same-key", "wg_public_key": encoding,
+            "challenge_id": cid, "proof": proof,
+        }))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        responses.push(body_json(response).await);
+    }
+    assert_eq!(responses[0]["id"], responses[1]["id"]);
+    assert_eq!(responses[0]["address_v4"], responses[1]["address_v4"]);
+    assert_eq!(responses[1]["wg_public_key"], public);
+    let path = format!("/api/v1/devices/{}/config", responses[1]["id"].as_str().unwrap());
+    let old_token = responses[0]["auth_token"].as_str().unwrap();
+    let new_token = responses[1]["auth_token"].as_str().unwrap();
+    assert_ne!(old_token, new_token);
+    assert_eq!(app.clone().oneshot(get_dev(&path, old_token)).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(app.clone().oneshot(get_dev(&path, new_token)).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(store.list_devices(&network.id).await.unwrap().len(), 1);
+    assert_eq!(store.list_invites(&network.id).await.unwrap()[0].uses, 1);
+    for invalid in ["bad".to_owned(), "ff".repeat(31)] {
+        let response = app.clone().oneshot(post("/api/v1/enroll/challenge", json!({"wg_public_key": invalid}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn revoked_key_rejoins_with_new_invite_and_possession_proof() {
+    let store = Arc::new(SqlStore::connect("sqlite::memory:").await.unwrap());
+    let network = store.create_network("rejoin-http").await.unwrap();
+    let invite = store.create_invite(&network.id, None, Some(1)).await.unwrap();
+    let app = sql_router(store.clone());
+    let first = enroll_pop(&app, &invite.code, "old", 92).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let old = body_json(first).await;
+    let old_id = old["id"].as_str().unwrap();
+    store.revoke_device(old_id).await.unwrap();
+    let invite = store.create_invite(&network.id, None, Some(1)).await.unwrap();
+    // A valid invitation never replaces proof of possession.
+    let (_, public) = keypair(92);
+    let no_proof = app.clone().oneshot(post("/api/v1/enroll", json!({
+        "invite_code": invite.code, "name": "new", "wg_public_key": public
+    }))).await.unwrap();
+    assert_eq!(no_proof.status(), StatusCode::UNAUTHORIZED);
+    let response = enroll_pop(&app, &invite.code, "new", 92).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let new = body_json(response).await;
+    let new_id = new["id"].as_str().unwrap();
+    assert_ne!(new_id, old_id);
+    assert_ne!(new["auth_token"], old["auth_token"]);
+    for path in [format!("/api/v1/devices/{old_id}/config"), format!("/api/v1/devices/{new_id}/config")] {
+        assert_eq!(app.clone().oneshot(get_dev(&path, old["auth_token"].as_str().unwrap())).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(app.clone().oneshot(get_dev(&format!("/api/v1/devices/{new_id}/config"), new["auth_token"].as_str().unwrap())).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(store.list_devices(&network.id).await.unwrap().len(), 2);
+    assert_eq!(store.list_invites(&network.id).await.unwrap().iter().find(|i| i.code == invite.code).unwrap().uses, 1);
+    let invalid = app.oneshot(post("/api/v1/enroll", json!({"invite_code": invite.code,"name":"bad","wg_public_key":"bad"}))).await.unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 }

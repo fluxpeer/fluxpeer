@@ -33,8 +33,8 @@ async fn cli_drives_control_server_end_to_end() {
 
     // batch import a wg.conf's worth of devices (full HTTP path), fixed addresses
     let import = serde_json::json!([
-        { "name": "hub", "wg_public_key": "k-hub", "address_v4": "10.0.0.1", "endpoints": [] },
-        { "name": "laptop", "wg_public_key": "k-laptop", "address_v4": "10.0.0.5", "endpoints": ["203.0.113.7:51820"] },
+        { "name": "hub", "wg_public_key": "11".repeat(32), "address_v4": "10.0.0.1", "endpoints": [] },
+        { "name": "laptop", "wg_public_key": "22".repeat(32), "address_v4": "10.0.0.5", "endpoints": ["203.0.113.7:51820"] },
     ]);
     let res = c.import_devices(&nid, &import).await.expect("import");
     assert_eq!(res["created"].as_array().expect("created").len(), 2);

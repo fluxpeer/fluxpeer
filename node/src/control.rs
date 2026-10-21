@@ -8,7 +8,7 @@ use fp_disco::Disco;
 use tokio::net::UdpSocket;
 
 use crate::config::Config;
-use crate::util::{DISCO_MAGIC, disco_dgram, hex32};
+use crate::util::{DISCO_MAGIC, disco_dgram};
 
 /// Build an SDK client that carries this device's auth token as the bearer, so the
 /// control-server authorizes its `/devices/:id/*` calls (config pull / endpoints /
@@ -278,7 +278,13 @@ pub(crate) fn parse_peers(conf: &serde_json::Value) -> Vec<PeerInfo> {
             plist
                 .iter()
                 .filter_map(|p| {
-                    let pk = p["wg_public_key"].as_str()?;
+                    let pubkey = match p["wg_public_key"].as_str().and_then(fluxpeer_sdk::key::decode) {
+                        Some(key) => key,
+                        None => {
+                            tracing::warn!("invalid peer public key; isolating peer");
+                            return None;
+                        }
+                    };
                     let candidates = p["endpoints"]
                         .as_array()
                         .map(|e| {
@@ -300,7 +306,7 @@ pub(crate) fn parse_peers(conf: &serde_json::Value) -> Vec<PeerInfo> {
                         None => allowed_ips.iter().any(|c| is_default_prefix(c)),
                     };
                     Some(PeerInfo {
-                        pubkey: hex32(pk),
+                        pubkey,
                         candidates,
                         allowed_ips,
                         overlay: p["address_v4"].as_str().and_then(|s| s.parse().ok()),
@@ -458,7 +464,7 @@ fn select_exit(peers: &[PeerInfo], use_exit: Option<&str>, relay_available: bool
                 .min_by_key(|p| p.pubkey)
                 .map(|p| p.pubkey)
         }
-        Some(hex_pk) => match parse_pubkey_hex(hex_pk) {
+        Some(hex_pk) => match fluxpeer_sdk::key::decode(hex_pk) {
             Some(pk) => match peers.iter().find(|p| p.pubkey == pk && p.exit) {
                 Some(p) => Some(p.pubkey),
                 None => {
@@ -467,21 +473,60 @@ fn select_exit(peers: &[PeerInfo], use_exit: Option<&str>, relay_available: bool
                 }
             },
             None => {
-                tracing::error!(use_exit = hex_pk, "use_exit is not a valid 32-byte hex pubkey; staying split-tunnel");
+                tracing::error!(use_exit = hex_pk, "use_exit is not a valid 32-byte hex/base64 pubkey; staying split-tunnel");
                 None
             }
         },
     }
 }
 
-/// Parse a 64-char hex pubkey; `None` on any deviation (no panic on bad input).
-fn parse_pubkey_hex(s: &str) -> Option<[u8; 32]> {
-    hex::decode(s).ok()?.try_into().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_exit_accepts_equivalent_hex_and_wireguard_base64() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let peers = parse_peers(&serde_json::json!({"peers": [{
+            "wg_public_key": hex::encode([0xab; 32]), "exit": true, "allowed_ips": ["0.0.0.0/0"]
+        }]}));
+        for encoding in [hex::encode([0xab; 32]), STANDARD.encode([0xab; 32])] {
+            assert_eq!(select_exit(&peers, Some(&encoding), true), Some([0xab; 32]));
+        }
+        assert_eq!(select_exit(&peers, Some(&STANDARD.encode([0xab; 31])), true), None);
+    }
+
+
+    #[tokio::test]
+    async fn wg_base64_import_config_and_node_parsing_isolate_invalid_peers() {
+        use base64::Engine;
+        use fluxpeer_control_server::{domain::ImportDevice, sql_store::SqlStore};
+        let store = SqlStore::connect("sqlite::memory:").await.unwrap();
+        let network = store.create_network("keys").await.unwrap();
+        let invite = store.create_invite(&network.id, None, None).await.unwrap();
+        let (me, _) = store.enroll(&invite.code, "me", &hex::encode([2; 32]), 0).await.unwrap();
+        let base64 = base64::engine::general_purpose::STANDARD.encode([0xab; 32]);
+        let conf = fluxpeer_sdk::wgconf::parse(&format!("[Peer]\nPublicKey = {base64}\nAllowedIPs = 100.72.16.150/32\n")).unwrap();
+        let (devices, _) = fluxpeer_sdk::build_import_devices(&conf, "wg0", true).unwrap();
+        assert_eq!(devices[0]["wg_public_key"], hex::encode([0xab; 32]));
+        // Exercise raw base64 at the server boundary too (older SDKs sent it).
+        store.import_devices(&network.id, &[ImportDevice {
+            wg_public_key: base64.clone(), address_v4: Some("100.72.16.150".into()), ..Default::default()
+        }]).await.unwrap();
+        let mut json = serde_json::to_value(store.device_config(&me.id).await.unwrap()).unwrap();
+        assert_eq!(json["peers"][0]["wg_public_key"], hex::encode([0xab; 32]));
+        assert_eq!(parse_peers(&json)[0].pubkey, [0xab; 32]);
+        // Older servers may still send base64. One corrupt peer must not remove
+        // valid peers or terminate initial resolve/steady-state reconciliation.
+        json["peers"][0]["wg_public_key"] = base64.into();
+        for invalid in [serde_json::Value::Null, "bad".into(), "ff".repeat(31).into(), "gg".repeat(32).into()] {
+            json["peers"].as_array_mut().unwrap().push(serde_json::json!({"wg_public_key": invalid}));
+        }
+        let peers = parse_peers(&json);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].pubkey, [0xab; 32]);
+    }
+
 
     #[tokio::test]
     async fn all_directory_dns_failures_are_nonterminal_and_can_recover() {
@@ -514,7 +559,7 @@ mod tests {
         let store = std::sync::Arc::new(Store::new());
         let net = store.create_network("directory-test");
         let invite = store.create_invite(&net.id, None, None).unwrap();
-        let device = store.enroll(&invite.code, "client", "test-key", 0).unwrap();
+        let device = store.enroll(&invite.code, "client", &hex::encode([9; 32]), 0).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, router(store)).await.unwrap(); });

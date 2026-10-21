@@ -110,8 +110,8 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub(crate) fn hex32(s: &str) -> [u8; 32] {
-    hex::decode(s).expect("valid hex key").try_into().expect("32-byte key")
+pub(crate) fn hex32(s: &str) -> std::io::Result<[u8; 32]> {
+    fluxpeer_sdk::key::decode(s).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid 32-byte key"))
 }
 
 pub(crate) fn netmask_v4(prefix: u8) -> Ipv4Addr {

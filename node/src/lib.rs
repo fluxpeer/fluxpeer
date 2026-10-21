@@ -893,7 +893,10 @@ pub async fn run_embedded_with_routes(cfg_json: &str, tun_fd: i32, protect: Opti
 }
 
 async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile::RoutesFn>) -> std::io::Result<()> {
-    let own_priv = StaticSecret::from(hex32(&cfg.private_key));
+    // Own the injected fd before parsing keys so early errors also close it.
+    #[cfg(unix)]
+    let mut fd_guard = cfg.tun_fd.map(|fd| InjectedFdGuard(Some(fd)));
+    let own_priv = StaticSecret::from(hex32(&cfg.private_key)?);
     let own_pub = PublicKey::from(&own_priv);
 
     // Register the protect callback process-wide so the relay/tcp-direct/bonded
@@ -903,11 +906,6 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     if let Some(p) = &protect {
         fp_transport::set_protect(p.clone());
     }
-
-    // Own the OS-injected tun fd until fp-tun adopts it below, so any early error
-    // (bind, control fetch) closes it instead of leaking (see InjectedFdGuard).
-    #[cfg(unix)]
-    let mut fd_guard = cfg.tun_fd.map(|fd| InjectedFdGuard(Some(fd)));
 
     // Bind the wg UDP socket FIRST so STUN learns the NAT mapping for this port.
     // SO_REUSEADDR so a rapid stop/start (common on mobile, where the OS keeps the
@@ -1557,6 +1555,22 @@ fn desired_dns(peers: &[control::PeerInfo], overrides: &[String], exit_ready: bo
 #[cfg(test)]
 mod exit_contract_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_private_key_returns_error_and_closes_injected_fd() {
+        use std::io::Read;
+        use std::os::fd::IntoRawFd;
+        let (injected, mut other) = std::os::unix::net::UnixStream::pair().unwrap();
+        other.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut config = directory_config(None, false);
+        config.private_key = "malformed-key".into();
+        config.tun_fd = Some(injected.into_raw_fd());
+        let error = run_with(config, None, None).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(other.read(&mut [0; 1]).unwrap(), 0);
+    }
+
 
     fn test_host() -> HostEffects {
         HostEffects { tun_name: "fp-test".into(), own_cidr: "100.72.16.0/24".into(), control_host: String::new(), relay_ips: parking_lot::Mutex::new(vec![]),

@@ -17,6 +17,7 @@ pub mod domain;
 pub mod ipam;
 pub mod persistence;
 mod pop;
+mod integrity;
 pub mod sql_store;
 pub mod state;
 
@@ -67,7 +68,7 @@ async fn version() -> Json<VersionInfo> {
 fn store_status(e: StoreError) -> StatusCode {
     match e {
         StoreError::NetworkNotFound | StoreError::DeviceNotFound | StoreError::RouteNotFound => StatusCode::NOT_FOUND,
-        StoreError::InvalidPrefix => StatusCode::BAD_REQUEST,
+        StoreError::InvalidPrefix | StoreError::InvalidKey => StatusCode::BAD_REQUEST,
         StoreError::InvalidInvite => StatusCode::FORBIDDEN,
         StoreError::PoolExhausted => StatusCode::CONFLICT,
     }
@@ -439,9 +440,10 @@ fn sql_status(e: SqlStoreError) -> StatusCode {
         SqlStoreError::NetworkNotFound | SqlStoreError::DeviceNotFound | SqlStoreError::RouteNotFound => {
             StatusCode::NOT_FOUND
         }
-        SqlStoreError::InvalidPrefix => StatusCode::BAD_REQUEST,
+        SqlStoreError::InvalidPrefix | SqlStoreError::InvalidKey | SqlStoreError::InvalidAddress => StatusCode::BAD_REQUEST,
         SqlStoreError::InvalidInvite => StatusCode::FORBIDDEN,
         SqlStoreError::PoolExhausted => StatusCode::CONFLICT,
+        SqlStoreError::Db(ref error) if error.as_database_error().is_some_and(|e| e.is_unique_violation()) => StatusCode::CONFLICT,
         SqlStoreError::BadPool(_) | SqlStoreError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -549,6 +551,7 @@ async fn sql_enroll(
     State(s): State<Arc<SqlStore>>,
     Json(req): Json<EnrollReq>,
 ) -> Result<(StatusCode, Json<EnrollResponse>), StatusCode> {
+    if fluxpeer_sdk::key::decode(&req.wg_public_key).is_none() { return Err(StatusCode::BAD_REQUEST); }
     // Proof-of-possession is mandatory (audit #11): without it a caller could enroll
     // a wg public key it doesn't own. Verify before allocating any IPAM / token.
     let (Some(cid), Some(proof)) = (req.challenge_id.as_deref(), req.proof.as_deref()) else {
@@ -735,6 +738,11 @@ async fn sql_list_relays(
     s.list_relays(&network_id).await.map(Json).map_err(sql_status)
 }
 
+struct WatchCredential {
+    bearer: String,
+    master: bool,
+}
+
 async fn sql_watch_device(
     State(s): State<Arc<SqlStore>>,
     Path(device_id): Path<String>,
@@ -747,34 +755,43 @@ async fn sql_watch_device(
         .await
         .map_err(sql_status)?
         .ok_or(StatusCode::NOT_FOUND)?;
+    let bearer = bearer_token(&headers).ok_or(StatusCode::UNAUTHORIZED)?.to_owned();
+    let credential = WatchCredential { master: auth::is_master_bearer(&bearer), bearer };
     let rx = s.subscribe(&network_id);
-    Ok(ws.on_upgrade(move |socket| sql_watch_loop(socket, s, device_id, rx)))
+    Ok(ws.on_upgrade(move |socket| sql_watch_loop(socket, s, device_id, credential, rx)))
 }
 
 async fn sql_watch_loop(
     mut socket: WebSocket,
     store: Arc<SqlStore>,
     device_id: String,
+    credential: WatchCredential,
     mut rx: tokio::sync::watch::Receiver<u64>,
 ) {
-    if !sql_send_config(&mut socket, &store, &device_id).await {
+    if !sql_send_config(&mut socket, &store, &device_id, &credential).await {
         return;
     }
     while rx.changed().await.is_ok() {
-        if !sql_send_config(&mut socket, &store, &device_id).await {
+        if !sql_send_config(&mut socket, &store, &device_id, &credential).await {
             break;
         }
     }
 }
 
-async fn sql_send_config(socket: &mut WebSocket, store: &Arc<SqlStore>, device_id: &str) -> bool {
-    match store.device_config(device_id).await {
-        Ok(cfg) => socket
-            .send(Message::Text(serde_json::to_string(&cfg).unwrap_or_default()))
-            .await
-            .is_ok(),
-        Err(_) => false,
+async fn sql_send_config(socket: &mut WebSocket, store: &Arc<SqlStore>, device_id: &str, credential: &WatchCredential) -> bool {
+    let Ok(cfg) = store.device_config(device_id).await else { return false; };
+    // Revalidate after reading the snapshot and immediately before each push.
+    // This also covers rotation on a different control-server instance.
+    let authorized = if credential.master {
+        auth::is_master_bearer(&credential.bearer)
+    } else {
+        matches!(store.device_token(device_id).await, Ok(Some(current)) if ct_eq(current.as_bytes(), credential.bearer.as_bytes()))
+    };
+    if !authorized {
+        let _ = socket.send(Message::Close(None)).await;
+        return false;
     }
+    socket.send(Message::Text(serde_json::to_string(&cfg).unwrap_or_default())).await.is_ok()
 }
 
 /// Persistent REST + WS API backed by [`SqlStore`] (PostgreSQL in prod).
@@ -889,8 +906,8 @@ mod test {
         let store = Arc::new(Store::new());
         let network = store.create_network("test");
         let invite = store.create_invite(&network.id, None, None).unwrap();
-        let exit = store.enroll(&invite.code, "exit", "exit-key", 1000).unwrap();
-        let client = store.enroll(&invite.code, "client", "client-key", 1000).unwrap();
+        let exit = store.enroll(&invite.code, "exit", "07a1acf4b8773a1ed39c1837a786a1ac481052890eb584d3f53abd40f1398dad", 1000).unwrap();
+        let client = store.enroll(&invite.code, "client", "8eb943e7040b69a94bf39562088223755bff4c2e7c5fc257f1e08f870fe01d35", 1000).unwrap();
         let app = router(store.clone());
         let uri = format!("/api/v1/devices/{}/routes", exit.id);
         for invalid in ["1.2.3.4/33", "::/129", "bad/0", "192.0.2.1"] {
@@ -909,14 +926,14 @@ mod test {
             assert!(approved.config_epoch > before);
             assert_eq!(approved.self_exit, canonical.ends_with("/0"));
             let peers = store.device_config(&client.id).unwrap().peers;
-            assert_eq!(peers.iter().find(|p| p.wg_public_key == "exit-key").unwrap().exit, canonical.ends_with("/0"));
+            assert_eq!(peers.iter().find(|p| p.wg_public_key == "07a1acf4b8773a1ed39c1837a786a1ac481052890eb584d3f53abd40f1398dad").unwrap().exit, canonical.ends_with("/0"));
             let request = || axum::http::Request::builder().method("DELETE").uri(format!("/api/v1/routes/{id}"))
                 .body(axum::body::Body::empty()).unwrap();
             assert_eq!(app.clone().oneshot(request()).await.unwrap().status(), StatusCode::NO_CONTENT);
             let revoked = store.device_config(&exit.id).unwrap();
             assert!(revoked.config_epoch > approved.config_epoch);
             assert!(!revoked.self_exit);
-            assert!(!store.device_config(&client.id).unwrap().peers.iter().find(|p| p.wg_public_key == "exit-key").unwrap().exit);
+            assert!(!store.device_config(&client.id).unwrap().peers.iter().find(|p| p.wg_public_key == "07a1acf4b8773a1ed39c1837a786a1ac481052890eb584d3f53abd40f1398dad").unwrap().exit);
             assert_eq!(app.clone().oneshot(request()).await.unwrap().status(), StatusCode::NOT_FOUND);
         }
     }
@@ -974,7 +991,7 @@ mod test {
             .clone()
             .oneshot(post(
                 "/api/v1/enroll",
-                serde_json::json!({"invite_code": code, "name": "laptop", "wg_public_key": "pk-A"}),
+                serde_json::json!({"invite_code": code, "name": "laptop", "wg_public_key": "7ff6874a5b9f7ded7d14fc4d566c9eedb04e99b2e6d6e09faeb4e8ec1f6d1b40"}),
             ))
             .await
             .unwrap();
@@ -998,7 +1015,7 @@ mod test {
         let resp = app()
             .oneshot(post(
                 "/api/v1/enroll",
-                serde_json::json!({"invite_code": "nope", "name": "x", "wg_public_key": "k"}),
+                serde_json::json!({"invite_code": "nope", "name": "x", "wg_public_key": "8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a"}),
             ))
             .await
             .unwrap();
@@ -1046,7 +1063,7 @@ mod test {
         let code = net_with_invite(&app).await;
 
         // A gateway peer that advertises a public endpoint.
-        let gw_id = enroll(&app, &code, "gw", "pk-gw").await;
+        let gw_id = enroll(&app, &code, "gw", "52f227c8e6bd35d1c7d22d31322938e0994656daf9289375834d395639e3af5a").await;
         let r = app
             .clone()
             .oneshot(post(
@@ -1058,11 +1075,11 @@ mod test {
         assert_eq!(r.status(), StatusCode::NO_CONTENT);
 
         // The mobile client looks up its gateway.
-        let me_id = enroll(&app, &code, "phone", "pk-phone").await;
+        let me_id = enroll(&app, &code, "phone", "62a2633db2e8b40d6f7156231298c261c1aa023f4efc4095602315f166597ea2").await;
         let resp = app.clone().oneshot(get(&format!("/api/v1/devices/{me_id}/gateway"))).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let g = body_json(resp).await;
-        assert_eq!(g["node_pubkey"], "pk-gw");
+        assert_eq!(g["node_pubkey"], "52f227c8e6bd35d1c7d22d31322938e0994656daf9289375834d395639e3af5a");
         assert_eq!(g["node_addr"], "203.0.113.7");
         assert_eq!(g["node_port"], 41820);
         assert_eq!(g["transport_protocol"], "udp");
@@ -1081,8 +1098,8 @@ mod test {
         let app = app();
         let code = net_with_invite(&app).await;
         // A peer exists but reports no endpoint → not reachable as a gateway.
-        let _gw = enroll(&app, &code, "gw", "pk-gw").await;
-        let me_id = enroll(&app, &code, "phone", "pk-phone").await;
+        let _gw = enroll(&app, &code, "gw", "52f227c8e6bd35d1c7d22d31322938e0994656daf9289375834d395639e3af5a").await;
+        let me_id = enroll(&app, &code, "phone", "62a2633db2e8b40d6f7156231298c261c1aa023f4efc4095602315f166597ea2").await;
         let resp = app.clone().oneshot(get(&format!("/api/v1/devices/{me_id}/gateway"))).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }

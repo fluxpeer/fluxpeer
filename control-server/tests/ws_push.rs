@@ -13,7 +13,7 @@ async fn ws_pushes_config_on_epoch_change() {
     let store = Arc::new(Store::new());
     let net = store.create_network("home");
     let inv = store.create_invite(&net.id, None, None).expect("invite");
-    let d1 = store.enroll(&inv.code, "d1", "k1", 1000).expect("enroll d1");
+    let d1 = store.enroll(&inv.code, "d1", "6ab9f1eb8f7d3388f4f9d586f66e99fd54080df2c446f0e58668b09c08a16dd0", 1000).expect("enroll d1");
 
     // Serve on an ephemeral port; keep a clone of the store to drive changes.
     let app = router(store.clone());
@@ -32,11 +32,11 @@ async fn ws_pushes_config_on_epoch_change() {
     assert_eq!(cfg["peers"].as_array().expect("peers").len(), 0);
 
     // 2) enroll a second device → epoch bump → push.
-    store.enroll(&inv.code, "d2", "k2", 1000).expect("enroll d2");
+    store.enroll(&inv.code, "d2", "015f7e6bc5aeaf483724089e9252cc13b50951a6b69412522765cff4d780306e", 1000).expect("enroll d2");
 
     let second = ws.next().await.expect("msg2").expect("ok2").into_text().expect("text2");
     let cfg2: serde_json::Value = serde_json::from_str(&second).expect("json2");
     let peers = cfg2["peers"].as_array().expect("peers2");
     assert_eq!(peers.len(), 1);
-    assert_eq!(peers[0]["wg_public_key"], "k2");
+    assert_eq!(peers[0]["wg_public_key"], "015f7e6bc5aeaf483724089e9252cc13b50951a6b69412522765cff4d780306e");
 }

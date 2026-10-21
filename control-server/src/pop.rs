@@ -53,9 +53,9 @@ pub(crate) struct Challenge {
 }
 
 /// Mint a challenge for a client claiming `claimed_pub_hex`. Returns `None` if the
-/// claimed key isn't a valid 32-byte hex key or the pending table is full.
+/// claimed key isn't a valid 32-byte hex/base64 key or the pending table is full.
 pub(crate) fn new_challenge(claimed_pub_hex: &str) -> Option<Challenge> {
-    let claimed = decode_key(claimed_pub_hex)?;
+    let claimed = fluxpeer_sdk::key::decode(claimed_pub_hex)?;
     let ephemeral = StaticSecret::from(random_32());
     let server_pub = hex::encode(PublicKey::from(&ephemeral).to_bytes());
     let challenge_id = crate::auth::random_hex(16);
@@ -92,7 +92,7 @@ pub(crate) fn verify(challenge_id: &str, claimed_pub_hex: &str, proof_hex: &str)
         return false;
     }
     // The proof must be for the SAME key the challenge was minted for.
-    let Some(claimed) = decode_key(claimed_pub_hex) else {
+    let Some(claimed) = fluxpeer_sdk::key::decode(claimed_pub_hex) else {
         return false;
     };
     if claimed != entry.claimed_pub {

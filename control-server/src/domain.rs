@@ -34,7 +34,7 @@ pub struct Device {
     pub id: String,
     pub network_id: String,
     pub name: String,
-    /// Curve25519 public key (base64); private key never leaves the device.
+    /// Curve25519 public key (canonical lowercase hex); private keys stay local.
     pub wg_public_key: String,
     /// Centrally-allocated stable overlay addresses.
     pub address_v4: Option<String>,
