@@ -110,7 +110,7 @@ impl Noise {
                     .expect("known-safe: HANDSHAKE_RESP_SZ guarantees 92 bytes"),
                 encrypted_nothing: &src[44..60],
             }),
-            (crate::DATA, crate::DATA_MIN_SZ..=std::usize::MAX) => Packet::PacketData(PacketData {
+            (crate::DATA, crate::DATA_MIN_SZ..=usize::MAX) => Packet::PacketData(PacketData {
                 receiver_idx: u32::from_le_bytes(
                     src[4..8]
                         .try_into()

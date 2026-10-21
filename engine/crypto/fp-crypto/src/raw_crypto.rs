@@ -15,7 +15,7 @@ impl RawCryptor {
                              node_pubkey: crate::x25519::PublicKey|
              -> Result<(std::ptr::NonNull<()>, Vec<u8>), crate::Error> {
                 C::init_handshake(own_prikey, node_pubkey).map(|(crypto, hs)| {
-                    let ptr = unsafe { std::ptr::NonNull::new_unchecked(Box::into_raw(Box::new(crypto))).cast() };
+                    let ptr = std::ptr::NonNull::from(Box::leak(Box::new(crypto))).cast();
                     (ptr, hs)
                 })
             },
@@ -24,7 +24,7 @@ impl RawCryptor {
                                packet: &[u8]|
              -> Result<(std::ptr::NonNull<()>, Option<Vec<u8>>), crate::Error> {
                 C::handle_handshake(own_prikey, node_pubkey, packet).map(|(crypto, hs)| {
-                    let ptr = unsafe { std::ptr::NonNull::new_unchecked(Box::into_raw(Box::new(crypto))).cast() };
+                    let ptr = std::ptr::NonNull::from(Box::leak(Box::new(crypto))).cast();
                     (ptr, hs)
                 })
             },
