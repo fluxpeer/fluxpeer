@@ -945,6 +945,7 @@ dependencies = [
 name = "fluxpeer-node"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arc-swap",
  "base64",
  "fluxpeer-relay-server",
@@ -963,6 +964,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "portable-atomic",
+ "reqwest",
  "serde",
  "serde_json",
  "socket2 0.6.4",

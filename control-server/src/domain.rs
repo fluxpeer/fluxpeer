@@ -112,6 +112,9 @@ pub struct PeerConfig {
 /// What a device fetches to configure itself + its peers (config-pull).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeviceConfig {
+    /// Stable overlay pools, independent of current peer membership.
+    #[serde(default)]
+    pub overlay_cidrs: Vec<String>,
     pub network_id: String,
     pub config_epoch: u64,
     pub address_v4: Option<String>,

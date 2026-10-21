@@ -8,6 +8,8 @@ name = "fp-node"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = { workspace = true }
+reqwest = { workspace = true }
 arc-swap = { workspace = true }
 fp-tun = { path = "../engine/net/fp-tun", features = ["async"] }
 fp-crypto = { path = "../engine/crypto/fp-crypto" }

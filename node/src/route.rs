@@ -464,7 +464,8 @@ load anchor "fluxpeer-exit" from "/etc/pf.anchors/fluxpeer-exit"
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    return Err(ApplyError::new(&["exit-gateway", phys, tun, overlay_cidr], "unsupported platform"));
+    { Err(ApplyError::new(&["exit-gateway", phys, tun, overlay_cidr], "unsupported platform")) }
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     Ok(())
 }
 

@@ -34,6 +34,9 @@ impl PeerConfig {
 /// What a device fetches to configure itself + its peers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeviceConfig {
+    /// Stable overlay pools, independent of current peer membership.
+    #[serde(default)]
+    pub overlay_cidrs: Vec<String>,
     pub network_id: String,
     pub config_epoch: u64,
     pub address_v4: Option<String>,
@@ -65,6 +68,7 @@ mod test {
             }"#,
         )
         .expect("old shape must parse");
+        assert!(v.overlay_cidrs.is_empty());
         assert!(!v.self_exit);
         assert_eq!(v.peers[0].exit, None);
         assert!(v.peers[0].is_exit());

@@ -20,6 +20,24 @@ pub(crate) fn mk_client(cfg: &Config) -> Client {
     )
 }
 
+/// Preserve HTTP status classification before wrapping the SDK error in io::Error.
+/// Authentication, revoked/missing resources and invalid requests need user action;
+/// network failures, server failures and rate limits remain retryable.
+pub(crate) fn request_error(error: anyhow::Error) -> std::io::Error {
+    use std::io::ErrorKind;
+    let kind = match error.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status) {
+        Some(status) if matches!(status.as_u16(), 401 | 403) => ErrorKind::PermissionDenied,
+        Some(status) if matches!(status.as_u16(), 404 | 410) => ErrorKind::NotFound,
+        Some(status) if status.is_client_error() && !matches!(status.as_u16(), 408 | 425 | 429) => ErrorKind::InvalidInput,
+        _ => ErrorKind::Other,
+    };
+    std::io::Error::new(kind, error)
+}
+
+pub(crate) fn terminal_control_error(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput)
+}
+
 /// Static info about one peer, resolved from the control-server config-pull.
 #[derive(Clone)]
 pub(crate) struct PeerInfo {
@@ -36,6 +54,7 @@ pub(crate) struct PeerInfo {
 }
 
 pub(crate) struct Resolved {
+    pub(crate) platform: serde_json::Value,
     pub(crate) own_addr: Ipv4Addr,
     pub(crate) peers: Vec<PeerInfo>,
     /// Admin-set wg settings from the control-server (editable in admin-lite).
@@ -77,15 +96,20 @@ pub(crate) struct RelayDir {
     pub(crate) stun: Option<SocketAddr>,
 }
 
+/// Respect explicit transport selection without dialing a directory address
+/// using a protocol it does not advertise. Auto keeps all candidates.
+pub(crate) fn relay_transport_matches(force: bool, anytls: bool, require_anytls: bool, require_bond: bool) -> bool {
+    if !force { return true; }
+    if require_anytls { anytls } else if require_bond { !anytls } else { true }
+}
+
 /// Fetch the relay directory for this device from the control-server (one GET,
-/// before STUN, so we can learn the STUN address from it too). Empty on any error
-/// — the node still runs direct-only.
-pub(crate) async fn fetch_relays(cfg: &Config) -> Vec<RelayDir> {
+/// before STUN, so we can learn the STUN address from it too). Preserve errors
+/// so mobile and forced-relay bootstrap can retry without ending the session.
+pub(crate) async fn fetch_relays(cfg: &Config) -> std::io::Result<Vec<RelayDir>> {
     let client = mk_client(cfg);
-    let Ok(conf) = client.device_config(&cfg.device_id).await else {
-        return Vec::new();
-    };
-    conf["relays"]
+    let conf = client.device_config(&cfg.device_id).await.map_err(request_error)?;
+    Ok(conf["relays"]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -99,7 +123,7 @@ pub(crate) async fn fetch_relays(cfg: &Config) -> Vec<RelayDir> {
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 /// STUN: send a disco Ping to `stun` and return the reflexive (public) `ip:port`
@@ -188,7 +212,7 @@ pub(crate) async fn resolve_from_control(cfg: &Config, advertise: &[String]) -> 
     client
         .set_endpoints(&cfg.device_id, advertise)
         .await
-        .map_err(std::io::Error::other)?;
+        .map_err(request_error)?;
     tracing::info!(?advertise, "reported endpoints to control-server");
 
     // Only `own_addr` is needed to bring the TUN up — so return the moment the
@@ -210,6 +234,7 @@ pub(crate) async fn resolve_from_control(cfg: &Config, advertise: &[String]) -> 
                     tracing::info!(peer_count = peers.len(), self_exit, "resolved from control-server");
                     return Ok((
                         Resolved {
+                            platform: conf.clone(),
                             own_addr: oa,
                             peers,
                             mtu,
@@ -221,7 +246,13 @@ pub(crate) async fn resolve_from_control(cfg: &Config, advertise: &[String]) -> 
                 }
                 // Enrolled but no overlay address yet — retry briefly.
             }
-            Err(e) => last_err = Some(e.to_string()),
+            Err(e) => {
+                let error = request_error(e);
+                if terminal_control_error(&error) {
+                    return Err(error);
+                }
+                last_err = Some(error.to_string());
+            }
         }
         tokio::time::sleep(Duration::from_millis(if attempt < 4 { 200 } else { 500 })).await;
     }
@@ -234,6 +265,7 @@ pub(crate) async fn resolve_from_control(cfg: &Config, advertise: &[String]) -> 
 /// A fresh config snapshot from the control-plane: peers + this device's own
 /// exit-ness (`self_exit`, AD-1) at the same epoch.
 pub(crate) struct Snapshot {
+    pub(crate) platform: serde_json::Value,
     pub(crate) epoch: u64,
     pub(crate) peers: Vec<PeerInfo>,
     pub(crate) self_exit: bool,
@@ -247,17 +279,28 @@ pub(crate) async fn poll_peers_if_changed(
     client: &Client,
     device_id: &str,
     applied_epoch: Option<u64>,
-) -> Option<Snapshot> {
-    let conf = client.device_config(device_id).await.ok()?;
+) -> std::io::Result<Option<Snapshot>> {
+    let conf = match client.device_config(device_id).await {
+        Ok(conf) => conf,
+        Err(error) => {
+            let error = request_error(error);
+            if terminal_control_error(&error) {
+                return Err(error);
+            }
+            tracing::warn!(%error, "control refresh unavailable; retrying next tick");
+            return Ok(None);
+        }
+    };
     let epoch = config_epoch(&conf);
     if Some(epoch) == applied_epoch {
-        return None;
+        return Ok(None);
     }
-    Some(Snapshot {
+    Ok(Some(Snapshot {
+        platform: conf.clone(),
         epoch,
         peers: parse_peers(&conf),
         self_exit: parse_self_exit(&conf),
-    })
+    }))
 }
 
 /// Resolve the local `use_exit` setting against the peer list (AD-2). Returns
@@ -324,6 +367,92 @@ fn parse_pubkey_hex(s: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn http_responses(responses: Vec<(u16, String)>) -> (Config, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 4096];
+                loop {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buf[..n]);
+                    let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue; };
+                    let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                    let length = headers.lines().find_map(|line| line.strip_prefix("content-length:")?.trim().parse::<usize>().ok()).unwrap_or(0);
+                    if request.len() >= end + 4 + length { break; }
+                }
+                let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let cfg = serde_json::from_value(serde_json::json!({
+            "private_key": "00".repeat(32), "device_id": "test", "control_server": url,
+            "listen_port": 0, "tun_name": "fp-test", "prefix_len": 32
+        })).unwrap();
+        (cfg, server)
+    }
+
+    #[tokio::test]
+    async fn terminal_http_statuses_exit_directory_and_bootstrap_without_retry() {
+        for status in [400, 401, 403, 404, 410, 422] {
+            let (cfg, server) = http_responses(vec![(status, "{}".into())]).await;
+            let result = tokio::time::timeout(Duration::from_millis(500), crate::mobile::retry_control(true, || fetch_relays(&cfg))).await.unwrap();
+            assert!(terminal_control_error(&result.err().unwrap()), "directory HTTP {status}");
+            server.await.unwrap();
+
+            // Endpoint publication fails before the first config GET.
+            let (cfg, server) = http_responses(vec![(status, "{}".into())]).await;
+            let result = tokio::time::timeout(Duration::from_millis(500), crate::mobile::retry_control(true, || resolve_from_control(&cfg, &[]))).await.unwrap();
+            assert!(terminal_control_error(&result.err().unwrap()), "endpoints HTTP {status}");
+            server.await.unwrap();
+
+            // Endpoint publication succeeds, but the subsequent config GET is terminal.
+            let (cfg, server) = http_responses(vec![(200, "{}".into()), (status, "{}".into())]).await;
+            let result = tokio::time::timeout(Duration::from_millis(500), crate::mobile::retry_control(true, || resolve_from_control(&cfg, &[]))).await.unwrap();
+            assert!(terminal_control_error(&result.err().unwrap()), "config HTTP {status}");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn server_failure_and_rate_limit_retry_then_recover() {
+        for status in [503, 429] {
+            let (cfg, server) = http_responses(vec![(status, "{}".into()), (200, "{\"relays\":[]}".into())]).await;
+            let result = tokio::time::timeout(Duration::from_secs(3), crate::mobile::retry_control(true, || fetch_relays(&cfg))).await.unwrap();
+            assert!(result.unwrap().is_empty());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn steady_state_revocation_propagates_but_server_failure_keeps_session() {
+        for status in [401, 403, 404, 500] {
+            let (cfg, server) = http_responses(vec![(status, "{}".into())]).await;
+            let result = poll_peers_if_changed(&mk_client(&cfg), &cfg.device_id, Some(1)).await;
+            if status == 500 {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert!(terminal_control_error(&result.err().unwrap()));
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_mobile_transport_filters_incompatible_directory_entries() {
+        for advertised in [false, true] {
+            assert!(relay_transport_matches(true, advertised, false, false));
+            assert!(relay_transport_matches(false, advertised, true, false));
+            assert!(relay_transport_matches(false, advertised, false, true));
+            assert_eq!(relay_transport_matches(true, advertised, true, false), advertised);
+            assert_eq!(relay_transport_matches(true, advertised, false, true), !advertised);
+        }
+    }
 
     fn peer(pk: u8, exit: bool, endpoints: &[&str], allowed: &[&str]) -> PeerInfo {
         PeerInfo {

@@ -431,6 +431,7 @@ impl Store {
             .iter()
             .any(|(did, prefix)| did == &me.id && is_default_prefix(prefix));
         Ok(DeviceConfig {
+            overlay_cidrs: g.networks.get(&me.network_id).map(|n| vec![n.ipv4_pool.clone(), n.ipv6_ula.clone()]).unwrap_or_default(),
             network_id: me.network_id.clone(),
             config_epoch,
             address_v4: me.address_v4.clone(),
@@ -562,6 +563,7 @@ mod test {
         let d2 = s.enroll(&inv.code, "d2", "k2", 1000).unwrap();
 
         let cfg = s.device_config(&d1.id).unwrap();
+        assert_eq!(cfg.overlay_cidrs, vec![net.ipv4_pool.clone(), net.ipv6_ula.clone()]);
         assert_eq!(cfg.peers.len(), 1);
         assert_eq!(cfg.peers[0].wg_public_key, "k2");
         let v4 = d2.address_v4.unwrap();
@@ -576,7 +578,9 @@ mod test {
         let d1 = s.enroll(&inv.code, "d1", "k1", 1000).unwrap();
         let d2 = s.enroll(&inv.code, "d2", "k2", 1000).unwrap();
 
+        let pools = s.device_config(&d1.id).unwrap().overlay_cidrs;
         s.revoke_device(&d2.id).unwrap();
+        assert_eq!(s.device_config(&d1.id).unwrap().overlay_cidrs, pools);
         assert!(s.device_config(&d1.id).unwrap().peers.is_empty());
         assert_eq!(s.device_config(&d2.id).unwrap_err(), StoreError::DeviceNotFound);
     }

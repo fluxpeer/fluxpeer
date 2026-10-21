@@ -438,6 +438,7 @@ impl SqlStore {
         let self_exit = is_exit(&me.id);
         let relays = db::list_relays(&self.pool, &me.network_id).await?;
         Ok(DeviceConfig {
+            overlay_cidrs: vec![net.ipv4_pool, net.ipv6_ula],
             network_id: me.network_id,
             config_epoch: net.config_epoch,
             address_v4: me.address_v4,
@@ -585,12 +586,14 @@ mod test {
 
         // config of d1 lists d2 as a peer
         let cfg = s.device_config(&d1.id).await.unwrap();
+        assert_eq!(cfg.overlay_cidrs, vec![net.ipv4_pool.clone(), net.ipv6_ula.clone()]);
         assert_eq!(cfg.peers.len(), 1);
         assert_eq!(cfg.peers[0].wg_public_key, "k2");
         assert!(cfg.config_epoch >= 2);
 
         // revoke d2 → freed addr reused, d2 cut off
         s.revoke_device(&d2.id).await.unwrap();
+        assert_eq!(s.device_config(&d1.id).await.unwrap().overlay_cidrs, cfg.overlay_cidrs);
         assert!(s.device_config(&d2.id).await.is_err());
         let (d3, _) = s.enroll(&inv.code, "tablet", "k3", 1000).await.unwrap();
         assert_eq!(d3.address_v4.as_deref(), Some("100.72.16.101")); // recycled

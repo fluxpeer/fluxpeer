@@ -1,15 +1,15 @@
 //! Android JNI surface — Kotlin `dev.fluxpeer.fluxpeer.FluxpeerNode` calls
-//! `runNode(cfgJson, tunFd)` / `stopNode()`. The engine upcalls the Kotlin static
+//! `runNode(cfgJson, tunFd, generation)` / `stopNode()`. The engine upcalls the Kotlin static
 //! `protectSocket(int fd): boolean` so `VpnService.protect` excludes each egress
 //! socket from the VPN (else our own wg packets loop back into the tun).
 
 use std::ffi::{CString, c_char, c_void};
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
 use jni::objects::{GlobalRef, JClass, JString, JValue};
-use jni::sys::{JNI_VERSION_1_6, jint, jstring};
+use jni::sys::{JNI_VERSION_1_6, jint, jlong, jstring};
 use jni::{JNIEnv, JavaVM};
 use parking_lot::Mutex;
 
@@ -47,7 +47,11 @@ static JVM: OnceLock<JavaVM> = OnceLock::new();
 /// the static method without `find_class` (which fails off the main classloader).
 static NODE_CLASS: OnceLock<GlobalRef> = OnceLock::new();
 /// Stop signal for the running engine (oneshot fires → `run_embedded` is cancelled).
-static STOP: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
+struct EngineThread {
+    stop: tokio::sync::oneshot::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+static STOP: Mutex<Option<EngineThread>> = Mutex::new(None);
 
 #[unsafe(no_mangle)]
 pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut c_void) -> jint {
@@ -63,6 +67,20 @@ pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut c_void) -> jint {
 
 fn jstr(env: &mut JNIEnv, s: &str) -> jstring {
     env.new_string(s).map(|o| o.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Do not leave a Java exception pending on a reused engine/JNI thread.
+fn clear_upcall_exception(env: &mut JNIEnv, method: &str) {
+    match env.exception_check() {
+        Ok(true) => {
+            tracing::error!(method, "[jni] clearing pending exception after failed upcall");
+            if let Err(error) = env.exception_clear() {
+                tracing::error!(method, %error, "[jni] exception_clear failed");
+            }
+        }
+        Ok(false) => {}
+        Err(error) => tracing::error!(method, %error, "[jni] exception_check failed"),
+    }
 }
 
 /// Engine → Kotlin upcall: `FluxpeerNode.protectSocket(fd)` (VpnService.protect).
@@ -81,7 +99,10 @@ fn protect_socket(fd: RawFd) {
     };
     match env.call_static_method(class, "protectSocket", "(I)Z", &[JValue::Int(fd as jint)]) {
         Ok(_) => tracing::info!(fd, "protected egress socket via VpnService"),
-        Err(e) => tracing::error!(fd, "[jni] protectSocket upcall failed: {e}"),
+        Err(e) => {
+            tracing::error!(fd, "[jni] protectSocket upcall failed: {e}");
+            clear_upcall_exception(&mut env, "protectSocket");
+        }
     }
 }
 
@@ -90,19 +111,41 @@ fn protect_socket(fd: RawFd) {
 /// showing a stale "connected" state behind a dead engine; the Kotlin side tears
 /// down (releasing the wake lock + the tun fd) on receipt. Runs on the fp-node
 /// thread, so it must attach to the JVM first.
-fn engine_exited() {
+fn engine_exited(generation: jlong) {
     let (Some(vm), Some(class)) = (JVM.get(), NODE_CLASS.get()) else {
         return;
     };
     let Ok(mut env) = vm.attach_current_thread() else {
         return;
     };
-    if let Err(e) = env.call_static_method(class, "onEngineExit", "()V", &[]) {
+    if let Err(e) = env.call_static_method(class, "onEngineExit", "(J)V", &[JValue::Long(generation)]) {
         tracing::error!("[jni] onEngineExit upcall failed: {e}");
+        clear_upcall_exception(&mut env, "onEngineExit");
     }
 }
 
-/// `runNode(cfgJson: String, tunFd: int) -> String`. Starts the full node engine on
+/// Publish only engine-applied route state; the service fences stale generations.
+fn report_routes(generation: jlong, json: &str) -> std::io::Result<()> {
+    let (Some(vm), Some(class)) = (JVM.get(), NODE_CLASS.get()) else {
+        return Err(std::io::Error::other("JVM/class unavailable"));
+    };
+    let mut env = vm.attach_current_thread().map_err(std::io::Error::other)?;
+    let value = match env.new_string(json) {
+        Ok(value) => value,
+        Err(error) => {
+            clear_upcall_exception(&mut env, "onRoutes/new_string");
+            return Err(std::io::Error::other(error));
+        }
+    };
+    if let Err(error) = env.call_static_method(class, "onRoutes", "(JLjava/lang/String;)V", &[JValue::Long(generation), JValue::Object(&value)]) {
+        tracing::error!(%error, "[jni] onRoutes upcall failed");
+        clear_upcall_exception(&mut env, "onRoutes");
+        return Err(std::io::Error::other(error));
+    }
+    Ok(())
+}
+
+/// `runNode(cfgJson: String, tunFd: int, generation: long) -> String`. Starts the full node engine on
 /// a background thread with its own multi-thread runtime, adopting `tunFd`. Returns
 /// a JSON status immediately (the engine runs until `stopNode` or error).
 #[unsafe(no_mangle)]
@@ -111,6 +154,7 @@ pub extern "system" fn Java_dev_fluxpeer_fluxpeer_FluxpeerNode_runNode<'l>(
     class: JClass<'l>,
     cfg_json: JString<'l>,
     tun_fd: jint,
+    generation: jlong,
 ) -> jstring {
     // Cache the class so the worker-thread protect callback can reach Kotlin.
     if NODE_CLASS.get().is_none()
@@ -124,34 +168,49 @@ pub extern "system" fn Java_dev_fluxpeer_fluxpeer_FluxpeerNode_runNode<'l>(
     };
     let fd = tun_fd as RawFd;
 
+    let mut slot = STOP.lock();
+    if slot.is_some() {
+        return jstr(&mut env, "{\"error\":\"previous engine must be stopped first\"}");
+    }
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-    *STOP.lock() = Some(stop_tx);
 
     let spawned = std::thread::Builder::new().name("fp-node".into()).spawn(move || {
+        // SAFETY: a successfully spawned engine exclusively owns the detached
+        // VpnService fd. Keep it guarded even if STOP wins before the first poll.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
             Ok(rt) => rt,
             Err(e) => {
                 tracing::error!("[fp-node] tokio runtime build failed: {e}");
+                engine_exited(generation);
                 return;
             }
         };
         rt.block_on(async move {
             let protect: fluxpeer_node::ProtectFn = Arc::new(protect_socket);
+            let routes: fluxpeer_node::mobile::RoutesFn = Arc::new(move |json| report_routes(generation, json));
+            let engine = async move {
+                fluxpeer_node::run_embedded_with_routes(&cfg, fd.into_raw_fd(), Some(protect), Some(routes)).await
+            };
             tokio::select! {
-                r = fluxpeer_node::run_embedded(&cfg, fd, Some(protect)) => {
+                r = engine => {
                     // The engine ended by itself (error / lost its last path). Tell the
                     // service so it tears down instead of showing a stale "connected".
                     tracing::warn!(?r, "[fp-node] engine exited");
-                    engine_exited();
+                    engine_exited(generation);
                 }
                 // stopNode: the select cancels run_embedded; expected, no upcall.
                 _ = stop_rx => tracing::info!("[fp-node] stop requested"),
             }
         });
+        crate::runtime::shutdown(rt);
     });
 
     match spawned {
-        Ok(_) => jstr(&mut env, "{\"ok\":true}"),
+        Ok(thread) => {
+            *slot = Some(EngineThread { stop: stop_tx, thread });
+            jstr(&mut env, "{\"ok\":true}")
+        }
         Err(e) => jstr(&mut env, &format!("{{\"error\":\"spawn failed: {e}\"}}")),
     }
 }
@@ -162,7 +221,13 @@ pub extern "system" fn Java_dev_fluxpeer_fluxpeer_FluxpeerNode_stopNode<'l>(
     _env: JNIEnv<'l>,
     _class: JClass<'l>,
 ) {
-    if let Some(tx) = STOP.lock().take() {
-        let _ = tx.send(());
+    // Kotlin invokes this on its serialized worker, never the UI thread. Keep
+    // the slot locked through join so a replacement cannot overlap old sockets.
+    let mut slot = STOP.lock();
+    if let Some(engine) = slot.take() {
+        let _ = engine.stop.send(());
+        if engine.thread.join().is_err() {
+            tracing::error!("[fp-node] engine thread failed during stop");
+        }
     }
 }

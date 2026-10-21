@@ -33,6 +33,7 @@ use tokio::sync::mpsc;
 mod apply;
 mod config;
 mod control;
+pub mod mobile;
 mod daemon;
 mod dns;
 mod firewall;
@@ -69,6 +70,8 @@ type AllowedMap = Arc<arc_swap::ArcSwap<worker::RouteTable>>;
 /// receive (fail-closed). Endpoint-only roaming is left to wg/disco; the tcp-direct
 /// middle rung is not live-updated (a new peer still gets udp-direct + relay).
 struct Reconciler {
+    platform: mobile::Reporter,
+    terminal_control: Option<std::io::Error>,
     client: fluxpeer_sdk::Client,
     device_id: String,
     n: usize,
@@ -524,12 +527,23 @@ impl Reconciler {
             }
             let result = self.reconcile_tick().await;
             self.apply_status.lock().complete(self.desired_epoch, result);
+            if let Some(error) = self.terminal_control.take() {
+                return Err(error);
+            }
         }
     }
 
     async fn reconcile_tick(&mut self) -> ApplyResult {
         let applied_epoch = self.apply_status.lock().applied_epoch;
-        if let Some(snap) = control::poll_peers_if_changed(&self.client, &self.device_id, applied_epoch).await { self.pending = Some(snap); }
+        match control::poll_peers_if_changed(&self.client, &self.device_id, applied_epoch).await {
+            Ok(Some(snap)) => self.pending = Some(snap),
+            Ok(None) => {}
+            Err(error) => {
+                let failure = ApplyError::new(&["control", "device-config"], error.to_string());
+                self.terminal_control = Some(error);
+                return Err(failure);
+            }
+        }
         self.reconcile_effects().await
     }
 
@@ -540,13 +554,15 @@ impl Reconciler {
         let epoch = self.desired_epoch;
         let self_exit = self.self_exit;
         let effects = apply::blocking(move || host.tick(epoch, &peers, self_exit)).await;
-        apply::all([membership, effects])
+        apply::all([membership, effects])?;
+        self.platform.applied(&self.desired).map_err(|e| ApplyError::new(&["mobile", "onRoutes"], e.to_string()))
     }
 
     async fn apply_pending(&mut self) -> ApplyResult {
         if let Some(snap) = self.pending.as_ref() {
             self.desired_epoch = snap.epoch;
             self.self_exit = snap.self_exit;
+            self.platform.config = snap.platform.clone();
             let (_, desired) = control::apply_use_exit(&snap.peers, self.use_exit.as_deref(), self.relay_available);
             let host = self.host.clone();
             let epoch = snap.epoch;
@@ -709,7 +725,7 @@ fn bind_reuse_udp(port: u16) -> std::io::Result<UdpSocket> {
 /// Bring up the tunnels from a config FILE (desktop/server: we create the device).
 pub async fn run(cfg_path: &str) -> std::io::Result<()> {
     let cfg: Config = serde_json::from_slice(&std::fs::read(cfg_path)?)?;
-    run_with(cfg, None).await
+    run_with(cfg, None, None).await
 }
 
 /// EMBEDDED entry (mobile): run the SAME node engine from an inline config JSON,
@@ -717,12 +733,21 @@ pub async fn run(cfg_path: &str) -> std::io::Result<()> {
 /// instead of creating a device. `protect` excludes egress sockets from the VPN.
 /// This is what makes a phone a first-class mesh peer — same data plane as the CLI.
 pub async fn run_embedded(cfg_json: &str, tun_fd: i32, protect: Option<ProtectFn>) -> std::io::Result<()> {
-    let mut cfg: Config = serde_json::from_str(cfg_json).map_err(std::io::Error::other)?;
-    cfg.tun_fd = Some(tun_fd);
-    run_with(cfg, protect).await
+    run_embedded_with_routes(cfg_json, tun_fd, protect, None).await
 }
 
-async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()> {
+/// Embedded entry with an applied-route observer for the platform VPN owner.
+pub async fn run_embedded_with_routes(cfg_json: &str, tun_fd: i32, protect: Option<ProtectFn>, routes: Option<mobile::RoutesFn>) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mut fd_guard = InjectedFdGuard(Some(tun_fd));
+    let mut cfg: Config = serde_json::from_str(cfg_json).map_err(std::io::Error::other)?;
+    cfg.tun_fd = Some(tun_fd);
+    #[cfg(unix)]
+    fd_guard.disarm(); // run_with takes ownership on its first poll below
+    run_with(cfg, protect, routes).await
+}
+
+async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile::RoutesFn>) -> std::io::Result<()> {
     let own_priv = StaticSecret::from(hex32(&cfg.private_key));
     let own_pub = PublicKey::from(&own_priv);
 
@@ -756,34 +781,53 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
 
     // Pull the relay directory from coordination. Local cfg fields, if set, still
     // override it — so a node needs zero relay/STUN config in the common case.
-    let relays_dir = fetch_relays(&cfg).await;
-    let dir0 = relays_dir.first();
-    // Relay candidates for failover: a hand-written cfg.relay overrides the
-    // directory entirely; otherwise use every directory relay (dial order).
-    let relay_targets: Vec<RelayTarget> = match cfg.relay.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()) {
-        Some(a) => vec![RelayTarget {
-            addr: a,
-            anytls: cfg.relay_anytls,
-            bond: cfg.relay_bond,
-            bond_links: cfg.relay_bond_links,
-            node_id: cfg
-                .relay_node_id
-                .clone()
-                .unwrap_or_else(|| "fluxpeer-relay".to_string()),
-        }],
-        None => relays_dir
-            .iter()
-            .filter_map(|d| {
-                Some(RelayTarget {
-                    addr: d.url.parse().ok()?,
-                    anytls: d.anytls,
-                    bond: cfg.relay_bond,
-                    bond_links: cfg.relay_bond_links,
-                    node_id: d.node_id.clone(),
+    let mut relay_backoff = mobile::Backoff::default();
+    let (relays_dir, relay_targets) = loop {
+        let relays_dir = match fetch_relays(&cfg).await {
+            Ok(directory) => directory,
+            Err(error) if control::terminal_control_error(&error) => return Err(error),
+            Err(error) if cfg.force_relay || cfg.tun_fd.is_some() => {
+                tracing::warn!(%error, "relay directory unavailable; retrying");
+                relay_backoff.wait().await;
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "relay directory unavailable; continuing direct-only");
+                Vec::new()
+            }
+        };
+        // Relay candidates for failover: a hand-written cfg.relay overrides the
+        // directory entirely; otherwise use every directory relay (dial order).
+        let relay_targets: Vec<RelayTarget> = match cfg.relay.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()) {
+            Some(a) => vec![RelayTarget {
+                addr: a,
+                anytls: cfg.relay_anytls,
+                bond: cfg.relay_bond,
+                bond_links: cfg.relay_bond_links,
+                node_id: cfg
+                    .relay_node_id
+                    .clone()
+                    .unwrap_or_else(|| "fluxpeer-relay".to_string()),
+            }],
+            None => relays_dir
+                .iter()
+                .filter(|d| control::relay_transport_matches(cfg.force_relay, d.anytls, cfg.relay_anytls, cfg.relay_bond))
+                .filter_map(|d| {
+                    Some(RelayTarget {
+                        addr: d.url.parse().ok()?,
+                        anytls: d.anytls,
+                        bond: cfg.relay_bond,
+                        bond_links: cfg.relay_bond_links,
+                        node_id: d.node_id.clone(),
+                    })
                 })
-            })
-            .collect(),
+                .collect(),
+        };
+        if !cfg.force_relay || !relay_targets.is_empty() { break (relays_dir, relay_targets); }
+        tracing::warn!("forced relay transport unavailable; retrying directory");
+        relay_backoff.wait().await;
     };
+    let dir0 = relays_dir.first();
     let eff_stun: Option<SocketAddr> = cfg
         .stun_server
         .as_deref()
@@ -805,13 +849,16 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
             tracing::info!(%reflexive, "STUN: learned reflexive (public) address");
             a.push(reflexive.to_string());
         }
-        if let Some(ip) = local_ipv4_toward(&url_host(&cfg.control_server)) {
+        // The OS resolver may block; keep it off the cancellable engine future.
+        let control_host = url_host(&cfg.control_server);
+        if let Some(ip) = tokio::task::spawn_blocking(move || local_ipv4_toward(&control_host)).await.map_err(std::io::Error::other)? {
             a.push(format!("{ip}:{}", cfg.listen_port));
         }
         a
     };
 
-    let (r, init_epoch) = resolve_from_control(&cfg, &advertise).await?;
+    let (r, init_epoch) = mobile::retry_control(cfg.tun_fd.is_some(), || resolve_from_control(&cfg, &advertise)).await?;
+    let mut platform = mobile::Reporter::new(r.platform.clone(), routes);
 
     // AD-2 (consumer exit contract): split-tunnel BY DEFAULT — strip every
     // peer's default prefixes (`0.0.0.0/0`, `::/0`) unless the local `use_exit`
@@ -1276,8 +1323,11 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
     // receive (fail-closed). Endpoint-only roaming is left to wg/disco; the
     // tcp-direct middle rung is not live-updated (a new peer still gets udp-direct +
     // relay; revoked peers lose their session regardless). ---
+    if apply_status.lock().applied_epoch == Some(init_epoch) { platform.applied(&desired_peers)?; }
     let mut reconciler = tokio::spawn(
         Reconciler {
+            platform,
+            terminal_control: None,
             client: crate::control::mk_client(&cfg),
             device_id: cfg.device_id.clone(),
             n,
@@ -1425,6 +1475,8 @@ mod exit_contract_tests {
     fn test_reconciler(host: HostEffects, old: control::PeerInfo, new: control::PeerInfo, tx: mpsc::Sender<worker::WorkerMsg>) -> Reconciler {
         let reg = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([(old.pubkey, status::PeerStat::new(old.allowed_ips.clone()))])));
         Reconciler {
+            platform: mobile::Reporter::default(),
+            terminal_control: None,
             // An unsupported URL makes polling fail locally; pending snapshots
             // must still be applied without a server or a live node.
             client: fluxpeer_sdk::Client::with_password("unsupported://control", ""), device_id: "test".into(), n: 1,
@@ -1433,7 +1485,7 @@ mod exit_contract_tests {
             status_reg: reg, wtxs: vec![tx], ordinal: 1,
             known: KnownPeers::from([(old.pubkey, (0, old.candidates.clone(), old.allowed_ips.clone()))]),
             desired_epoch: 1, apply_status: Arc::default(), host: Arc::new(host), use_exit: None, relay_available: false,
-            desired: vec![old], pending: Some(control::Snapshot { epoch: 2, peers: vec![new], self_exit: false }), self_exit: false,
+            desired: vec![old], pending: Some(control::Snapshot { platform: serde_json::Value::Null, epoch: 2, peers: vec![new], self_exit: false }), self_exit: false,
         }
     }
 
@@ -1450,6 +1502,9 @@ mod exit_contract_tests {
         let old = peer(1, "192.0.2.1:1", &["100.72.16.2/32"]);
         let new = peer(1, "192.0.2.2:2", &["100.72.16.2/32", "10.0.0.0/8"]);
         let mut r = test_reconciler(host, old, new.clone(), tx);
+        let reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = reports.clone();
+        r.platform.callback = Some(Arc::new(move |_| { captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst); Ok(()) }));
         r.apply_status.lock().complete(1, Ok(()));
         let result = r.reconcile_tick().await;
         r.apply_status.lock().complete(r.desired_epoch, result);
@@ -1462,6 +1517,26 @@ mod exit_contract_tests {
         calls.lock().clear();
         assert!(r.reconcile_tick().await.is_err());
         assert_eq!(*calls.lock(), [HostStage::Exit, HostStage::Nat]); // failed effects respect independent backoff
+        assert_eq!(reports.load(std::sync::atomic::Ordering::SeqCst), 0); // failed config is never exported
+    }
+
+    #[tokio::test]
+    async fn successful_reconcile_exports_applied_exit_and_propagates_callback_failure() {
+        let (tx, _rx) = mpsc::channel(8);
+        let peer = peer(1, "192.0.2.1:1", &["100.72.16.2/32", "0.0.0.0/0"]);
+        let mut r = test_reconciler(test_host(), peer.clone(), peer, tx);
+        r.use_exit = Some("auto".into());
+        let reports = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let capture = reports.clone();
+        r.platform.callback = Some(Arc::new(move |json| {
+            capture.lock().push(serde_json::from_str::<serde_json::Value>(json)?);
+            Ok(())
+        }));
+        r.reconcile_effects().await.unwrap();
+        assert_eq!(reports.lock().len(), 1);
+        assert_eq!(reports.lock()[0]["selected_exit"], hex::encode([1; 32]));
+        r.platform = mobile::Reporter::new(serde_json::json!({"mtu":1400}), Some(Arc::new(|_| Err(std::io::Error::other("JNI unavailable")))));
+        assert!(r.reconcile_effects().await.unwrap_err().stderr.contains("JNI unavailable"));
     }
 
     #[tokio::test]
@@ -1551,6 +1626,8 @@ mod exit_contract_tests {
         let (tx, rx) = mpsc::channel(4);
         drop(rx); // Worker dispatch fails before either change may be acknowledged.
         let mut r = Reconciler {
+            platform: mobile::Reporter::default(),
+            terminal_control: None,
             client: fluxpeer_sdk::Client::with_password("http://127.0.0.1:1", ""),
             device_id: "test".into(), n: 1,
             own_pub: PublicKey::from(&StaticSecret::from([42; 32])),
@@ -1559,7 +1636,7 @@ mod exit_contract_tests {
             status_reg: reg, wtxs: vec![tx], ordinal: 1,
             known: KnownPeers::from([(old.pubkey, (0, old.candidates.clone(), old.allowed_ips.clone()))]),
             desired_epoch: 1, apply_status: Arc::default(), host: Arc::new(test_host()), use_exit: None, relay_available: false,
-            desired: vec![old.clone()], pending: Some(control::Snapshot { epoch: 2, peers: vec![new.clone()], self_exit: false }), self_exit: false,
+            desired: vec![old.clone()], pending: Some(control::Snapshot { platform: serde_json::Value::Null, epoch: 2, peers: vec![new.clone()], self_exit: false }), self_exit: false,
         };
         r.apply_status.lock().complete(1, Ok(()));
         let result = r.apply_pending().await;
