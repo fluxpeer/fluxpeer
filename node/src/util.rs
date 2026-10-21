@@ -123,22 +123,19 @@ pub(crate) fn netmask_v4(prefix: u8) -> Ipv4Addr {
     Ipv4Addr::from(bits)
 }
 
-/// Whether `ip` falls inside the IPv4 `cidr` (e.g. "100.72.16.5/32").
-pub(crate) fn ip_in_cidr(ip: Ipv4Addr, cidr: &str) -> bool {
-    let (net, plen) = match cidr.split_once('/') {
-        Some((n, p)) => (n, p.parse::<u8>().unwrap_or(32)),
-        None => (cidr, 32),
-    };
-    let Ok(net) = net.parse::<Ipv4Addr>() else { return false };
-    // plen 0 ⇒ match everything (0.0.0.0/0, the exit node). `u32::MAX << 32` is NOT 0
-    // in Rust — the shift amount is masked to 5 bits — so /0 must be special-cased,
-    // else a full-tunnel peer matches nothing and internet traffic is never routed.
-    let mask = match plen {
-        0 => 0,
-        p if p >= 32 => u32::MAX,
-        p => u32::MAX << (32 - p),
-    };
-    (u32::from(ip) & mask) == (u32::from(net) & mask)
+/// Longest-prefix-match primitive: if `ip` falls inside `cidr`, return the
+/// cidr's prefix length (higher = more specific), else `None`. Works for both
+/// IPv4 and IPv6 CIDRs; a missing `/plen` means an exact host route (/32 or
+/// /128). Malformed CIDRs and address-family mismatches never match.
+///
+/// plen 0 matches everything of that family (0.0.0.0/0, ::/0 — the exit node).
+/// Shifts are guarded explicitly: `u32::MAX << 32` is NOT 0 in Rust (the shift
+/// amount is masked), so /0 must be special-cased, else a full-tunnel peer
+/// matches nothing and internet traffic is never routed.
+#[cfg(test)]
+pub(crate) fn cidr_match_len(ip: IpAddr, cidr: &str) -> Option<u8> {
+    let prefix = cidr.parse::<fluxpeer_sdk::prefix::IpPrefix>().ok()?;
+    prefix.contains(ip).then_some(prefix.length())
 }
 
 /// Primary local IPv4 on the route toward `host` (no packets sent).
@@ -152,12 +149,12 @@ pub(crate) fn local_ipv4_toward(host: &str) -> Option<Ipv4Addr> {
 }
 
 pub(crate) fn url_host(url: &str) -> String {
-    url.trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split(['/', ':'])
-        .next()
-        .unwrap_or("")
-        .to_string()
+    let authority = url.trim_start_matches("http://").trim_start_matches("https://").split('/').next().unwrap_or("");
+    if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("").to_string()
+    } else {
+        authority.split(':').next().unwrap_or("").to_string()
+    }
 }
 
 /// Little-endian u32 at offset `off` (wg session indices), if in bounds.
@@ -233,6 +230,37 @@ mod tests {
         tampered[last] ^= 0xff;
         let tbody = tampered.strip_prefix(DISCO_MAGIC).unwrap();
         assert!(!disco_authed(&a_key, &tampered, tbody, used));
+    }
+
+    #[test]
+    fn cidr_match_len_v4_basics() {
+        let ip = IpAddr::V4(Ipv4Addr::new(100, 72, 16, 5));
+        assert_eq!(cidr_match_len(ip, "100.72.16.5/32"), Some(32));
+        assert_eq!(cidr_match_len(ip, "100.72.16.0/24"), Some(24));
+        assert_eq!(cidr_match_len(ip, "100.64.0.0/10"), Some(10));
+        // plen 0 matches everything of the family (the exit-node default).
+        assert_eq!(cidr_match_len(ip, "0.0.0.0/0"), Some(0));
+        assert_eq!(cidr_match_len(ip, "10.0.0.0/8"), None);
+        // Host route without a prefix = /32 exact.
+        assert_eq!(cidr_match_len(ip, "100.72.16.5"), Some(32));
+        assert_eq!(cidr_match_len(ip, "100.72.16.6"), None);
+        // Malformed never matches.
+        assert_eq!(cidr_match_len(ip, "100.72.16.0/33"), None);
+        assert_eq!(cidr_match_len(ip, "not-a-cidr"), None);
+        // Family mismatch never matches.
+        assert_eq!(cidr_match_len(ip, "::/0"), None);
+    }
+
+    #[test]
+    fn cidr_match_len_v6_basics() {
+        let ip: IpAddr = "fd72:15ab:0:1::64".parse().expect("v6 addr");
+        assert_eq!(cidr_match_len(ip, "fd72:15ab:0:1::64/128"), Some(128));
+        assert_eq!(cidr_match_len(ip, "fd72:15ab::/48"), Some(48));
+        assert_eq!(cidr_match_len(ip, "::/0"), Some(0));
+        assert_eq!(cidr_match_len(ip, "fe00::/8"), None);
+        assert_eq!(cidr_match_len(ip, "fd72:15ab::/129"), None);
+        // v4 default does not match v6 traffic.
+        assert_eq!(cidr_match_len(ip, "0.0.0.0/0"), None);
     }
 
     #[test]

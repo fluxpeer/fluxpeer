@@ -58,16 +58,30 @@ pub(crate) struct Config {
     pub(crate) mtu: Option<i32>,
     #[serde(default)]
     pub(crate) dns: Vec<String>,
-    /// This device acts as an EXIT NODE: enable IP forwarding + NAT masquerade so
-    /// peers routing 0.0.0.0/0 through it actually egress to the internet. This flag
-    /// only sets up the LOCAL forwarding/NAT — for peers to actually route through it,
-    /// an admin must additionally advertise + approve the `0.0.0.0/0` route for this
-    /// device at the control-server (`POST /devices/:id/routes {"prefix":"0.0.0.0/0"}`
-    /// then `POST /routes/:id/approve`, or the equivalent CLI / admin-lite action).
-    /// Declaring a node as everyone's exit is privileged, so it is deliberately NOT
-    /// self-service: the node cannot advertise the route itself (admin-gated).
+    /// Local override for acting as an EXIT NODE (IP forwarding + NAT masquerade,
+    /// so peers routing 0.0.0.0/0 through us actually egress to the internet).
+    ///
+    /// Tri-state (AD-1): `true` = force ON (legacy behavior, works even against
+    /// an old control-server); absent = follow the control-plane, which is the
+    /// single source of truth (NAT runs while this device has an APPROVED
+    /// default route — `self_exit` in the pulled config). A legacy JSON
+    /// `"exit_node": false` migrates to absent (see `de_exit_node`); an explicit
+    /// local refusal is `exit_veto` below. Writers (daemon/CLI) only ever write
+    /// `true` or remove the key.
+    #[serde(default, deserialize_with = "de_exit_node")]
+    pub(crate) exit_node: Option<bool>,
+    /// Explicit local VETO against being an exit: even when the control-plane
+    /// approved a default route for this device (`self_exit`), do NOT enable
+    /// forwarding/NAT. Wins over every other signal.
     #[serde(default)]
-    pub(crate) exit_node: bool,
+    pub(crate) exit_veto: bool,
+    /// Use an EXIT PEER for this device's own internet traffic (full-tunnel).
+    /// `None`/`"off"` = split-tunnel (default): all peers' default prefixes are
+    /// stripped. `"auto"` = pick the first exit-capable peer (pubkey order) with
+    /// a known endpoint or a configured relay.
+    /// `"<pubkey hex>"` = pin that exit peer; unknown/non-exit ⇒ error + split.
+    #[serde(default)]
+    pub(crate) use_exit: Option<String>,
     /// Subnets to EXCLUDE from the tunnel (split-exclude). Only meaningful when a
     /// peer is an exit node (AllowedIPs 0.0.0.0/0, full-tunnel): these CIDRs get a
     /// more-specific bypass route via the original physical gateway, so they keep
@@ -84,6 +98,27 @@ pub(crate) struct Config {
     /// owns those), so a phone is a first-class mesh node, not a thin gateway client.
     #[serde(default)]
     pub(crate) tun_fd: Option<i32>,
+}
+
+/// Backward-compatible `exit_node` deserialization (AD-1 migration): a legacy
+/// `"exit_node": false` meant "not forced on", which under the new tri-state is
+/// simply ABSENT (follow the control-plane) — the explicit refusal moved to
+/// `exit_veto`. So only `true` survives as `Some(true)`.
+fn de_exit_node<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<bool>::deserialize(d)?.filter(|b| *b))
+}
+
+impl Config {
+    /// Whether THIS device runs forwarding/NAT as an exit right now, given the
+    /// control-plane's `self_exit` (this device has an approved default route).
+    /// Precedence (AD-1): `exit_veto` > `exit_node` (force on/off) > `self_exit`.
+    #[cfg(test)]
+    pub(crate) fn nat_on(&self, self_exit: bool) -> bool {
+        crate::nat_on(self.exit_node, self.exit_veto, self_exit)
+    }
 }
 
 /// Generate a fresh x25519 keypair, returning `(private_hex, public_hex)`. Shared by
@@ -105,4 +140,71 @@ pub fn keygen() {
     let (priv_hex, pub_hex) = keypair();
     println!("private_key = {priv_hex}");
     println!("public_key  = {pub_hex}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_json(extra: &str) -> String {
+        format!(
+            r#"{{
+                "private_key": "{sk}", "device_id": "d1",
+                "control_server": "http://127.0.0.1:8080",
+                "listen_port": 51820, "tun_name": "fp0", "prefix_len": 24
+                {extra}
+            }}"#,
+            sk = "00".repeat(32),
+        )
+    }
+
+    fn parse(extra: &str) -> Config {
+        serde_json::from_str(&cfg_json(extra)).expect("config parses")
+    }
+
+    #[test]
+    fn legacy_exit_node_false_migrates_to_absent() {
+        // Old configs wrote `"exit_node": false`; that now means "follow the
+        // control-plane", NOT an explicit veto.
+        let c = parse(r#", "exit_node": false"#);
+        assert_eq!(c.exit_node, None);
+        assert!(!c.exit_veto);
+        assert!(c.nat_on(true)); // follows self_exit
+        assert!(!c.nat_on(false));
+    }
+
+    #[test]
+    fn exit_node_true_forces_on_regardless_of_control() {
+        let c = parse(r#", "exit_node": true"#);
+        assert_eq!(c.exit_node, Some(true));
+        assert!(c.nat_on(false)); // forced on even without an approved route
+        assert!(c.nat_on(true));
+    }
+
+    #[test]
+    fn absent_exit_node_follows_control() {
+        let c = parse("");
+        assert_eq!(c.exit_node, None);
+        assert!(c.nat_on(true));
+        assert!(!c.nat_on(false));
+    }
+
+    #[test]
+    fn exit_veto_wins_over_everything() {
+        let c = parse(r#", "exit_node": true, "exit_veto": true"#);
+        assert!(!c.nat_on(true));
+        assert!(!c.nat_on(false));
+        let c = parse(r#", "exit_veto": true"#);
+        assert!(!c.nat_on(true));
+    }
+
+    #[test]
+    fn use_exit_defaults_to_split() {
+        let c = parse("");
+        assert_eq!(c.use_exit, None);
+        let c = parse(r#", "use_exit": "auto""#);
+        assert_eq!(c.use_exit.as_deref(), Some("auto"));
+        let c = parse(r#", "use_exit": "off""#);
+        assert_eq!(c.use_exit.as_deref(), Some("off"));
+    }
 }

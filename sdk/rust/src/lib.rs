@@ -4,6 +4,8 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
+pub mod prefix;
+pub mod types;
 pub mod wgconf;
 
 /// Default control-server base URL.

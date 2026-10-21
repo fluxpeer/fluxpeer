@@ -228,3 +228,112 @@ async fn persistent_http_enroll_loop_on_sqlite() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+/// Exit contract over HTTP (AD-1/AD-2): approving a `0.0.0.0/0` route flips
+/// `self_exit` in the exit device's own config and `exit` in every peer's view;
+/// deleting the route revokes both.
+#[tokio::test]
+async fn exit_flags_over_http_follow_default_route_approval() {
+    unsafe { std::env::set_var("FLUXPEER_ADMIN_PASSWORD", "test") };
+    let store = Arc::new(
+        SqlStore::connect("sqlite:file:memhttp_exit?mode=memory&cache=shared")
+            .await
+            .unwrap(),
+    );
+    let app = sql_router(store);
+
+    let resp = app
+        .clone()
+        .oneshot(post("/api/v1/networks", json!({"name": "exit-net"})))
+        .await
+        .unwrap();
+    let net_id = body_json(resp).await["id"].as_str().unwrap().to_string();
+    let resp = app
+        .clone()
+        .oneshot(post(
+            &format!("/api/v1/networks/{net_id}/invites"),
+            json!({"max_uses": 3}),
+        ))
+        .await
+        .unwrap();
+    let code = body_json(resp).await["code"].as_str().unwrap().to_string();
+
+    let resp = enroll_pop(&app, &code, "exit", 11).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let exit_dev = body_json(resp).await;
+    let exit_id = exit_dev["id"].as_str().unwrap().to_string();
+    let exit_token = exit_dev["auth_token"].as_str().unwrap().to_string();
+    let resp = enroll_pop(&app, &code, "client", 12).await;
+    let client_dev = body_json(resp).await;
+    let client_id = client_dev["id"].as_str().unwrap().to_string();
+    let client_token = client_dev["auth_token"].as_str().unwrap().to_string();
+
+    async fn config(app: &axum::Router, id: &str, token: &str) -> Value {
+        let resp = app
+            .clone()
+            .oneshot(get_dev(&format!("/api/v1/devices/{id}/config"), token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp).await
+    }
+    let peer_exit = |cfg: &Value| -> bool {
+        cfg["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["wg_public_key"].as_str() == Some(keypair(11).1.as_str()))
+            .map(|p| p["exit"].as_bool().unwrap_or(false))
+            .unwrap_or(false)
+    };
+
+    // Baseline: no default route → no exit flags.
+    let cfg = config(&app, &exit_id, &exit_token).await;
+    assert_eq!(cfg["self_exit"], false);
+    let cfg = config(&app, &client_id, &client_token).await;
+    assert!(!peer_exit(&cfg));
+
+    // Reject invalid CIDRs; canonicalize host bits and noncanonical defaults.
+    for prefix in ["1.2.3.4/33", "::/129", "not-a-prefix", "192.0.2.1"] {
+        let resp = app.clone().oneshot(post(&format!("/api/v1/devices/{exit_id}/routes"), json!({"prefix": prefix}))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{prefix}");
+    }
+    for (prefix, expected) in [("10.2.3.4/8", "10.0.0.0/8"), ("2001:db8::7/32", "2001:db8::/32")] {
+        let resp = app.clone().oneshot(post(&format!("/api/v1/devices/{exit_id}/routes"), json!({"prefix": prefix}))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let route = body_json(resp).await;
+        assert_eq!(route["prefix"], expected);
+        let id = route["id"].as_str().unwrap();
+        assert_eq!(app.clone().oneshot(del(&format!("/api/v1/routes/{id}"))).await.unwrap().status(), StatusCode::NO_CONTENT);
+    }
+    let resp = app.clone().oneshot(post(
+        &format!("/api/v1/devices/{exit_id}/routes"), json!({"prefix": "1.2.3.4/00"}),
+    )).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let route = body_json(resp).await;
+    assert_eq!(route["prefix"], "0.0.0.0/0");
+    let route_id = route["id"].as_str().unwrap().to_string();
+    let resp = app
+        .clone()
+        .oneshot(post(&format!("/api/v1/routes/{route_id}/approve"), json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let cfg = config(&app, &exit_id, &exit_token).await;
+    assert_eq!(cfg["self_exit"], true, "approved default route must set self_exit");
+    let cfg = config(&app, &client_id, &client_token).await;
+    assert!(peer_exit(&cfg), "peer view must mark the exit device");
+
+    // Revoke (delete) → both flags off again.
+    let resp = app
+        .clone()
+        .oneshot(del(&format!("/api/v1/routes/{route_id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let cfg = config(&app, &exit_id, &exit_token).await;
+    assert_eq!(cfg["self_exit"], false);
+    let cfg = config(&app, &client_id, &client_token).await;
+    assert!(!peer_exit(&cfg));
+}

@@ -6,7 +6,10 @@
 //! invite → enroll device (allocate stable IP) → list → revoke. Peer-level
 //! revocation bumps the network `config_epoch` so clients resync.
 
-use crate::domain::{Device, DeviceConfig, DeviceStatus, ImportDevice, ImportResult, Invite, Network, PeerConfig, RelayNode, Route};
+use crate::domain::{
+    Device, DeviceConfig, DeviceStatus, ImportDevice, ImportResult, Invite, Network, PeerConfig, RelayNode, Route,
+    is_default_prefix, normalize_prefix,
+};
 use crate::ipam::{Ipam, IpamError};
 use parking_lot::Mutex;
 use portable_atomic::AtomicU64;
@@ -21,6 +24,7 @@ pub enum StoreError {
     NetworkNotFound,
     DeviceNotFound,
     RouteNotFound,
+    InvalidPrefix,
     InvalidInvite,
     PoolExhausted,
 }
@@ -276,7 +280,7 @@ impl Store {
             id: format!("route-{}", self.next_seq()),
             network_id: dev.network_id,
             device_id: device_id.to_string(),
-            prefix: prefix.to_string(),
+            prefix: normalize_prefix(prefix).ok_or(StoreError::InvalidPrefix)?,
             approved: false,
         };
         g.routes.insert(route.id.clone(), route.clone());
@@ -295,6 +299,17 @@ impl Store {
             None => return Err(StoreError::RouteNotFound),
         };
         bump_epoch(&mut g, &network_id);
+        Ok(())
+    }
+
+    /// Delete a route (revoke). Bumps the epoch only if it was approved (i.e. in
+    /// the config) so nodes reconcile its removal. Mirrors the SQL store.
+    pub fn delete_route(&self, route_id: &str) -> Result<(), StoreError> {
+        let mut g = self.inner.lock();
+        let r = g.routes.remove(route_id).ok_or(StoreError::RouteNotFound)?;
+        if r.approved {
+            bump_epoch(&mut g, &r.network_id);
+        }
         Ok(())
     }
 
@@ -392,10 +407,16 @@ impl Store {
                         allowed_ips.push(prefix.clone());
                     }
                 }
+                // Exit-ness (AD-1/AD-2): an approved default route makes this peer
+                // an exit; the control-plane is the single source of truth.
+                let exit = approved
+                    .iter()
+                    .any(|(did, prefix)| did == &d.id && is_default_prefix(prefix));
                 PeerConfig {
                     wg_public_key: d.wg_public_key.clone(),
                     allowed_ips,
                     endpoints: g.endpoints.get(&d.id).cloned().unwrap_or_default(),
+                    exit,
                 }
             })
             .collect();
@@ -406,6 +427,9 @@ impl Store {
             .filter(|r| r.network_id.as_deref() == Some(me.network_id.as_str()) || r.network_id.is_none())
             .cloned()
             .collect();
+        let self_exit = approved
+            .iter()
+            .any(|(did, prefix)| did == &me.id && is_default_prefix(prefix));
         Ok(DeviceConfig {
             network_id: me.network_id.clone(),
             config_epoch,
@@ -415,6 +439,7 @@ impl Store {
             relays,
             mtu: None,
             dns: Vec::new(),
+            self_exit,
         })
     }
 }
@@ -586,6 +611,49 @@ mod test {
         assert!(!has_prefix(&s)); // unapproved
         s.approve_route(&route.id).unwrap();
         assert!(has_prefix(&s)); // approved → distributed
+    }
+
+    #[test]
+    fn exit_flags_follow_default_route_approval() {
+        // AD-1/AD-2: approving `0.0.0.0/0` makes the device an exit — visible as
+        // `self_exit` in its own config and `exit` on its peer entry elsewhere.
+        let s = Store::new();
+        let net = s.create_network("n");
+        let inv = s.create_invite(&net.id, None, None).unwrap();
+        let exit_dev = s.enroll(&inv.code, "exit", "ke", 1000).unwrap();
+        let client = s.enroll(&inv.code, "laptop", "kl", 1000).unwrap();
+
+        let peer_exit = |s: &Store| {
+            s.device_config(&client.id)
+                .unwrap()
+                .peers
+                .iter()
+                .find(|p| p.wg_public_key == "ke")
+                .map(|p| p.exit)
+                .unwrap_or(false)
+        };
+        // No route yet: neither flag set.
+        assert!(!s.device_config(&exit_dev.id).unwrap().self_exit);
+        assert!(!peer_exit(&s));
+
+        // Advertised but UNAPPROVED: still no exit-ness.
+        let route = s.advertise_route(&exit_dev.id, "0.0.0.0/0").unwrap();
+        assert!(!s.device_config(&exit_dev.id).unwrap().self_exit);
+        assert!(!peer_exit(&s));
+
+        // Approved: both flags on (the default prefix stays in allowed_ips for
+        // backward compatibility with old nodes).
+        s.approve_route(&route.id).unwrap();
+        assert!(s.device_config(&exit_dev.id).unwrap().self_exit);
+        assert!(peer_exit(&s));
+        let cfg = s.device_config(&client.id).unwrap();
+        let p = cfg.peers.iter().find(|p| p.wg_public_key == "ke").unwrap();
+        assert!(p.allowed_ips.iter().any(|a| a == "0.0.0.0/0"));
+
+        // Revoked (route deleted): both flags off again.
+        s.delete_route(&route.id).unwrap();
+        assert!(!s.device_config(&exit_dev.id).unwrap().self_exit);
+        assert!(!peer_exit(&s));
     }
 
     #[test]

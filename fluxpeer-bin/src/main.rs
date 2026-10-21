@@ -45,6 +45,20 @@ enum Cmd {
         #[arg(long)]
         config_dir: Option<String>,
     },
+    /// Route this device's internet traffic through an EXIT PEER (full-tunnel).
+    /// `auto` picks an approved exit in pubkey order with an endpoint or relay
+    /// path; `off` returns to split-tunnel (the default); a 64-char hex
+    /// pubkey pins that exit (must exist and be an approved exit).
+    UseExit {
+        /// `auto`, `off`, or a peer pubkey (64 hex chars).
+        mode: String,
+        /// Apply to one interface only (default: every joined network).
+        #[arg(long)]
+        iface: Option<String>,
+        /// Config directory (default: /etc/fluxpeer).
+        #[arg(long)]
+        config_dir: Option<String>,
+    },
     /// Show live status of a running node (fluxpeer's `wg show`): per-peer
     /// transport, endpoint, latest handshake, transfer (rx/tx), rtt.
     Show {
@@ -101,6 +115,8 @@ enum NodeCmd {
 enum ExitState {
     On,
     Off,
+    Follow,
+    Veto,
 }
 
 impl ExitState {
@@ -174,10 +190,14 @@ async fn main() -> anyhow::Result<()> {
             NodeCmd::Run { config } => fluxpeer_node::run(&config).await?,
             NodeCmd::Keygen => fluxpeer_node::keygen(),
             NodeCmd::SetExit { state, config_dir } => {
-                let updated = fluxpeer_node::set_exit(&config_dir, state.enabled())?;
+                let updated = if matches!(state, ExitState::Veto) {
+                    fluxpeer_node::veto_exit(&config_dir)?
+                } else {
+                    fluxpeer_node::set_exit(&config_dir, state.enabled())?
+                };
                 println!(
                     "exit_node={} updated {updated} config(s)",
-                    if state.enabled() { "on" } else { "off" }
+                    match state { ExitState::On => "on", ExitState::Veto => "veto", _ => "follow" }
                 );
             }
         },
@@ -197,6 +217,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Networks { config_dir } => {
             fluxpeer_node::list_networks(&config_dir.unwrap_or_else(fluxpeer_node::config_dir))?
+        }
+        Cmd::UseExit {
+            mode,
+            iface,
+            config_dir,
+        } => {
+            let dir = config_dir.unwrap_or_else(fluxpeer_node::config_dir);
+            let updated = fluxpeer_node::set_use_exit(&dir, iface.as_deref(), &mode)?;
+            println!("use_exit={mode} updated {updated} config(s); restart the tunnel to apply");
         }
         Cmd::FwSelftest { cmd } => match cmd {
             FwSelftestCmd::Detect => fluxpeer_node::fw_selftest("detect", "", "")?,

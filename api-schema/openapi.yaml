@@ -234,6 +234,10 @@ components:
       properties:
         wg_public_key: { type: string }
         allowed_ips: { type: array, items: { type: string } }
+        endpoints: { type: array, items: { type: string } }
+        exit:
+          type: boolean
+          description: this peer has an approved default route (0.0.0.0/0 or ::/0)
     DeviceConfig:
       type: object
       properties:
@@ -242,3 +246,6 @@ components:
         address_v4: { type: string, nullable: true }
         address_v6: { type: string, nullable: true }
         peers: { type: array, items: { $ref: "#/components/schemas/PeerConfig" } }
+        self_exit:
+          type: boolean
+          description: this device itself has an approved default route (is an exit)

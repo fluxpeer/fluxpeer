@@ -67,6 +67,7 @@ async fn version() -> Json<VersionInfo> {
 fn store_status(e: StoreError) -> StatusCode {
     match e {
         StoreError::NetworkNotFound | StoreError::DeviceNotFound | StoreError::RouteNotFound => StatusCode::NOT_FOUND,
+        StoreError::InvalidPrefix => StatusCode::BAD_REQUEST,
         StoreError::InvalidInvite => StatusCode::FORBIDDEN,
         StoreError::PoolExhausted => StatusCode::CONFLICT,
     }
@@ -297,6 +298,10 @@ async fn advertise_route(
         .map_err(store_status)
 }
 
+async fn delete_route(State(s): State<Arc<Store>>, Path(route_id): Path<String>) -> Result<StatusCode, StatusCode> {
+    s.delete_route(&route_id).map(|_| StatusCode::NO_CONTENT).map_err(store_status)
+}
+
 async fn approve_route(
     State(store): State<Arc<Store>>,
     Path(route_id): Path<String>,
@@ -423,6 +428,7 @@ fn sql_status(e: SqlStoreError) -> StatusCode {
         SqlStoreError::NetworkNotFound | SqlStoreError::DeviceNotFound | SqlStoreError::RouteNotFound => {
             StatusCode::NOT_FOUND
         }
+        SqlStoreError::InvalidPrefix => StatusCode::BAD_REQUEST,
         SqlStoreError::InvalidInvite => StatusCode::FORBIDDEN,
         SqlStoreError::PoolExhausted => StatusCode::CONFLICT,
         SqlStoreError::BadPool(_) | SqlStoreError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -826,6 +832,7 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/devices/:id/watch", get(watch_device))
         .route("/devices/:id/routes", post(advertise_route))
         .route("/routes/:id/approve", post(approve_route))
+        .route("/routes/:id", delete(delete_route))
         .route("/networks/:id/resolve/:name", get(resolve_name))
         .route("/relays", post(register_relay))
         .route("/networks/:id/relays", get(list_relays))
@@ -863,6 +870,43 @@ mod test {
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn memory_http_normalizes_prefixes_and_delete_revokes_exit() {
+        let store = Arc::new(Store::new());
+        let network = store.create_network("test");
+        let invite = store.create_invite(&network.id, None, None).unwrap();
+        let exit = store.enroll(&invite.code, "exit", "exit-key", 1000).unwrap();
+        let client = store.enroll(&invite.code, "client", "client-key", 1000).unwrap();
+        let app = router(store.clone());
+        let uri = format!("/api/v1/devices/{}/routes", exit.id);
+        for invalid in ["1.2.3.4/33", "::/129", "bad/0", "192.0.2.1"] {
+            let resp = app.clone().oneshot(post(&uri, serde_json::json!({"prefix":invalid}))).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+        for (prefix, canonical) in [("1.2.3.4/00", "0.0.0.0/0"), ("2001:db8::1/00", "::/0"), ("10.2.3.4/8", "10.0.0.0/8")] {
+            let resp = app.clone().oneshot(post(&uri, serde_json::json!({"prefix":prefix}))).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let route = body_json(resp).await;
+            assert_eq!(route["prefix"], canonical);
+            let id = route["id"].as_str().unwrap();
+            let before = store.device_config(&exit.id).unwrap().config_epoch;
+            assert_eq!(app.clone().oneshot(post(&format!("/api/v1/routes/{id}/approve"), serde_json::json!({}))).await.unwrap().status(), StatusCode::NO_CONTENT);
+            let approved = store.device_config(&exit.id).unwrap();
+            assert!(approved.config_epoch > before);
+            assert_eq!(approved.self_exit, canonical.ends_with("/0"));
+            let peers = store.device_config(&client.id).unwrap().peers;
+            assert_eq!(peers.iter().find(|p| p.wg_public_key == "exit-key").unwrap().exit, canonical.ends_with("/0"));
+            let request = || axum::http::Request::builder().method("DELETE").uri(format!("/api/v1/routes/{id}"))
+                .body(axum::body::Body::empty()).unwrap();
+            assert_eq!(app.clone().oneshot(request()).await.unwrap().status(), StatusCode::NO_CONTENT);
+            let revoked = store.device_config(&exit.id).unwrap();
+            assert!(revoked.config_epoch > approved.config_epoch);
+            assert!(!revoked.self_exit);
+            assert!(!store.device_config(&client.id).unwrap().peers.iter().find(|p| p.wg_public_key == "exit-key").unwrap().exit);
+            assert_eq!(app.clone().oneshot(request()).await.unwrap().status(), StatusCode::NOT_FOUND);
+        }
     }
 
     #[tokio::test]

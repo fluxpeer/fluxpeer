@@ -8,6 +8,7 @@ name = "control-server"
 path = "src/main.rs"
 
 [dependencies]
+fluxpeer-sdk = { path = "../sdk/rust" }
 axum = { workspace = true, features = ["json", "http1", "tokio", "ws"] }
 futures-util = { version = "0.3", default-features = false }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }

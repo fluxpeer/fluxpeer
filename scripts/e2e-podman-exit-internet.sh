@@ -134,7 +134,7 @@ def start(c, cfg):
     need(P + ['exec', '-d', c, 'sh', '-c', 'echo $$ > /run/fpe/node.pid; '
         'exec env RUST_LOG=info,fp_transport_anytls::health=error fluxpeer node run /run/fpe/node.json > /run/fpe/node.log 2>&1'])
 
-def settings(exit_flag=True, transport='direct', dns=True, port=41841):
+def settings(use_exit='auto', transport='direct', dns=True, port=41841, force_exit=False):
     e, c = dict(state['e']), dict(state['c'])
     for cfg, addr, listen in [(e, f'{MESH}.20', port), (c, f'{MESH}.30', 41840)]:
         cfg.update(tun_name='fpe0', listen_port=listen, advertise=[f'{addr}:{listen}'],
@@ -147,13 +147,22 @@ def settings(exit_flag=True, transport='direct', dns=True, port=41841):
                 cfg['relay_anytls'] = transport == 'anytls'
                 cfg['relay_bond'] = transport == 'bond'
                 cfg['relay_node_id'] = 'fluxpeer-relay'
-    e['exit_node'] = exit_flag
-    c['exit_node'] = False
+    # AD-1: the exit side needs NO local flag — the control-plane's approved
+    # 0.0.0.0/0 route (self_exit) enables its forwarding/NAT dynamically.
+    # force_exit exercises the legacy `exit_node: true` local override instead.
+    for cfg in (e, c):
+        for key in ('exit_node', 'exit_veto', 'use_exit'):
+            cfg.pop(key, None)
+    if force_exit:
+        e['exit_node'] = True
+    # AD-2: the client opts INTO an exit explicitly; absent → split-tunnel.
+    if use_exit:
+        c['use_exit'] = use_exit
     return e, c
 
-def pair(exit_flag=True, transport='direct', dns=True):
+def pair(use_exit='auto', transport='direct', dns=True, force_exit=False, port=41841):
     stop_pair()
-    e, c = settings(exit_flag, transport, dns)
+    e, c = settings(use_exit, transport, dns, port, force_exit)
     # A preexisting LAN-forwarding setup is intentional. S1 then isolates NAT.
     # A separate S1-forward-off control demonstrates LAN forwarding dependency.
     need(px('fpe-exit', 'sysctl', '-w', 'net.ipv4.ip_forward=1'))
@@ -361,7 +370,19 @@ try:
         check('exit-has-public', px('fpe-exit', 'curl', '--noproxy', '*', '-fsS', '--max-time', '10', 'https://1.1.1.1/cdn-cgi/trace'))
         capture()
     scenario('S0', s0)
-    scenario('S1', lambda: (pair(False), probes(False)))
+    # S1 (AD-1+AD-2): only the admin's 0.0.0.0/0 approval (no exit_node flag on the
+    # exit) + the client's `use_exit=auto` opt-in → full-tunnel internet works.
+    scenario('S1', lambda: (pair(), probes(True)))
+    # S1-split (AD-2): same approved exit, but the client never opted in → default
+    # prefixes are stripped; overlay/intranet work, public does NOT (split-tunnel).
+    def s1split():
+        pair(use_exit=None)
+        probes(False)
+        check('split-no-v4-default-halves', px('fpe-cli', 'sh', '-ec',
+            '! ip -4 route show | grep -Eq "^(0.0.0.0/1|128.0.0.0/1).*dev fpe0"'))
+        check('split-no-cryptokey-default', px('fpe-cli', 'sh', '-ec',
+            "fluxpeer show --json | jq -se 'length > 0 and ([.[].peers[].allowed_ips[] | select(. == \"0.0.0.0/0\" or . == \"::/0\")] | length == 0)'"))
+    scenario('S1-split', s1split)
     def s1off():
         need(px('fpe-exit', 'sysctl', '-w', 'net.ipv4.ip_forward=0'))
         exit_cfg = api('GET', f'/devices/{state["e"]["device_id"]}/config', token=state['e']['auth_token'])
@@ -369,14 +390,16 @@ try:
         check('lan-needs-forwarding', px('fpe-cli', 'ping', '-c', '2', '-W', '2', f'{LAN}.40'), False)
         capture()
     scenario('S1-forward-off', s1off)
-    scenario('S2', lambda: (pair(True), probes(True)))
+    # S2 (AD-1 legacy override): `exit_node: true` forces the provider side on even
+    # without relying on self_exit — the old local flag keeps working.
+    scenario('S2', lambda: (pair(force_exit=True), probes(True)))
     def s3():
         api('DELETE', f'/routes/{state["default_route"]}')
-        pair(True); probes(False)
+        pair(); probes(False)
     scenario('S3', s3)
     def s4():
         state['default_route'] = route('0.0.0.0/0')
-        pair(True)
+        pair()
         need(P + ['exec', '-i', 'fpe-exit', 'nft', '-f', '-'], 'table inet fpe_drop { chain forward { '
              'type filter hook forward priority 10; policy drop; counter drop comment "fpe-simulated-fw4-drop";\n }\n}\n')
         # The independent drop blocks LAN forwarding too; overlay remains local.
@@ -391,11 +414,11 @@ try:
         ('relay-tcp-directory', 'directory-tcp', 'tcp', True),
         ('relay-anytls-directory', 'directory-anytls', 'anytls', False)]:
         def test_transport(label=label, mode=mode, directory=directory, positive=positive):
-            new_network(label, directory); pair(True, mode); probes(positive, positive)
+            new_network(label, directory); pair(transport=mode); probes(positive, positive)
         scenario('S5-' + label, test_transport)
 
     def s6():
-        new_network('race'); pair(True)
+        new_network('race'); pair()
         probes(True)
         for i in range(3):
             api('DELETE', f'/routes/{state["default_route"]}')
@@ -403,7 +426,7 @@ try:
             record(f'race-{i}-before-route', px('fpe-cli', 'ip', 'route'))
             stop('fpe-exit')
             port = 41842 + i
-            e, unused = settings(True, port=port)
+            e, unused = settings(port=port)
             started = time.monotonic()
             start('fpe-exit', e)
             endpoints(state['e'], f'{MESH}.20', port)
@@ -418,19 +441,19 @@ try:
                 f09_candidate=suspected, note='candidate requires matching reconcile log; not unique proof'))
             capture(f'race-{i}')
             # Rebuild the client from the same config to measure restart recovery.
-            stop('fpe-cli'); start('fpe-cli', settings(True, port=port)[1]); time.sleep(8)
+            stop('fpe-cli'); start('fpe-cli', settings(port=port)[1]); time.sleep(8)
             check(f'race-{i}-client-restart-recovery', px('fpe-cli', 'curl', '--noproxy', '*', '-fsS', '--max-time', '8', 'https://1.1.1.1/cdn-cgi/trace'))
         capture()
     scenario('S6', s6)
     def s7():
-        new_network('dns'); pair(True, dns=False)
+        new_network('dns'); pair(dns=False)
         original = need(px('fpe-cli', 'cat', '/run/fpe/resolv.original'))
         write_container('fpe-cli', '/etc/resolv.conf', original)
         capture('without-dns-override')
         record('original-resolver-query', px('fpe-cli', 'dig', '+time=2', '+tries=1', 'example.com', 'A'))
         record('original-resolver-https', px('fpe-cli', 'curl', '--noproxy', '*', '-fsS', '--max-time', '10', 'https://example.com'))
         # Restart with an explicit reachable resolver, then measure restoration.
-        pair(True, dns=True)
+        pair(dns=True)
         check('configured-resolver-query', px('fpe-cli', 'dig', '+time=2', '+tries=1', 'example.com', 'A'))
         check('configured-resolver-https', px('fpe-cli', 'curl', '--noproxy', '*', '-fsS', '--max-time', '10', 'https://example.com'))
         capture('configured')
@@ -447,7 +470,7 @@ try:
         need(px('fpe-exit', 'mount', '--bind', '/proc/sys', '/proc/sys'))
         need(px('fpe-exit', 'mount', '-o', 'remount,bind,ro', '/proc/sys'))
         try:
-            e, c = settings(True)
+            e, c = settings()
             start('fpe-exit', e); start('fpe-cli', c); time.sleep(10)
             observe_counters()
             check('sysctl-write-fails', px('fpe-exit', 'sysctl', '-w', 'net.ipv4.ip_forward=1'), False)

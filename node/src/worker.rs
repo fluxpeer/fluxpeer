@@ -11,7 +11,7 @@
 //! task drains every worker's decrypted output to the one TUN fd.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -27,7 +27,7 @@ use crate::relay::RelayOut;
 use crate::status::{self, PeerStat, StatusRegistry};
 use crate::util::{
     DISCO_MAGIC, LIVENESS_DEAD_SECS, REKEY_AFTER_SECS, T_DATA, T_HANDSHAKE_INIT, T_HANDSHAKE_RESP, auth_disco_dgram,
-    disco_authed, disco_replay_ok, ip_in_cidr, le_u32,
+    disco_authed, disco_replay_ok, le_u32,
 };
 
 /// Shared `wg session index → owning worker id`, written by whichever worker
@@ -112,16 +112,53 @@ pub(crate) enum WorkerMsg {
     },
 }
 
-/// Route an egress TUN packet to `(owning peer pubkey, worker id)` by destination
-/// overlay IP. `allowed` is `(allowed_ips, pubkey, wid)` per peer.
-pub(crate) fn route_tun(pkt: &[u8], allowed: &[(Vec<String>, [u8; 32], usize)]) -> Option<([u8; 32], usize)> {
-    let Some(IpAddr::V4(dst)) = fp_crypto::dst_address(pkt) else {
-        return None;
-    };
-    allowed
-        .iter()
-        .find(|(ips, _, _)| ips.iter().any(|c| ip_in_cidr(dst, c)))
-        .map(|(_, pk, wid)| (*pk, *wid))
+/// Immutable, pre-parsed routing snapshot. Construction and conflict reporting
+/// happen only when configuration changes; packet lookup never allocates or locks.
+#[derive(Clone, Copy)]
+struct RouteEntry {
+    prefix: fluxpeer_sdk::prefix::IpPrefix,
+    peer: [u8; 32],
+    worker: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct RouteTable {
+    routes: Vec<RouteEntry>,
+    conflicts: std::collections::HashSet<fluxpeer_sdk::prefix::IpPrefix>,
+}
+
+impl RouteTable {
+    pub(crate) fn with_peer(&self, peer: [u8; 32], worker: usize, prefixes: &[String]) -> Self {
+        self.with_peer_report(peer, worker, prefixes, |prefix| {
+            tracing::warn!(%prefix, "allowed_ips prefix claimed by multiple peers; routing to the lexicographically smaller pubkey");
+        })
+    }
+
+    fn with_peer_report(
+        &self, peer: [u8; 32], worker: usize, prefixes: &[String],
+        mut warn: impl FnMut(fluxpeer_sdk::prefix::IpPrefix),
+    ) -> Self {
+        let mut routes: Vec<_> = self.routes.iter().copied().filter(|r| r.peer != peer).collect();
+        routes.extend(prefixes.iter().filter_map(|s| s.parse().ok()).map(|prefix| RouteEntry { prefix, peer, worker }));
+        routes.sort_by(|a, b| b.prefix.length().cmp(&a.prefix.length()).then(a.peer.cmp(&b.peer)));
+        let mut owners = HashMap::new();
+        let mut conflicts = std::collections::HashSet::new();
+        for entry in &routes {
+            if let Some(owner) = owners.insert(entry.prefix, entry.peer)
+                && owner != entry.peer && conflicts.insert(entry.prefix)
+                && !self.conflicts.contains(&entry.prefix)
+            {
+                warn(entry.prefix);
+            }
+        }
+        Self { routes, conflicts }
+    }
+}
+
+/// Longest-prefix lookup over a stable snapshot, independent of insertion order.
+pub(crate) fn route_tun(pkt: &[u8], allowed: &RouteTable) -> Option<([u8; 32], usize)> {
+    let dst = fp_crypto::dst_address(pkt)?;
+    allowed.routes.iter().find(|r| r.prefix.contains(dst)).map(|r| (r.peer, r.worker))
 }
 
 /// Route an inbound UDP datagram to the owning worker: disco by sender pubkey /
@@ -759,5 +796,138 @@ impl WorkerState {
             gso.flush(&self.udp).await;
             send_to_peer(&self.udp, peer, self.force_relay, &self.relay_out, enc).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lookup(pkt: &[u8], entries: &[(Vec<String>, [u8; 32], usize)]) -> Option<([u8; 32], usize)> {
+        let mut table = RouteTable::default();
+        for (prefixes, peer, worker) in entries {
+            table = table.with_peer(*peer, *worker, prefixes);
+        }
+        route_tun(pkt, &table)
+    }
+
+    /// Minimal IPv4 packet (20-byte header) with the given destination.
+    fn v4_pkt(dst: [u8; 4]) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        p[16..20].copy_from_slice(&dst);
+        p
+    }
+
+    /// Minimal IPv6 packet (40-byte header) with the given destination.
+    fn v6_pkt(dst: [u8; 16]) -> Vec<u8> {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x60;
+        p[24..40].copy_from_slice(&dst);
+        p
+    }
+
+    fn entry(pk: u8, wid: usize, cidrs: &[&str]) -> (Vec<String>, [u8; 32], usize) {
+        (
+            cidrs.iter().map(|s| s.to_string()).collect(),
+            [pk; 32],
+            wid,
+        )
+    }
+
+    #[test]
+    fn lpm_most_specific_wins_regardless_of_order() {
+        // 0/0 (exit) + /8 + /32 in every permutation: the /32 must always win
+        // for a matching dst — the old first-match depended on insertion order.
+        let exit = entry(1, 10, &["0.0.0.0/0"]);
+        let lan = entry(2, 20, &["100.0.0.0/8"]);
+        let host = entry(3, 30, &["100.72.16.5/32"]);
+        let pkt = v4_pkt([100, 72, 16, 5]);
+        for table in [
+            vec![exit.clone(), lan.clone(), host.clone()],
+            vec![host.clone(), lan.clone(), exit.clone()],
+            vec![lan.clone(), exit.clone(), host.clone()],
+            vec![host.clone(), exit.clone(), lan.clone()],
+            vec![exit.clone(), host.clone(), lan.clone()],
+            vec![lan.clone(), host.clone(), exit.clone()],
+        ] {
+            assert_eq!(lookup(&pkt, &table), Some(([3u8; 32], 30)));
+        }
+        // A dst matching only the /8 goes to the /8 peer, not the exit.
+        let pkt = v4_pkt([100, 1, 2, 3]);
+        assert_eq!(
+            lookup(&pkt, &[exit.clone(), lan.clone(), host.clone()]),
+            Some(([2u8; 32], 20))
+        );
+        // A dst matching nothing specific falls to the 0/0 exit.
+        let pkt = v4_pkt([8, 8, 8, 8]);
+        assert_eq!(lookup(&pkt, &[lan.clone(), exit.clone()]), Some(([1u8; 32], 10)));
+        // No exit (split-tunnel): unmatched traffic goes nowhere.
+        assert_eq!(lookup(&pkt, &[lan, host]), None);
+    }
+
+    #[test]
+    fn conflicts_warn_once_on_update_and_never_on_packet_lookup() {
+        let mut warnings = Vec::new();
+        let table = RouteTable::default().with_peer_report([9; 32], 1, &["10.1.2.3/8".into()], |p| warnings.push(p));
+        assert!(warnings.is_empty());
+        let table = table.with_peer_report([4; 32], 2, &["10.0.0.0/8".into()], |p| warnings.push(p));
+        assert_eq!(warnings.len(), 1);
+        let table = table.with_peer_report([4; 32], 2, &["10.0.0.0/8".into()], |p| warnings.push(p));
+        let table = table.with_peer_report([3; 32], 3, &["192.0.2.0/24".into()], |p| warnings.push(p));
+        for _ in 0..1000 {
+            assert_eq!(route_tun(&v4_pkt([10, 9, 8, 7]), &table), Some(([4; 32], 2)));
+        }
+        assert_eq!(warnings.len(), 1);
+        let table = table.with_peer_report([4; 32], 2, &[], |p| warnings.push(p));
+        assert_eq!(route_tun(&v4_pkt([10, 9, 8, 7]), &table), Some(([9; 32], 1)));
+        let _ = table.with_peer_report([4; 32], 2, &["10.0.0.0/8".into()], |p| warnings.push(p));
+        assert_eq!(warnings.len(), 2); // a new conflict after resolution warrants a new warning
+    }
+
+    #[test]
+    fn lpm_same_prefix_conflict_is_stable_by_pubkey() {
+        // Two peers claim the identical prefix: the lexicographically smaller
+        // pubkey wins, whichever order they appear in.
+        let a = entry(9, 1, &["100.72.16.0/24"]);
+        let b = entry(4, 2, &["100.72.16.0/24"]);
+        let pkt = v4_pkt([100, 72, 16, 9]);
+        assert_eq!(lookup(&pkt, &[a.clone(), b.clone()]), Some(([4u8; 32], 2)));
+        assert_eq!(lookup(&pkt, &[b, a]), Some(([4u8; 32], 2)));
+    }
+
+    #[test]
+    fn lpm_ipv6_overlay_and_no_v6_exit_leak() {
+        let dst: [u8; 16] = "fd72:15ab:0:1::64".parse::<std::net::Ipv6Addr>().expect("v6").octets();
+        let peer = entry(7, 3, &["fd72:15ab:0:1::64/128"]);
+        let pkt = v6_pkt(dst);
+        assert_eq!(lookup(&pkt, std::slice::from_ref(&peer)), Some(([7u8; 32], 3)));
+        // A v4-only exit (0.0.0.0/0) must NOT capture v6 traffic.
+        let v4exit = entry(1, 1, &["0.0.0.0/0"]);
+        assert_eq!(lookup(&pkt, &[v4exit, peer]), Some(([7u8; 32], 3)));
+        let v4exit_only = entry(1, 1, &["0.0.0.0/0"]);
+        let unknown_v6: [u8; 16] = "2001:db8::1".parse::<std::net::Ipv6Addr>().expect("v6").octets();
+        assert_eq!(lookup(&v6_pkt(unknown_v6), &[v4exit_only]), None);
+    }
+
+    #[test]
+    fn ipv6_lpm_prefers_host_then_subnet_then_default_in_every_order() {
+        let default = entry(1, 1, &["::/0"]);
+        let subnet = entry(2, 2, &["2000::/8"]);
+        let host = entry(3, 3, &["2000::1/128"]);
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            let entries = [default.clone(), subnet.clone(), host.clone()];
+            let table: Vec<_> = order.iter().map(|i| entries[*i].clone()).collect();
+            for (dst, winner) in [("2000::1", 3), ("2000::2", 2), ("2600::1", 1)] {
+                let dst = dst.parse::<std::net::Ipv6Addr>().unwrap().octets();
+                assert_eq!(lookup(&v6_pkt(dst), &table), Some(([winner; 32], usize::from(winner))));
+            }
+        }
+    }
+
+    #[test]
+    fn route_tun_ignores_malformed_packets() {
+        assert_eq!(lookup(&[], &[entry(1, 1, &["0.0.0.0/0"])]), None);
+        assert_eq!(lookup(&[0x45, 0, 0], &[entry(1, 1, &["0.0.0.0/0"])]), None);
     }
 }

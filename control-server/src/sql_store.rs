@@ -14,7 +14,10 @@ use portable_atomic::AtomicU64;
 use sqlx::AnyPool;
 use tokio::sync::watch;
 
-use crate::domain::{Device, DeviceConfig, DeviceStatus, ImportDevice, ImportResult, Invite, Network, PeerConfig, RelayNode, Route};
+use crate::domain::{
+    Device, DeviceConfig, DeviceStatus, ImportDevice, ImportResult, Invite, Network, PeerConfig, RelayNode, Route,
+    is_default_prefix, normalize_prefix,
+};
 use crate::ipam::{DEVICE_HOST_MAX, DEVICE_HOST_MIN};
 use crate::persistence as db;
 
@@ -26,6 +29,8 @@ pub enum SqlStoreError {
     DeviceNotFound,
     #[error("route not found")]
     RouteNotFound,
+    #[error("invalid route prefix")]
+    InvalidPrefix,
     #[error("invalid invite")]
     InvalidInvite,
     #[error("address pool exhausted")]
@@ -318,7 +323,7 @@ impl SqlStore {
             id: format!("route-{}", self.next_seq()),
             network_id: dev.network_id,
             device_id: device_id.to_string(),
-            prefix: prefix.to_string(),
+            prefix: normalize_prefix(prefix).ok_or(SqlStoreError::InvalidPrefix)?,
             approved: false,
         };
         db::insert_route(&self.pool, &route).await?;
@@ -380,6 +385,13 @@ impl SqlStore {
             .ok_or(SqlStoreError::NetworkNotFound)?;
         // Approved subnet routes in this network, as (advertising device, prefix).
         let approved = db::approved_routes_for_network(&self.pool, &me.network_id).await?;
+        // Exit-ness (AD-1/AD-2): a device is an exit iff it owns an APPROVED
+        // default route. The control-plane is the single source of truth.
+        let is_exit = |device_id: &str| {
+            approved
+                .iter()
+                .any(|(did, prefix)| did == device_id && is_default_prefix(prefix))
+        };
         // This device's own editable wg settings (MTU / DNS apply locally).
         let my_settings: serde_json::Value =
             serde_json::from_str(&db::get_device_settings(&self.pool, device_id).await?).unwrap_or_default();
@@ -415,12 +427,15 @@ impl SqlStore {
             if let Some(ep) = ps.get("endpoint").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 endpoints.insert(0, ep.to_string());
             }
+            let exit = is_exit(&d.id);
             peers.push(PeerConfig {
                 wg_public_key: d.wg_public_key,
                 allowed_ips,
                 endpoints,
+                exit,
             });
         }
+        let self_exit = is_exit(&me.id);
         let relays = db::list_relays(&self.pool, &me.network_id).await?;
         Ok(DeviceConfig {
             network_id: me.network_id,
@@ -431,6 +446,7 @@ impl SqlStore {
             relays,
             mtu,
             dns,
+            self_exit,
         })
     }
 
@@ -638,6 +654,49 @@ mod test {
         let cfg = s.device_config(&a.id).await.unwrap();
         assert_eq!(cfg.relays.len(), 2);
         assert!(cfg.relays.iter().any(|r| r.url == "relay.example.org:443" && r.anytls));
+    }
+
+    #[tokio::test]
+    async fn exit_flags_follow_default_route_approval() {
+        // AD-1/AD-2: approving `0.0.0.0/0` makes the device an exit — visible as
+        // `self_exit` in its own config and `exit` on its peer entry elsewhere;
+        // deleting the route revokes both. Covers the SQL path end to end.
+        let s = SqlStore::connect("sqlite:file:memdb_exit?mode=memory&cache=shared")
+            .await
+            .unwrap();
+        let net = s.create_network("home").await.unwrap();
+        let inv = s.create_invite(&net.id, None, None).await.unwrap();
+        let (exit_dev, _) = s.enroll(&inv.code, "exit", "kE", 1000).await.unwrap();
+        let (client, _) = s.enroll(&inv.code, "laptop", "kL", 1000).await.unwrap();
+
+        async fn peer_exit(s: &SqlStore, client_id: &str) -> bool {
+            s.device_config(client_id)
+                .await
+                .unwrap()
+                .peers
+                .iter()
+                .find(|p| p.wg_public_key == "kE")
+                .map(|p| p.exit)
+                .unwrap_or(false)
+        }
+        assert!(!s.device_config(&exit_dev.id).await.unwrap().self_exit);
+        assert!(!peer_exit(&s, &client.id).await);
+
+        let route = s.advertise_route(&exit_dev.id, "0.0.0.0/0").await.unwrap();
+        assert!(!s.device_config(&exit_dev.id).await.unwrap().self_exit); // unapproved
+        assert!(!peer_exit(&s, &client.id).await);
+
+        s.approve_route(&route.id).await.unwrap();
+        assert!(s.device_config(&exit_dev.id).await.unwrap().self_exit);
+        assert!(peer_exit(&s, &client.id).await);
+        // The default prefix remains in allowed_ips (old-node compatibility).
+        let cfg = s.device_config(&client.id).await.unwrap();
+        let p = cfg.peers.iter().find(|p| p.wg_public_key == "kE").unwrap();
+        assert!(p.allowed_ips.iter().any(|a| a == "0.0.0.0/0"));
+
+        s.delete_route(&route.id).await.unwrap();
+        assert!(!s.device_config(&exit_dev.id).await.unwrap().self_exit);
+        assert!(!peer_exit(&s, &client.id).await);
     }
 
     #[tokio::test]

@@ -73,10 +73,84 @@ pub async fn daemon(dir: String, addr: Option<String>) -> std::io::Result<()> {
     }
 }
 
-/// Update `exit_node` in every membership config under `dir`.
+/// Validate a `use_exit` mode string: `off`/`auto`/`<64-hex pubkey>`.
+/// Returns the canonical string to store (`off` → caller removes the key).
+fn normalize_use_exit(mode: &str) -> Result<String, String> {
+    let m = mode.trim();
+    if m.is_empty() || m == "off" {
+        return Ok("off".to_string());
+    }
+    if m == "auto" {
+        return Ok("auto".to_string());
+    }
+    let lower = m.to_ascii_lowercase();
+    if lower.len() == 64 && lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(lower);
+    }
+    Err(format!(
+        "invalid use_exit {mode:?}: expected `auto`, `off`, or a 64-char hex peer pubkey"
+    ))
+}
+
+/// Local force-on or follow-control. Off clears both overrides so an existing
+/// veto cannot silently survive returning to control-plane behavior.
 pub fn set_exit(dir: &str, enabled: bool) -> std::io::Result<usize> {
+    edit_configs(Path::new(dir), None, |obj| {
+        obj.remove("exit_veto");
+        if enabled { obj.insert("exit_node".into(), serde_json::json!(true)); }
+        else { obj.remove("exit_node"); }
+    })
+}
+
+/// Shared by daemon settings tests without starting a node or touching routing.
+fn apply_provider_settings(obj: &mut serde_json::Map<String, serde_json::Value>, req: &serde_json::Value) {
+    if let Some(enabled) = req.get("exit_node").and_then(|v| v.as_bool()) {
+        obj.remove("exit_veto");
+        if enabled { obj.insert("exit_node".into(), serde_json::json!(true)); }
+        else { obj.remove("exit_node"); }
+    }
+    if let Some(veto) = req.get("exit_veto").and_then(|v| v.as_bool()) {
+        if veto { obj.insert("exit_veto".into(), serde_json::json!(true)); }
+        else { obj.remove("exit_veto"); }
+    }
+}
+
+/// Explicit provider refusal, separate from the legacy on/off toggle.
+pub fn veto_exit(dir: &str) -> std::io::Result<usize> {
+    edit_configs(Path::new(dir), None, |obj| {
+        obj.remove("exit_node");
+        obj.insert("exit_veto".into(), serde_json::json!(true));
+    })
+}
+
+/// Set `use_exit` (`auto`/`off`/`<pubkey hex>`) in membership configs under
+/// `dir` — one interface when `iface` is given, else all of them. `off`
+/// removes the key (split-tunnel is the default).
+pub fn set_use_exit(dir: &str, iface: Option<&str>, mode: &str) -> std::io::Result<usize> {
+    let mode = normalize_use_exit(mode).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    edit_configs(Path::new(dir), iface, |obj| {
+        if mode == "off" {
+            obj.remove("use_exit");
+        } else {
+            obj.insert("use_exit".to_string(), serde_json::json!(mode));
+        }
+    })
+}
+
+/// Apply `edit` to every matching membership config (`*.json`) under `dir` —
+/// filtered to one interface when `iface` is given. Returns the edit count.
+fn edit_configs(
+    dir: &Path,
+    iface: Option<&str>,
+    edit: impl Fn(&mut serde_json::Map<String, serde_json::Value>),
+) -> std::io::Result<usize> {
     let mut updated = 0usize;
-    for path in configs(Path::new(dir)) {
+    for path in configs(dir) {
+        if let Some(want) = iface
+            && read_iface(&path).as_deref() != Some(want)
+        {
+            continue;
+        }
         let raw = std::fs::read_to_string(&path)?;
         let mut cfg: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
             std::io::Error::new(
@@ -90,11 +164,19 @@ pub fn set_exit(dir: &str, enabled: bool) -> std::io::Result<usize> {
                 format!("{}: config root is not an object", path.display()),
             ));
         };
-        obj.insert("exit_node".to_string(), serde_json::json!(enabled));
+        edit(obj);
         let mut serialized = serde_json::to_string_pretty(&cfg).map_err(std::io::Error::other)?;
         serialized.push('\n');
         std::fs::write(&path, serialized)?;
         updated += 1;
+    }
+    if updated == 0
+        && let Some(want) = iface
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no config for iface {want} in {}", dir.display()),
+        ));
     }
     Ok(updated)
 }
@@ -266,6 +348,9 @@ impl Daemon {
                     "control_server": v["control_server"].as_str().unwrap_or(""),
                     "up": running.contains_key(&iface),
                     "exit_node": v["exit_node"].as_bool().unwrap_or(false),
+                    "exit_veto": v["exit_veto"].as_bool().unwrap_or(false),
+                    // Consumer exit selection (AD-2); absent = split-tunnel.
+                    "use_exit": v["use_exit"].as_str().unwrap_or("off"),
                     "force_relay": v["force_relay"].as_bool().unwrap_or(false),
                     "relay_anytls": v["relay_anytls"].as_bool().unwrap_or(false),
                     "relay_bond": v["relay_bond"].as_bool().unwrap_or(false),
@@ -404,9 +489,26 @@ impl Daemon {
         if req.get("exclude_routes").is_some() {
             cfg["exclude_routes"] = req["exclude_routes"].clone();
         }
-        // Advertise THIS device as an exit node (IP forward + NAT). Off by default.
-        if let Some(ex) = req.get("exit_node").and_then(|x| x.as_bool()) {
-            cfg["exit_node"] = serde_json::json!(ex);
+        // Local force-on follows AD-1; cancellation returns to control approval.
+        if let Some(obj) = cfg.as_object_mut() { apply_provider_settings(obj, req); }
+        // Use an EXIT PEER for this device's own traffic (AD-2): `auto`/`off`/
+        // `<pubkey hex>`; `off` removes the key (split is the default).
+        if let Some(value) = req.get("use_exit") {
+            let Some(ue) = value.as_str() else {
+                return serde_json::json!({ "error": "use_exit must be a string" });
+            };
+            match normalize_use_exit(ue) {
+                Ok(mode) => {
+                    if let Some(obj) = cfg.as_object_mut() {
+                        if mode == "off" {
+                            obj.remove("use_exit");
+                        } else {
+                            obj.insert("use_exit".to_string(), serde_json::json!(mode));
+                        }
+                    }
+                }
+                Err(e) => return serde_json::json!({ "error": e }),
+            }
         }
         // Connection mode (transport policy): force-relay + relay flavor.
         for k in ["force_relay", "relay_anytls", "relay_bond"] {
@@ -503,4 +605,122 @@ fn ensure_token(dir: &Path) -> std::io::Result<String> {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh temp config dir with one minimal membership config per iface.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(ifaces: &[&str]) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "fluxpeer-daemon-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&dir).expect("mk tempdir");
+            for (i, iface) in ifaces.iter().enumerate() {
+                let cfg = serde_json::json!({
+                    "private_key": "00", "device_id": format!("d{i}"),
+                    "control_server": "http://127.0.0.1:8080",
+                    "listen_port": 51820 + i as u16, "tun_name": iface, "prefix_len": 24,
+                });
+                std::fs::write(dir.join(format!("{iface}.json")), cfg.to_string()).expect("write cfg");
+            }
+            TempDir(dir)
+        }
+        fn read(&self, iface: &str) -> serde_json::Value {
+            let s = std::fs::read_to_string(self.0.join(format!("{iface}.json"))).expect("read cfg");
+            serde_json::from_str(&s).expect("cfg json")
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_rejects_invalid_use_exit_without_writing_or_starting_a_node() {
+        let temp = TempDir::new(&["fp0"]);
+        let daemon = Daemon { dir: temp.0.clone(), token: String::new(), nets: Mutex::new(HashMap::new()) };
+        let original = temp.read("fp0");
+        for mode in [serde_json::json!(true), serde_json::json!("bad-key")] {
+            let result = daemon.settings(&serde_json::json!({"iface": "fp0", "use_exit": mode})).await;
+            assert!(result.get("error").is_some());
+            assert_eq!(temp.read("fp0"), original);
+            assert!(daemon.nets.lock().is_empty());
+        }
+    }
+
+    #[test]
+    fn normalize_use_exit_accepts_off_auto_hex() {
+        assert_eq!(normalize_use_exit("off").as_deref(), Ok("off"));
+        assert_eq!(normalize_use_exit("").as_deref(), Ok("off"));
+        assert_eq!(normalize_use_exit("auto").as_deref(), Ok("auto"));
+        let upper = "AB".repeat(32);
+        assert_eq!(normalize_use_exit(&upper).as_deref(), Ok(upper.to_ascii_lowercase().as_str()));
+        assert!(normalize_use_exit("xyz").is_err());
+        assert!(normalize_use_exit(&"ab".repeat(31)).is_err()); // 62 chars
+    }
+
+    #[test]
+    fn daemon_provider_settings_off_follows_approval_and_veto_is_explicit() {
+        let mut cfg = serde_json::json!({"exit_node":true});
+        apply_provider_settings(cfg.as_object_mut().unwrap(), &serde_json::json!({"exit_node":false}));
+        assert_eq!(cfg, serde_json::json!({}));
+        apply_provider_settings(cfg.as_object_mut().unwrap(), &serde_json::json!({"exit_veto":true}));
+        assert_eq!(cfg, serde_json::json!({"exit_veto":true}));
+        apply_provider_settings(cfg.as_object_mut().unwrap(), &serde_json::json!({"exit_node":false}));
+        assert_eq!(cfg, serde_json::json!({}));
+        apply_provider_settings(cfg.as_object_mut().unwrap(), &serde_json::json!({"exit_node":true, "exit_veto":true}));
+        assert_eq!(cfg, serde_json::json!({"exit_node":true, "exit_veto":true}));
+        apply_provider_settings(cfg.as_object_mut().unwrap(), &serde_json::json!({"exit_veto":false}));
+        assert_eq!(cfg, serde_json::json!({"exit_node":true}));
+    }
+
+    #[test]
+    fn set_exit_off_follows_control_and_explicit_veto_is_separate() {
+        let t = TempDir::new(&["fp0"]);
+        let dir = t.0.to_string_lossy().to_string();
+        assert_eq!(set_exit(&dir, true).expect("on"), 1);
+        let cfg = t.read("fp0");
+        assert_eq!(cfg["exit_node"], true);
+        assert!(cfg.get("exit_veto").is_none());
+
+        assert_eq!(set_exit(&dir, false).expect("off"), 1);
+        let cfg = t.read("fp0");
+        assert!(cfg.get("exit_node").is_none(), "off removes the key (AD-1)");
+        assert!(cfg.get("exit_veto").is_none());
+        assert_eq!(veto_exit(&dir).expect("veto"), 1);
+        assert_eq!(t.read("fp0")["exit_veto"], true);
+        assert_eq!(set_exit(&dir, false).expect("follow"), 1);
+        assert!(t.read("fp0").get("exit_veto").is_none());
+    }
+
+    #[test]
+    fn set_use_exit_scopes_by_iface_and_off_removes_key() {
+        let t = TempDir::new(&["fp0", "fp1"]);
+        let dir = t.0.to_string_lossy().to_string();
+        // One iface only.
+        assert_eq!(set_use_exit(&dir, Some("fp0"), "auto").expect("auto"), 1);
+        assert_eq!(t.read("fp0")["use_exit"], "auto");
+        assert!(t.read("fp1").get("use_exit").is_none());
+        // All ifaces when no filter.
+        let pk = "cd".repeat(32);
+        assert_eq!(set_use_exit(&dir, None, &pk).expect("pin"), 2);
+        assert_eq!(t.read("fp1")["use_exit"], serde_json::json!(pk));
+        // off removes the key.
+        assert_eq!(set_use_exit(&dir, Some("fp0"), "off").expect("off"), 1);
+        assert!(t.read("fp0").get("use_exit").is_none());
+        // Invalid mode is an error, nothing written.
+        assert!(set_use_exit(&dir, None, "bogus").is_err());
+        // Unknown iface is an error.
+        assert!(set_use_exit(&dir, Some("fp9"), "auto").is_err());
+    }
 }

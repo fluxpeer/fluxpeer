@@ -8,6 +8,7 @@ name = "fp-node"
 path = "src/main.rs"
 
 [dependencies]
+arc-swap = { workspace = true }
 fp-tun = { path = "../engine/net/fp-tun", features = ["async"] }
 fp-crypto = { path = "../engine/crypto/fp-crypto" }
 fp-crypto-noise = { path = "../engine/crypto/fp-crypto-noise" }

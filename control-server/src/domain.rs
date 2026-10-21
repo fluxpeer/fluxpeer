@@ -92,13 +92,21 @@ pub struct Route {
 pub struct PeerConfig {
     pub wg_public_key: String,
     /// Overlay addresses the peer owns (`<v4>/32`, `<v6>/128`); subnet routes
-    /// append here.
+    /// append here. An approved default route (`0.0.0.0/0`) is STILL listed here
+    /// for backward compatibility with old nodes; new nodes strip it unless the
+    /// user opted into an exit (`use_exit`) — see `exit`.
     pub allowed_ips: Vec<String>,
     /// The peer's reachable candidate `ip:port` endpoints, for disco hole-punching
     /// Empty until the peer reports them; the local node probes these for a
     /// direct path, else falls back to relay.
     #[serde(default)]
     pub endpoints: Vec<String>,
+    /// This peer is an approved EXIT (it has an approved default route
+    /// `0.0.0.0/0` / `::/0`). The control-plane is the single source of truth
+    /// for exit-ness; absent (old control) ⇒ the node infers it from a default
+    /// prefix in `allowed_ips`.
+    #[serde(default)]
+    pub exit: bool,
 }
 
 /// What a device fetches to configure itself + its peers (config-pull).
@@ -120,6 +128,23 @@ pub struct DeviceConfig {
     /// Admin-set DNS servers the node installs (wg-quick `DNS =`); empty = none.
     #[serde(default)]
     pub dns: Vec<String>,
+    /// THIS device is an approved EXIT (it has an approved default route): the
+    /// node dynamically enables local forwarding/NAT while this holds (unless
+    /// locally forced on via `exit_node: true` or vetoed via `exit_veto: true`).
+    #[serde(default)]
+    pub self_exit: bool,
+}
+
+/// Whether `prefix` is a default route (`0.0.0.0/0` or `::/0`) — the marker of
+/// an approved EXIT device (AD-1: the control-plane is the source of truth).
+pub fn is_default_prefix(prefix: &str) -> bool {
+    prefix.parse::<fluxpeer_sdk::prefix::IpPrefix>().is_ok_and(|p| p.length() == 0)
+}
+
+/// Advertised routes must be CIDRs; normalize their network and prefix length.
+pub fn normalize_prefix(value: &str) -> Option<String> {
+    if !value.contains('/') { return None; }
+    value.parse::<fluxpeer_sdk::prefix::IpPrefix>().ok().map(|p| p.to_string())
 }
 
 impl Invite {

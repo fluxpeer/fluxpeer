@@ -922,6 +922,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
+ "fluxpeer-sdk",
  "fp-crypto",
  "futures-util",
  "hex",
@@ -944,6 +945,7 @@ dependencies = [
 name = "fluxpeer-node"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "base64",
  "fluxpeer-relay-server",
  "fluxpeer-sdk",
