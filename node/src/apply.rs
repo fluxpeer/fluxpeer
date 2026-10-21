@@ -200,26 +200,49 @@ pub(crate) async fn blocking<T: Send + 'static>(effect: impl FnOnce() -> Result<
 
 /// Only call this for optional IPv6 operations, never for an IPv4 failure.
 pub(crate) fn ipv6_unavailable(error: &ApplyError) -> bool {
+    let message = error.stderr.to_ascii_lowercase();
+    if error.kind == io::ErrorKind::PermissionDenied || message.contains("permission denied") || message.contains("operation not permitted") { return false; }
     error.kind == io::ErrorKind::NotFound || error.kind == io::ErrorKind::Unsupported
         || error.stderr.contains("Address family not supported") || error.stderr.contains("IPv6 is disabled")
         || error.stderr.contains("Operation not supported") || error.stderr.contains("Protocol not supported") || error.missing()
 }
 
+#[derive(Default)]
+pub(crate) struct Routes {
+    pub installed: std::collections::HashSet<String>,
+    skipped: std::collections::HashMap<String, (u64, Instant, ApplyError)>,
+}
+
+pub(crate) enum RouteOutcome { Installed, Skipped(ApplyError) }
+
 pub(crate) fn sync_routes(
-    installed: &mut std::collections::HashSet<String>, desired: &std::collections::HashSet<String>,
-    mut add: impl FnMut(&str) -> Result, mut remove: impl FnMut(&str) -> Result,
+    state: &mut Routes, desired: &std::collections::HashSet<String>, clock: (u64, Instant),
+    mut add: impl FnMut(&str) -> Result<RouteOutcome>, mut remove: impl FnMut(&str) -> Result,
 ) -> Result {
+    let (epoch, now) = clock;
     let mut results = Vec::new();
-    let obsolete: Vec<_> = installed.difference(desired).cloned().collect();
+    state.skipped.retain(|prefix, _| desired.contains(prefix));
+    let obsolete: Vec<_> = state.installed.difference(desired).cloned().collect();
     for prefix in obsolete {
         let result = remove(&prefix);
-        if result.is_ok() { installed.remove(&prefix); }
+        if result.is_ok() { state.installed.remove(&prefix); }
         results.push(result);
     }
-    for prefix in desired.difference(installed).cloned().collect::<Vec<_>>() {
-        let result = add(&prefix);
-        if result.is_ok() { installed.insert(prefix); }
-        results.push(result);
+    for prefix in desired.difference(&state.installed).cloned().collect::<Vec<_>>() {
+        if state.skipped.get(&prefix).is_some_and(|(old_epoch, next, _)| *old_epoch == epoch && now < *next) { continue; }
+        match add(&prefix) {
+            Ok(RouteOutcome::Installed) => {
+                if state.skipped.remove(&prefix).is_some() { tracing::info!(%prefix, "host route recovered"); }
+                state.installed.insert(prefix);
+            }
+            Ok(RouteOutcome::Skipped(error)) => {
+                if state.skipped.get(&prefix).is_none_or(|(_, _, old)| old != &error) {
+                    tracing::warn!(%prefix, %error, "optional host route unavailable; retrying in 60s or on epoch change");
+                }
+                state.skipped.insert(prefix, (epoch, now + Duration::from_secs(60), error));
+            }
+            Err(error) => { state.skipped.remove(&prefix); results.push(Err(error)); }
+        }
     }
     all(results)
 }
@@ -309,19 +332,19 @@ mod tests {
 
     #[test]
     fn failed_route_add_and_delete_preserve_state_and_epoch_until_retry() {
-        let mut installed = HashSet::from(["10.1.0.0/16".to_string()]);
+        let mut installed = Routes { installed: HashSet::from(["10.1.0.0/16".to_string()]), ..Routes::default() };
         let desired = HashSet::from(["10.2.0.0/16".to_string()]);
         let mut status = Status::default();
         status.complete(1, Ok(()));
-        let result = sync_routes(&mut installed, &desired,
+        let result = sync_routes(&mut installed, &desired, (2, Instant::now()),
             |_| Err(ApplyError::new(&["ip", "route", "replace"], "permission denied")),
             |_| Err(ApplyError::new(&["ip", "route", "del"], "permission denied")));
         status.complete(2, result);
-        assert_eq!(installed, HashSet::from(["10.1.0.0/16".to_string()]));
+        assert_eq!(installed.installed, HashSet::from(["10.1.0.0/16".to_string()]));
         assert_eq!(status.applied_epoch, Some(1));
         assert!(status.last_error.is_some());
-        status.complete(2, sync_routes(&mut installed, &desired, |_| Ok(()), |_| Ok(())));
-        assert_eq!(installed, desired);
+        status.complete(2, sync_routes(&mut installed, &desired, (2, Instant::now()), |_| Ok(RouteOutcome::Installed), |_| Ok(())));
+        assert_eq!(installed.installed, desired);
         assert_eq!(status.applied_epoch, Some(2));
         assert!(status.last_error.is_none());
     }

@@ -114,7 +114,7 @@ enum HostStage { Routes, Exit, Dns, Nat, Retire }
 
 #[derive(Default)]
 struct HostRuntime {
-    routes: std::collections::HashSet<String>,
+    routes: apply::Routes,
     admin_dns: bool,
     dns: DnsInstall,
     retries: [apply::Retry; 4],
@@ -175,7 +175,7 @@ impl HostEffects {
         let host = route_retry.run(epoch, now, || self.effect(HostStage::Routes, || {
             let stopped = self.shutdown.lock();
             if *stopped || !self.manage_host_routes { return Ok(()); }
-            sync_host(peers, &self.own_cidr, &self.tun_name, routes)
+            sync_host(peers, &self.own_cidr, &self.tun_name, routes, epoch)
         }));
         let exit = exit_retry.run(epoch, now, || self.effect(HostStage::Exit, || self.sync_exit(peers)));
         let resolver = dns_retry.run(epoch, now, || self.effect(HostStage::Dns, || {
@@ -228,7 +228,10 @@ fn nat_on(override_: Option<bool>, veto: bool, self_exit: bool) -> bool {
 fn sync_nat(policy: ProviderPolicy, state: &NatState, shutdown: &Shutdown, approved: bool, tun: &str, own_cidr: &str) -> ApplyResult {
     #[cfg(target_os = "linux")]
     {
+        let stopped = shutdown.lock();
+        if *stopped || !policy.enabled { return Ok(()); }
         let mut state = state.lock();
+        recover_nat(&mut state, nat_on(policy.force, policy.veto, approved), || firewall::has_lease(tun), || firewall::recover(tun))?;
         if state.backend.is_none() && ((policy.enabled && nat_on(policy.force, policy.veto, approved)) || state.applied.is_some() || state.dirty.is_some()) {
             let backend = firewall::detect()?;
             state.backend = Some(Arc::from(backend));
@@ -237,7 +240,7 @@ fn sync_nat(policy: ProviderPolicy, state: &NatState, shutdown: &Shutdown, appro
     let backend = state.lock().backend.clone();
     policy.sync(state, shutdown, approved, route::physical_iface, |enabled, phys| {
         if enabled {
-            route::exit_gateway_up(phys, tun, own_cidr, backend.as_deref())?;
+            route::exit_gateway_up(phys, tun, own_cidr, policy.trust_external, backend.as_deref())?;
             tracing::info!(phys, tun, "exit provider: forwarding/NAT UP");
         } else {
             route::exit_gateway_down(phys, tun, backend.as_deref())?;
@@ -257,7 +260,35 @@ fn set_nat(
 }
 
 #[derive(Default)]
-struct NatInstall { applied: Option<String>, dirty: Option<String>, backend: Option<Arc<dyn firewall::Firewall>> }
+struct NatInstall {
+    #[cfg(any(target_os = "linux", test))]
+    recovered: bool,
+    #[cfg(any(target_os = "linux", test))]
+    recovery_deferred: bool,
+    applied: Option<String>, dirty: Option<String>, backend: Option<Arc<dyn firewall::Firewall>> }
+
+#[cfg(any(target_os = "linux", test))]
+fn recover_nat(
+    state: &mut NatInstall, on: bool, has_lease: impl FnOnce() -> ApplyResult<bool>,
+    cleanup: impl FnOnce() -> ApplyResult,
+) -> ApplyResult {
+    if state.recovered { return Ok(()); }
+    // Only a confirmed absence of this interface's lease permits best-effort
+    // cleanup. A lease (or an unreadable path) retains the restoration obligation.
+    let can_defer = !on && !has_lease()?;
+    if can_defer && state.recovery_deferred { return Ok(()); }
+    match cleanup() {
+        Ok(()) => { state.recovered = true; state.recovery_deferred = false; }
+        Err(error) if can_defer => {
+            tracing::warn!(%error, "startup firewall cleanup deferred: exit disabled and no interface lease");
+            // Do not retry commands/log every tick, but require successful
+            // recovery before exit activation or if an interface lease appears.
+            state.recovery_deferred = true;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
 
 /// Failed setup keeps a cleanup obligation, never an applied marker. Both failed
 /// cleanup and failed revocation retain their state for the next cycle.
@@ -300,11 +331,12 @@ struct ProviderPolicy {
     enabled: bool,
     force: Option<bool>,
     veto: bool,
+    trust_external: bool,
 }
 
 impl ProviderPolicy {
     fn from_config(cfg: &Config, embedded: bool) -> Self {
-        Self { enabled: !embedded, force: cfg.exit_node, veto: cfg.exit_veto }
+        Self { enabled: !embedded, force: cfg.exit_node, veto: cfg.exit_veto, trust_external: cfg.firewall_trust_external }
     }
 
     fn sync(
@@ -1293,12 +1325,12 @@ pub use join::config_dir;
 pub use join::join;
 pub use show::{list_networks, show};
 
-pub fn fw_selftest(action: &str, phys: &str, tun: &str) -> std::io::Result<()> {
+pub fn fw_selftest(action: &str, phys: &str, tun: &str, overlay_cidr: &str) -> std::io::Result<()> {
     let fw = firewall::detect()?;
     println!("firewall backend: {}", fw.name());
     match action {
         "detect" => {}
-        "up" => fw.up(phys, tun)?,
+        "up" => fw.up(phys, tun, &firewall::Options { overlay_cidr: overlay_cidr.into(), trust_external: false })?,
         "down" => fw.down(phys, tun)?,
         "killswitch-on" => fw.killswitch_on(phys, tun)?,
         "killswitch-off" => fw.killswitch_off(phys, tun)?,
@@ -1349,11 +1381,11 @@ fn overlay_cidr(address: Ipv4Addr, prefix: u8) -> String {
 
 fn sync_host(
     peers: &[control::PeerInfo], own_cidr: &str, dev: &str,
-    installed: &mut std::collections::HashSet<String>,
+    installed: &mut apply::Routes, epoch: u64,
 ) -> ApplyResult {
     let desired = peers.iter().flat_map(|p| p.allowed_ips.iter().map(String::as_str))
         .chain(std::iter::once(own_cidr).filter(|s| !s.is_empty())).filter(|s| !control::is_default_prefix(s)).map(str::to_string).collect();
-    apply::sync_routes(installed, &desired, |p| route_replace(p, dev), |p| route_del(p, dev))?;
+    apply::sync_routes(installed, &desired, (epoch, Instant::now()), |p| route_replace(p, dev), |p| route_del(p, dev))?;
     Ok(())
 }
 
@@ -1386,7 +1418,7 @@ mod exit_contract_tests {
     fn test_host() -> HostEffects {
         HostEffects { tun_name: "fp-test".into(), own_cidr: "100.72.16.0/24".into(), control_host: String::new(), relay_ips: vec![],
             exclude_routes: vec![], dns_override: vec![], exit_state: Arc::default(), exit_progress: Arc::default(), nat_state: Arc::default(),
-            provider: ProviderPolicy { enabled: false, force: None, veto: false }, manage_host_routes: false,
+            provider: ProviderPolicy { enabled: false, force: None, veto: false, trust_external: false }, manage_host_routes: false,
             shutdown: Arc::default(), runtime: parking_lot::Mutex::default(), probe: None }
     }
 
@@ -1546,10 +1578,10 @@ mod exit_contract_tests {
         assert!(r.pending.is_none());
         // Membership success does not acknowledge a host-route failure.
         let wanted = new.allowed_ips.iter().cloned().collect();
-        let result = apply::sync_routes(&mut r.host.runtime.lock().routes, &wanted, |_| Err(ApplyError::new(&["ip", "route"], "permission denied")), |_| Ok(()));
+        let result = apply::sync_routes(&mut r.host.runtime.lock().routes, &wanted, (2, Instant::now()), |_| Err(ApplyError::new(&["ip", "route"], "permission denied")), |_| Ok(()));
         r.apply_status.lock().complete(r.desired_epoch, result);
         assert_eq!(r.apply_status.lock().applied_epoch, Some(1));
-        let result = apply::sync_routes(&mut r.host.runtime.lock().routes, &wanted, |_| Ok(()), |_| Ok(()));
+        let result = apply::sync_routes(&mut r.host.runtime.lock().routes, &wanted, (2, Instant::now()), |_| Ok(apply::RouteOutcome::Installed), |_| Ok(()));
         r.apply_status.lock().complete(r.desired_epoch, result);
         assert_eq!(r.apply_status.lock().applied_epoch, Some(2));
         assert!(r.apply_status.lock().last_error.is_none());

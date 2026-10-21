@@ -17,22 +17,23 @@ fn cidr(s: &str) -> String {
 
 /// Connected route for `cidr` over the tun device. A default route (`0.0.0.0/0` /
 /// `::/0`) is NEVER installed raw — it would clobber the physical default; full-
-/// tunnel uses the split-default in [`exit_up`].
-pub(crate) fn route_replace(cidr: &str, dev: &str) -> Result {
+/// tunnel uses the split-default in [`exit_up`]. Returns Skipped when an optional
+/// route was skipped, so reconciliation can retry it without claiming ownership.
+pub(crate) fn route_replace(cidr: &str, dev: &str) -> Result<apply::RouteOutcome> {
     optional_route_result(current_os(), cidr, route_change_with(current_os(), cidr, dev, true, &mut apply::System))
 }
 
 pub(crate) fn route_del(cidr: &str, dev: &str) -> Result {
-    optional_route_result(current_os(), cidr, route_change_with(current_os(), cidr, dev, false, &mut apply::System))
+    optional_route_result(current_os(), cidr, route_change_with(current_os(), cidr, dev, false, &mut apply::System)).map(|_| ())
 }
 
-fn optional_route_result(os: RouteOs, cidr: &str, result: Result) -> Result {
+fn optional_route_result(os: RouteOs, cidr: &str, result: Result) -> Result<apply::RouteOutcome> {
     match result {
         Err(error) if (os == RouteOs::Windows && error.kind == std::io::ErrorKind::Unsupported)
             || (cidr.contains(':') && apply::ipv6_unavailable(&error)) => {
-                tracing::warn!(%error, cidr, "host route unavailable; skipping unsupported route"); Ok(())
+                Ok(apply::RouteOutcome::Skipped(error))
             }
-        result => result,
+        result => result.map(|()| apply::RouteOutcome::Installed),
     }
 }
 
@@ -243,7 +244,7 @@ fn exit_effect(dev: &str, gateway: &str, phys: &str, effect: ExitEffect<'_>) -> 
         ExitEffect::BypassDel(b) => bypass_del(b)?,
         ExitEffect::GuardUp(pending) => return v6_block_up(dev, pending).map_err(ApplyError::from),
         ExitEffect::GuardDown(pending) => v6_cleanup_with(pending, run_route_command)?,
-        ExitEffect::DefaultAdd(p) => route_replace(p, dev)?,
+        ExitEffect::DefaultAdd(p) => { route_replace(p, dev)?; },
         ExitEffect::DefaultDel(p) => route_del(p, dev)?,
     }
     Ok(false)
@@ -428,11 +429,10 @@ fn v6_block_up(dev: &str, pending: &mut Vec<Vec<String>>) -> std::io::Result<boo
 /// Exit SIDE: enable IPv4+IPv6 forwarding + NAT masquerade out `phys` so traffic from
 /// peers routing 0.0.0.0/0 (or ::/0) through us reaches the internet. Linux only (the
 /// common exit-node platform); idempotent on both stacks.
-pub(crate) fn exit_gateway_up(phys: &str, tun: &str, overlay_cidr: &str, _backend: Option<&dyn crate::firewall::Firewall>) -> Result {
+pub(crate) fn exit_gateway_up(phys: &str, tun: &str, overlay_cidr: &str, _trust_external: bool, _backend: Option<&dyn crate::firewall::Firewall>) -> Result {
     #[cfg(target_os = "linux")]
     {
-        let _ = overlay_cidr;
-        _backend.ok_or_else(|| ApplyError::new(&["firewall", "up"], "missing selected backend"))?.up(phys, tun)?;
+        _backend.ok_or_else(|| ApplyError::new(&["firewall", "up"], "missing selected backend"))?.up(phys, tun, &crate::firewall::Options { overlay_cidr: overlay_cidr.into(), trust_external: _trust_external })?;
     }
     #[cfg(target_os = "windows")]
     {
@@ -522,6 +522,23 @@ pub(crate) fn reset_dns(dev: &str) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_ipv6_route_waits_sixty_seconds_or_new_epoch_without_churning() {
+        use apply::test_support::{Scripted, error};
+        let desired = std::collections::HashSet::from(["fd00::/64".to_string()]);
+        let mut state = apply::Routes::default();
+        let unavailable = || Err(error(Some(2), "IPv6 is disabled"));
+        let mut runner = Scripted::new(vec![unavailable(), unavailable(), Ok(String::new())]);
+        let now = std::time::Instant::now();
+        for (epoch, seconds, commands, installed) in [(42,0,1,false), (42,2,1,false), (42,59,1,false), (42,60,2,false), (43,61,3,true), (43,62,3,true)] {
+            apply::sync_routes(&mut state, &desired, (epoch, now + std::time::Duration::from_secs(seconds)), |prefix| optional_route_result(RouteOs::Linux, prefix,
+                route_change_with(RouteOs::Linux, prefix, "fp0", true, &mut runner)), |_| Ok(())).unwrap();
+            assert_eq!(state.installed.contains("fd00::/64"), installed);
+            assert_eq!(runner.commands.len(), commands);
+        }
+        assert!(runner.commands.iter().all(|c| c == &["ip", "-6", "route", "replace", "fd00::/64", "dev", "fp0"]));
+    }
 
     #[test]
     fn resolved_hostname_bypasses_cover_all_ips_and_resolution_failure_keeps_exit_up() {

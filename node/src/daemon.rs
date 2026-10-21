@@ -102,6 +102,15 @@ pub fn set_exit(dir: &str, enabled: bool) -> std::io::Result<usize> {
     })
 }
 
+fn apply_firewall_setting(cfg: &mut serde_json::Value, req: &serde_json::Value) -> Result<(), String> {
+    if let Some(value) = req.get("firewall_trust_external") {
+        let enabled = value.as_bool().ok_or("firewall_trust_external must be a boolean")?;
+        let obj = cfg.as_object_mut().ok_or("config must be an object")?;
+        obj.insert("firewall_trust_external".into(), serde_json::json!(enabled));
+    }
+    Ok(())
+}
+
 /// Shared by daemon settings tests without starting a node or touching routing.
 fn apply_provider_settings(obj: &mut serde_json::Map<String, serde_json::Value>, req: &serde_json::Value) {
     if let Some(enabled) = req.get("exit_node").and_then(|v| v.as_bool()) {
@@ -349,6 +358,7 @@ impl Daemon {
                     "up": running.contains_key(&iface),
                     "exit_node": v["exit_node"].as_bool().unwrap_or(false),
                     "exit_veto": v["exit_veto"].as_bool().unwrap_or(false),
+                    "firewall_trust_external": v["firewall_trust_external"].as_bool().unwrap_or(false),
                     // Consumer exit selection (AD-2); absent = split-tunnel.
                     "use_exit": v["use_exit"].as_str().unwrap_or("off"),
                     "force_relay": v["force_relay"].as_bool().unwrap_or(false),
@@ -488,6 +498,9 @@ impl Daemon {
         // an empty array clears them, so the field round-trips faithfully.
         if req.get("exclude_routes").is_some() {
             cfg["exclude_routes"] = req["exclude_routes"].clone();
+        }
+        if let Err(error) = apply_firewall_setting(&mut cfg, req) {
+            return serde_json::json!({ "error": error });
         }
         // Local force-on follows AD-1; cancellation returns to control approval.
         if let Some(obj) = cfg.as_object_mut() { apply_provider_settings(obj, req); }
@@ -655,6 +668,33 @@ mod tests {
             assert!(result.get("error").is_some());
             assert_eq!(temp.read("fp0"), original);
             assert!(daemon.nets.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_rejects_non_boolean_firewall_trust_without_writing_or_restart() {
+        let temp = TempDir::new(&["fp0"]);
+        let daemon = Daemon { dir: temp.0.clone(), token: String::new(), nets: Mutex::new(HashMap::new()) };
+        let original = temp.read("fp0");
+        for value in [serde_json::json!("true"), serde_json::json!(1), serde_json::Value::Null] {
+            let result = daemon.settings(&serde_json::json!({"iface":"fp0", "firewall_trust_external":value})).await;
+            assert!(result.get("error").is_some()); assert_eq!(temp.read("fp0"), original);
+            assert!(daemon.nets.lock().is_empty());
+        }
+    }
+
+    #[test]
+    fn firewall_settings_round_trip_and_reject_invalid_types() {
+        let mut cfg = serde_json::json!({});
+        apply_firewall_setting(&mut cfg, &serde_json::json!({})).unwrap();
+        assert!(cfg.get("firewall_trust_external").is_none());
+        for enabled in [true, false] {
+            apply_firewall_setting(&mut cfg, &serde_json::json!({"firewall_trust_external":enabled})).unwrap();
+            assert_eq!(cfg["firewall_trust_external"], enabled);
+        }
+        for value in [serde_json::json!("true"), serde_json::json!(1), serde_json::Value::Null] {
+            assert!(apply_firewall_setting(&mut cfg, &serde_json::json!({"firewall_trust_external":value})).is_err());
+            assert_eq!(cfg["firewall_trust_external"], false);
         }
     }
 

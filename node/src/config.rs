@@ -75,6 +75,9 @@ pub(crate) struct Config {
     /// forwarding/NAT. Wins over every other signal.
     #[serde(default)]
     pub(crate) exit_veto: bool,
+    /// Explicitly trust external firewall forwarding policy despite preflight uncertainty.
+    #[serde(default)]
+    pub(crate) firewall_trust_external: bool,
     /// Use an EXIT PEER for this device's own internet traffic (full-tunnel).
     /// `None`/`"off"` = split-tunnel (default): all peers' default prefixes are
     /// stripped. `"auto"` = pick the first exit-capable peer (pubkey order) with
@@ -160,6 +163,14 @@ mod tests {
 
     fn parse(extra: &str) -> Config {
         serde_json::from_str(&cfg_json(extra)).expect("config parses")
+    }
+
+    #[test]
+    fn external_firewall_trust_requires_explicit_boolean_opt_in() {
+        assert!(!parse("").firewall_trust_external);
+        assert!(parse(r#", "firewall_trust_external": true"#).firewall_trust_external);
+        assert!(!parse(r#", "firewall_trust_external": false"#).firewall_trust_external);
+        assert!(serde_json::from_str::<Config>(&cfg_json(r#", "firewall_trust_external": "true""#)).is_err());
     }
 
     #[test]

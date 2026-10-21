@@ -133,6 +133,8 @@ enum FwSelftestCmd {
         phys: String,
         #[arg(long)]
         tun: String,
+        #[arg(long)]
+        overlay_cidr: String,
     },
     Down {
         #[arg(long)]
@@ -228,12 +230,12 @@ async fn main() -> anyhow::Result<()> {
             println!("use_exit={mode} updated {updated} config(s); restart the tunnel to apply");
         }
         Cmd::FwSelftest { cmd } => match cmd {
-            FwSelftestCmd::Detect => fluxpeer_node::fw_selftest("detect", "", "")?,
-            FwSelftestCmd::Up { phys, tun } => fluxpeer_node::fw_selftest("up", &phys, &tun)?,
-            FwSelftestCmd::Down { phys, tun } => fluxpeer_node::fw_selftest("down", &phys, &tun)?,
+            FwSelftestCmd::Detect => fluxpeer_node::fw_selftest("detect", "", "", "")?,
+            FwSelftestCmd::Up { phys, tun, overlay_cidr } => fluxpeer_node::fw_selftest("up", &phys, &tun, &overlay_cidr)?,
+            FwSelftestCmd::Down { phys, tun } => fluxpeer_node::fw_selftest("down", &phys, &tun, "")?,
             FwSelftestCmd::Killswitch { cmd } => match cmd {
-                KillswitchCmd::On { phys, tun } => fluxpeer_node::fw_selftest("killswitch-on", &phys, &tun)?,
-                KillswitchCmd::Off { phys, tun } => fluxpeer_node::fw_selftest("killswitch-off", &phys, &tun)?,
+                KillswitchCmd::On { phys, tun } => fluxpeer_node::fw_selftest("killswitch-on", &phys, &tun, "")?,
+                KillswitchCmd::Off { phys, tun } => fluxpeer_node::fw_selftest("killswitch-off", &phys, &tun, "")?,
             },
         },
         Cmd::DnsSelftest { cmd } => match cmd {
