@@ -77,6 +77,8 @@ pub(crate) struct Peer {
     pub(crate) rtt: Option<Duration>,
     /// When we last sent a handshake init, to sample RTT on completion.
     pub(crate) init_sent_at: Option<Instant>,
+    pub(crate) rekey_after: Option<Instant>,
+    rekey_delay: u64,
     /// Shared live counters + status for this peer (read by the status socket /
     /// `fluxpeer show`; the same Arc lives in the [`crate::status::StatusRegistry`]).
     pub(crate) stat: Arc<crate::status::PeerStat>,
@@ -118,8 +120,19 @@ impl Peer {
             handshake_at: None,
             rtt: None,
             init_sent_at: None,
+            rekey_after: None,
+            rekey_delay: 5,
             stat,
         }
+    }
+
+    pub(crate) fn note_rekey(&mut self, now: Instant) {
+        self.rekey_after = Some(now + Duration::from_secs(self.rekey_delay));
+        self.rekey_delay = (self.rekey_delay * 2).min(120);
+    }
+    pub(crate) fn authenticated_data(&mut self) {
+        self.rekey_after = None;
+        self.rekey_delay = 5;
     }
 
     /// Build an authenticated disco Ping toward this peer (a hole-punch probe),
@@ -229,7 +242,7 @@ pub(crate) async fn accept_init(
                     }
                     send_to_peer(udp, peer, force_relay, relay_out, &resp).await;
                 }
-                tracing::info!(via, "gapless rekey (responder)");
+                tracing::debug!(via, "gapless rekey (responder)");
                 return;
             }
             // Fall through to a fresh handshake on error (rare).
@@ -248,6 +261,7 @@ pub(crate) async fn accept_init(
     let Some(peer) = peers.iter_mut().find(|p| p.pubkey == pk) else {
         return;
     };
+    index_map.remove_peer(pk);
     peer.raw = fresh;
     peer.last_init = Some(bytes.to_vec());
     set_path(peer, from, via);
@@ -277,10 +291,12 @@ pub(crate) async fn handle_wg(
     force_relay: bool,
     relay_out: &Option<RelayOut>,
     dbuf: &mut [u8],
+    index_map: &mut crate::worker::IndexTable,
 ) -> Option<Vec<u8>> {
     match bytes.first().copied().unwrap_or(0) {
         T_HANDSHAKE_RESP => match peer.raw.handle_handshake_response(bytes) {
             Ok(()) => {
+                if let Some(idx) = le_u32(bytes, 8) { index_map.confirm(idx, peer.pubkey); }
                 set_path(peer, from, via);
                 peer.handshaked = true;
                 peer.last_recv = Some(Instant::now());
@@ -304,6 +320,9 @@ pub(crate) async fn handle_wg(
         },
         T_DATA => match peer.raw.on_recv(bytes, dbuf) {
             Ok(pkt) => {
+                let packet = if pkt.is_empty() { None } else { Some(pkt.to_vec()) };
+                peer.authenticated_data();
+                if let Some(idx) = le_u32(bytes, 4) { index_map.confirm(idx, peer.pubkey); }
                 // WireGuard endpoint roaming: a decrypted (AEAD-authenticated)
                 // packet proves the peer's *current* source address, so adopt it
                 // for replies. This follows a symmetric NAT that remaps the port
@@ -314,9 +333,7 @@ pub(crate) async fn handle_wg(
                 // Count wire bytes received (incl. keepalives), like wg transfer.
                 peer.stat.add_rx(bytes.len());
                 // An empty payload is a keepalive — confirms the session, not a real packet.
-                if !pkt.is_empty() {
-                    return Some(pkt.to_vec());
-                }
+                return packet;
             }
             Err(e) => tracing::debug!(error = ?e, "on_recv"),
         },

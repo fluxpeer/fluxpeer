@@ -234,6 +234,7 @@ pub(crate) async fn resolve_from_control(cfg: &Config, advertise: &[String]) -> 
 /// A fresh config snapshot from the control-plane: peers + this device's own
 /// exit-ness (`self_exit`, AD-1) at the same epoch.
 pub(crate) struct Snapshot {
+    pub(crate) epoch: u64,
     pub(crate) peers: Vec<PeerInfo>,
     pub(crate) self_exit: bool,
 }
@@ -245,15 +246,15 @@ pub(crate) struct Snapshot {
 pub(crate) async fn poll_peers_if_changed(
     client: &Client,
     device_id: &str,
-    last_epoch: &mut u64,
+    applied_epoch: Option<u64>,
 ) -> Option<Snapshot> {
     let conf = client.device_config(device_id).await.ok()?;
     let epoch = config_epoch(&conf);
-    if epoch == *last_epoch {
+    if Some(epoch) == applied_epoch {
         return None;
     }
-    *last_epoch = epoch;
     Some(Snapshot {
+        epoch,
         peers: parse_peers(&conf),
         self_exit: parse_self_exit(&conf),
     })

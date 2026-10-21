@@ -32,6 +32,8 @@ pub(crate) struct Noise {
     sessions: [Option<crate::Session>; crate::N_SESSIONS],
     /// Index of most recently used session
     current: usize,
+    /// Responder session awaiting its first authenticated transport packet.
+    next: Option<usize>,
     /// Queue to store blocked packets
     packet_queue: VecDeque<Vec<u8>>,
     // verify packet
@@ -154,6 +156,7 @@ impl Noise {
             ),
             sessions: Default::default(),
             current: Default::default(),
+            next: None,
             packet_queue: VecDeque::new(),
 
             verifier: verifier.unwrap_or_else(|| crate::Verifier::new(&static_public)),
@@ -230,6 +233,7 @@ impl Noise {
         // Store new session in ring buffer
         let index = session.local_index();
         self.sessions[index % crate::N_SESSIONS] = Some(session);
+        self.next = Some(index);
 
         tracing::debug!(message = "Sending handshake_response", local_idx = index);
 
@@ -253,22 +257,20 @@ impl Noise {
         let index = l_idx % crate::N_SESSIONS;
         self.sessions[index] = Some(session);
 
-        self.set_current_session(l_idx);
+        // The response authenticates the new initiator session. Keep old receive
+        // slots, but immediately send the confirmation using the new keys.
+        // A delayed response to the previous initiation must not roll sending
+        // back after a newer response. Indices use a wrapping eight-bit counter;
+        // an overwritten current slot means the old session is no longer live.
+        let distance = (l_idx as u8).wrapping_sub(self.current as u8);
+        let current_live = self.sessions.get(self.current % crate::N_SESSIONS)
+            .and_then(Option::as_ref).is_some_and(|s| s.local_index() == self.current);
+        if !current_live || (distance != 0 && distance < 128) {
+            self.current = l_idx;
+            self.next = None;
+        }
 
         Ok(NoiseResult::Done)
-    }
-
-    /// Update the index of the currently used session, if needed
-    fn set_current_session(&mut self, new_idx: usize) {
-        let cur_idx = self.current;
-        if cur_idx == new_idx {
-            // There is nothing to do, already using this session, this is the common case
-            return;
-        }
-        if self.sessions[cur_idx % crate::N_SESSIONS].is_none() {
-            self.current = new_idx;
-            tracing::debug!(message = "New session", session = new_idx);
-        }
     }
 
     /// Decrypts a data packet, and stores the decapsulated packet in dst.
@@ -286,7 +288,12 @@ impl Noise {
             session.receive_packet_data(packet, dst)?
         };
 
-        self.set_current_session(r_idx);
+        // Only confirmation of the pending responder session advances sending.
+        // Late packets on an older receive slot must never switch it back.
+        if self.next == Some(r_idx) {
+            self.current = r_idx;
+            self.next = None;
+        }
 
         self.validate_decapsulated_packet(decapsulated_packet)
     }

@@ -48,8 +48,8 @@ pub(crate) struct PeerStat {
     pub(crate) rtt_us: AtomicU64,
     pub(crate) transport: AtomicU8,
     pub(crate) endpoint: Mutex<Option<SocketAddr>>,
-    /// Allowed-IPs (set at creation; routes can append later — kept simple here).
-    pub(crate) allowed_ips: Vec<String>,
+    /// Current cryptokey routes, updated by reconciliation and read by status.
+    pub(crate) allowed_ips: RwLock<Vec<String>>,
 }
 
 impl PeerStat {
@@ -61,7 +61,7 @@ impl PeerStat {
             rtt_us: AtomicU64::new(0),
             transport: AtomicU8::new(T_NONE),
             endpoint: Mutex::new(None),
-            allowed_ips,
+            allowed_ips: RwLock::new(allowed_ips),
         })
     }
     pub(crate) fn add_rx(&self, n: usize) {
@@ -102,7 +102,7 @@ pub(crate) fn snapshot(reg: &StatusRegistry) -> Vec<PeerSnapshot> {
             pubkey: *pk,
             endpoint: *s.endpoint.lock(),
             transport: s.transport.load(Ordering::Relaxed),
-            allowed_ips: s.allowed_ips.clone(),
+            allowed_ips: s.allowed_ips.read().clone(),
             last_handshake_unix: s.last_handshake_unix.load(Ordering::Relaxed),
             rtt_us: s.rtt_us.load(Ordering::Relaxed),
             rx_bytes: s.rx_bytes.load(Ordering::Relaxed),

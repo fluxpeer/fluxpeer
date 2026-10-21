@@ -42,15 +42,38 @@ pub(crate) struct IndexTable {
     local: HashMap<u32, [u8; 32]>,
     owner: IndexOwner,
     wid: usize,
+    slots: HashMap<[u8; 32], IndexSlots>,
 }
+
+#[derive(Default)]
+struct IndexSlots { current: Option<u32>, previous: Option<u32>, pending: Option<u32> }
 
 impl IndexTable {
     pub(crate) fn new(local: HashMap<u32, [u8; 32]>, owner: IndexOwner, wid: usize) -> Self {
-        Self { local, owner, wid }
+        let slots = local.iter().map(|(idx, pk)| (*pk, IndexSlots { pending: Some(*idx), ..Default::default() })).collect();
+        Self { local, owner, wid, slots }
     }
     pub(crate) fn insert(&mut self, idx: u32, pk: [u8; 32]) {
+        self.slots.entry(pk).or_default().pending = Some(idx);
+        self.prune(pk);
         self.local.insert(idx, pk);
         self.owner.write().insert(idx, self.wid);
+    }
+    pub(crate) fn confirm(&mut self, idx: u32, pk: [u8; 32]) {
+        if let Some(slots) = self.slots.get_mut(&pk) && slots.pending == Some(idx) {
+            slots.previous = slots.current;
+            slots.current = slots.pending.take();
+            self.prune(pk);
+        }
+    }
+    fn prune(&mut self, pk: [u8; 32]) {
+        let Some(slots) = self.slots.get(&pk) else { return; };
+        let keep = [slots.current, slots.previous, slots.pending];
+        let mut owner = self.owner.write();
+        self.local.retain(|idx, peer| {
+            if *peer != pk || keep.contains(&Some(*idx)) { true }
+            else { if owner.get(idx) == Some(&self.wid) { owner.remove(idx); } false }
+        });
     }
     pub(crate) fn get(&self, idx: u32) -> Option<[u8; 32]> {
         self.local.get(&idx).copied()
@@ -58,6 +81,7 @@ impl IndexTable {
     /// Drop every index this worker assigned to `pk` (local + the shared owner map),
     /// so a revoked peer's RESP/DATA no longer route anywhere (REVOKE-1).
     pub(crate) fn remove_peer(&mut self, pk: [u8; 32]) {
+        self.slots.remove(&pk);
         let idxs: Vec<u32> = self.local.iter().filter(|(_, v)| **v == pk).map(|(k, _)| *k).collect();
         if idxs.is_empty() {
             return;
@@ -225,6 +249,17 @@ pub(crate) struct WorkerState {
     pub(crate) status: StatusRegistry,
 }
 
+/// A restarted responder has no session/init to send. Without a relay, the
+/// surviving initiator must recover on authenticated silence, not wait 120s.
+fn rekey_due(peer: &Peer, own_pub: &[u8; 32], now: Instant, relay_available: bool) -> bool {
+    if own_pub >= &peer.pubkey || !peer.handshaked || peer.rekey_after.is_some_and(|t| now < t) { return false; }
+    let dead = peer.rtt.map_or(Duration::from_secs(LIVENESS_DEAD_SECS), |r| (r * 8).max(Duration::from_secs(LIVENESS_DEAD_SECS)));
+    if peer.init_sent_at.is_some_and(|t| now.duration_since(t) < dead) { return false; }
+    let aged = peer.handshake_at.is_some_and(|t| now.duration_since(t) >= Duration::from_secs(REKEY_AFTER_SECS));
+    let silent = peer.last_recv.is_some_and(|t| now.duration_since(t) >= dead);
+    aged || (!relay_available && silent)
+}
+
 /// Emit a gapless rekey init on `peer` (the initiator side keeps the live session
 /// encrypting until the response installs the new one) and record its index so the
 /// peer's response routes back. Shared by the silent→relay fallback and the
@@ -272,6 +307,7 @@ async fn emit_rekey(
     if let Some(idx) = le_u32(&init, 4) {
         index_map.insert(idx, peer.pubkey);
     }
+    peer.note_rekey(Instant::now());
     send_to_peer(udp, peer, force_relay, relay_out, &init).await;
     true
 }
@@ -482,16 +518,12 @@ impl WorkerState {
             // initiator re-keys a session older than REKEY_AFTER_SECS over its
             // CURRENT path, keeping the live session encrypting until the new one
             // is confirmed (handle_handshake_response).
-            if self.own_pub.as_bytes() < &peer.pubkey
-                && peer
-                    .handshake_at
-                    .map(|t| now.duration_since(t) >= Duration::from_secs(REKEY_AFTER_SECS))
-                    .unwrap_or(false)
+            if rekey_due(peer, self.own_pub.as_bytes(), now, self.relay_out.is_some())
+                && emit_rekey(peer, &self.udp, self.force_relay, &self.relay_out, &mut self.index_map).await
             {
+                peer.init_sent_at = Some(now);
                 peer.handshake_at = Some(now);
-                if emit_rekey(peer, &self.udp, self.force_relay, &self.relay_out, &mut self.index_map).await {
-                    tracing::info!("gapless rekey (session aged out)");
-                }
+                tracing::debug!("gapless rekey (session aged or peer silent)");
             }
         }
     }
@@ -574,6 +606,7 @@ impl WorkerState {
             self.force_relay,
             &self.relay_out,
             dbuf,
+            &mut self.index_map,
         )
         .await
         {
@@ -836,6 +869,51 @@ mod tests {
     }
 
     #[test]
+    fn offline_rekeys_back_off_and_authenticated_data_resets_delay() {
+        let key = StaticSecret::from([41; 32]);
+        let mut peer = Peer::fresh([255; 32], vec![], false, PeerStat::new(vec![]), &key);
+        let now = Instant::now();
+        peer.handshaked = true; peer.last_recv = Some(now); peer.handshake_at = Some(now);
+        let mut attempts = Vec::new();
+        for second in 0..600 {
+            let tick = now + Duration::from_secs(second);
+            if rekey_due(&peer, &[0; 32], tick, false) {
+                peer.note_rekey(tick); peer.init_sent_at = Some(tick); peer.handshake_at = Some(tick);
+                attempts.push(second);
+            }
+        }
+        assert_eq!(attempts, [5, 10, 20, 40, 80, 160, 280, 400, 520]);
+        peer.authenticated_data(); peer.last_recv = Some(now + Duration::from_secs(600));
+        assert!(!rekey_due(&peer, &[0; 32], now + Duration::from_secs(604), false));
+        assert!(rekey_due(&peer, &[0; 32], now + Duration::from_secs(605), false));
+        peer.note_rekey(now + Duration::from_secs(605));
+        assert_eq!(peer.rekey_after, Some(now + Duration::from_secs(610)));
+    }
+
+    #[test]
+    fn index_tables_keep_current_previous_and_one_pending_per_peer() {
+        let owner = Arc::default();
+        let mut table = IndexTable::new(HashMap::new(), owner, 3);
+        let pk = [1; 32];
+        table.insert(1, pk); table.confirm(1, pk);
+        table.insert(2, pk); table.confirm(2, pk);
+        for idx in 3..1000 {
+            table.insert(idx, pk);
+            assert_eq!(table.get(1), Some(pk));
+            assert_eq!(table.get(2), Some(pk));
+            assert_eq!(table.local.len(), 3);
+            assert_eq!(table.owner.read().len(), 3);
+        }
+        table.confirm(999, pk);
+        assert!(table.get(1).is_none());
+        table.confirm(2, pk); // late data cannot revert the current index
+        table.insert(1000, pk);
+        assert_eq!(table.local.len(), 3);
+        table.remove_peer(pk);
+        assert!(table.local.is_empty()); assert!(table.owner.read().is_empty());
+    }
+
+    #[test]
     fn lpm_most_specific_wins_regardless_of_order() {
         // 0/0 (exit) + /8 + /32 in every permutation: the /32 must always win
         // for a matching dst — the old first-match depended on insertion order.
@@ -864,6 +942,110 @@ mod tests {
         assert_eq!(lookup(&pkt, &[lan.clone(), exit.clone()]), Some(([1u8; 32], 10)));
         // No exit (split-tunnel): unmatched traffic goes nowhere.
         assert_eq!(lookup(&pkt, &[lan, host]), None);
+    }
+
+    #[test]
+    fn no_relay_responder_restart_recovers_before_periodic_rekey() {
+        use fp_crypto::RawCryptor;
+        let first = StaticSecret::from([11; 32]);
+        let second = StaticSecret::from([12; 32]);
+        let (a_key, b_key) = if PublicKey::from(&first).as_bytes() < PublicKey::from(&second).as_bytes() { (first, second) } else { (second, first) };
+        let a_pub = PublicKey::from(&a_key);
+        let b_pub = PublicKey::from(&b_key);
+        let mut a = Peer::fresh(*b_pub.as_bytes(), Vec::new(), false, PeerStat::new(Vec::new()), &a_key);
+        let init = a.raw.init_handshake(a_key.clone(), b_pub).unwrap();
+        let mut old_b = RawCryptor::new::<fp_crypto_noise::Cryptor>();
+        let resp = old_b.handle_handshake(b_key.clone(), b_pub, &init).unwrap().unwrap();
+        a.raw.handle_handshake_response(&resp).unwrap();
+        let mut wire = [0; 512];
+        let mut plain = [0; 512];
+        let keepalive = a.raw.on_send(&[], &mut wire).unwrap();
+        old_b.on_recv(keepalive, &mut plain).unwrap();
+        let now = Instant::now();
+        a.handshaked = true;
+        a.last_recv = Some(now);
+        a.handshake_at = Some(now);
+        a.disco_validated = true; // a reachable transport is not session liveness
+        let retry_at = now + Duration::from_secs(LIVENESS_DEAD_SECS + 1);
+        assert!(!rekey_due(&a, a_pub.as_bytes(), now, false));
+        assert!(rekey_due(&a, a_pub.as_bytes(), retry_at, false));
+        assert!(!rekey_due(&a, a_pub.as_bytes(), retry_at, true)); // existing relay recovery is separate
+        let mut restarted_b = RawCryptor::new::<fp_crypto_noise::Cryptor>();
+        assert!(restarted_b.on_recv(keepalive, &mut plain).is_err());
+        let init = a.raw.rekey_init(&mut wire).unwrap().to_vec();
+        a.init_sent_at = Some(retry_at);
+        assert!(!rekey_due(&a, a_pub.as_bytes(), retry_at + Duration::from_secs(1), false));
+        let resp = restarted_b.handle_handshake(b_key, b_pub, &init).unwrap().unwrap();
+        a.raw.handle_handshake_response(&resp).unwrap();
+        let keepalive = a.raw.on_send(&[], &mut wire).unwrap();
+        restarted_b.on_recv(keepalive, &mut plain).unwrap();
+        let mut packet = v4_pkt([8, 8, 8, 8]);
+        packet[2..4].copy_from_slice(&20u16.to_be_bytes());
+        let encrypted = restarted_b.on_send(&packet, &mut wire).unwrap();
+        assert_eq!(a.raw.on_recv(encrypted, &mut plain).unwrap(), packet);
+    }
+
+    #[test]
+    fn rekey_promotes_confirmed_keys_without_old_packets_reverting_send_session() {
+        use fp_crypto::RawCryptor;
+        let a_key = StaticSecret::from([21; 32]);
+        let b_key = StaticSecret::from([22; 32]);
+        let b_pub = PublicKey::from(&b_key);
+        let mut a = RawCryptor::new::<fp_crypto_noise::Cryptor>();
+        let mut b = RawCryptor::new::<fp_crypto_noise::Cryptor>();
+        let init = a.init_handshake(a_key, b_pub).unwrap();
+        let resp = b.handle_handshake(b_key, b_pub, &init).unwrap().unwrap();
+        a.handle_handshake_response(&resp).unwrap();
+        let mut wire = [0; 512];
+        let mut plain = [0; 512];
+        b.on_recv(a.on_send(&[], &mut wire).unwrap(), &mut plain).unwrap();
+        // Exercise the eight-bit session counter wrap as well as ring reuse.
+        for _ in 0..260 {
+            let old_a = a.on_send(&[], &mut wire).unwrap().to_vec();
+            let old_b = b.on_send(&[], &mut wire).unwrap().to_vec();
+            let init = a.rekey_init(&mut wire).unwrap().to_vec();
+            let resp = b.rekey_respond(&init, &mut wire).unwrap().unwrap().to_vec();
+            a.handle_handshake_response(&resp).unwrap();
+            let confirm = a.on_send(&[], &mut wire).unwrap().to_vec();
+            assert_ne!(le_u32(&old_a, 4), le_u32(&confirm, 4));
+            b.on_recv(&confirm, &mut plain).unwrap();
+            let fresh_b = b.on_send(&[], &mut wire).unwrap().to_vec();
+            a.on_recv(&fresh_b, &mut plain).unwrap();
+            a.on_recv(&old_b, &mut plain).unwrap();
+            b.on_recv(&old_a, &mut plain).unwrap();
+            let fresh_a = a.on_send(&[], &mut wire).unwrap().to_vec();
+            assert_eq!(le_u32(&fresh_a, 4), le_u32(&confirm, 4));
+            let after_old = b.on_send(&[], &mut wire).unwrap().to_vec();
+            assert_eq!(le_u32(&after_old, 4), le_u32(&fresh_b, 4));
+            assert!(b.on_recv(&fresh_a, &mut plain).is_ok());
+            assert!(a.on_recv(&after_old, &mut plain).is_ok());
+        }
+    }
+
+    #[test]
+    fn delayed_previous_rekey_response_does_not_revert_confirmed_session() {
+        use fp_crypto::RawCryptor;
+        let mut a = RawCryptor::new::<fp_crypto_noise::Cryptor>();
+        let mut b = RawCryptor::new::<fp_crypto_noise::Cryptor>();
+        let b_key = StaticSecret::from([32; 32]);
+        let b_pub = PublicKey::from(&b_key);
+        let init = a.init_handshake(StaticSecret::from([31; 32]), b_pub).unwrap();
+        let resp = b.handle_handshake(b_key, b_pub, &init).unwrap().unwrap();
+        a.handle_handshake_response(&resp).unwrap();
+        let mut wire = [0; 512];
+        let mut plain = [0; 512];
+        b.on_recv(a.on_send(&[], &mut wire).unwrap(), &mut plain).unwrap();
+        let init = a.rekey_init(&mut wire).unwrap().to_vec();
+        let delayed = b.rekey_respond(&init, &mut wire).unwrap().unwrap().to_vec();
+        let init = a.rekey_init(&mut wire).unwrap().to_vec();
+        let latest = b.rekey_respond(&init, &mut wire).unwrap().unwrap().to_vec();
+        a.handle_handshake_response(&latest).unwrap();
+        let confirm = a.on_send(&[], &mut wire).unwrap().to_vec();
+        b.on_recv(&confirm, &mut plain).unwrap();
+        a.handle_handshake_response(&delayed).unwrap();
+        let next = a.on_send(&[], &mut wire).unwrap();
+        assert_eq!(le_u32(next, 4), le_u32(&confirm, 4));
+        assert!(b.on_recv(next, &mut plain).is_ok());
     }
 
     #[test]

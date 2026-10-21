@@ -52,6 +52,7 @@ pub(crate) fn socket_path(iface: &str) -> PathBuf {
 pub(crate) async fn serve(
     sock_path: PathBuf,
     reg: StatusRegistry,
+    apply_status: crate::apply::SharedStatus,
     own_priv_hex: String,
     own_pub_hex: String,
     iface: String,
@@ -82,6 +83,7 @@ pub(crate) async fn serve(
                     handle(
                         stream,
                         &reg,
+                        &apply_status,
                         &own_priv_hex,
                         &own_pub_hex,
                         &iface,
@@ -115,6 +117,7 @@ pub(crate) async fn serve(
                     handle(
                         stream,
                         &reg,
+                        &apply_status,
                         &own_priv_hex,
                         &own_pub_hex,
                         &iface,
@@ -136,6 +139,7 @@ pub(crate) async fn serve(
 async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     reg: &StatusRegistry,
+    apply_status: &crate::apply::SharedStatus,
     own_priv_hex: &str,
     own_pub_hex: &str,
     iface: &str,
@@ -149,7 +153,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     let resp = if req.starts_with("get=") {
         wg_uapi_get(reg, own_priv_hex, listen_port)
     } else {
-        json_status(reg, own_pub_hex, iface, listen_port, address, control_server)
+        json_status(reg, apply_status, own_pub_hex, iface, listen_port, address, control_server)
     };
     let _ = stream.write_all(resp.as_bytes()).await;
 }
@@ -182,6 +186,7 @@ fn wg_uapi_get(reg: &StatusRegistry, own_priv_hex: &str, listen_port: u16) -> St
 /// The fluxpeer-native JSON status (richer than wg: transport rung + rtt).
 fn json_status(
     reg: &StatusRegistry,
+    apply_status: &crate::apply::SharedStatus,
     own_pub_hex: &str,
     iface: &str,
     listen_port: u16,
@@ -203,6 +208,7 @@ fn json_status(
             })
         })
         .collect();
+    let applied = apply_status.lock();
     let doc = serde_json::json!({
         "interface": {
             "name": iface,
@@ -211,8 +217,36 @@ fn json_status(
             "address": address.to_string(),
             "control_server": control_server,
             "peers": peers.len(),
+            "last_error": applied.last_error,
+            "applied_epoch": applied.applied_epoch,
         },
         "peers": peers,
     });
     serde_json::to_string(&doc).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_exposes_command_failure_and_retains_last_successful_epoch() {
+        let reg = Default::default();
+        let state: crate::apply::SharedStatus = Default::default();
+        state.lock().complete(7, Ok(()));
+        let error = crate::apply::ApplyError {
+            command: vec!["ip".into(), "route".into(), "replace".into()], exit_code: Some(2),
+            stderr: "Operation not permitted".into(), kind: std::io::ErrorKind::PermissionDenied,
+        };
+        state.lock().complete(8, Err(error));
+        let render = || serde_json::from_str::<serde_json::Value>(&json_status(&reg, &state, "test", "fp0", 1234, Ipv4Addr::LOCALHOST, "")).unwrap();
+        let doc = render();
+        assert_eq!(doc["interface"]["applied_epoch"], 7);
+        assert_eq!(doc["interface"]["last_error"]["exit_code"], 2);
+        assert_eq!(doc["interface"]["last_error"]["stderr"], "Operation not permitted");
+        assert_eq!(doc["interface"]["last_error"]["command"][0], "ip");
+        state.lock().complete(8, Ok(()));
+        assert!(render()["interface"]["last_error"].is_null());
+        assert_eq!(render()["interface"]["applied_epoch"], 8);
+    }
 }

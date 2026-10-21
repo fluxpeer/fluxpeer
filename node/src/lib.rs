@@ -30,6 +30,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+mod apply;
 mod config;
 mod control;
 mod daemon;
@@ -70,44 +71,146 @@ type AllowedMap = Arc<arc_swap::ArcSwap<worker::RouteTable>>;
 struct Reconciler {
     client: fluxpeer_sdk::Client,
     device_id: String,
-    tun_name: String,
     n: usize,
     own_pub: PublicKey,
     peer_to_wid: WidMap,
     cand_to_wid: CandMap,
     allowed: AllowedMap,
+    status_reg: status::StatusRegistry,
     wtxs: Vec<mpsc::Sender<worker::WorkerMsg>>,
-    known: std::collections::HashMap<[u8; 32], (usize, Vec<SocketAddr>, Vec<String>)>,
-    last_epoch: u64,
+    known: KnownPeers,
+    desired_epoch: u64,
+    apply_status: apply::SharedStatus,
     ordinal: usize,
-    // Full-tunnel (exit node) re-evaluation: re-apply or tear down 0.0.0.0/0 routing
-    // when a peer becomes / stops being an exit (e.g. a 0.0.0.0/0 route is approved
-    // live). Shared `exit_state` so the SIGTERM handler restores routing on shutdown.
-    exit_state: ExitState,
+    use_exit: Option<String>,
+    relay_available: bool,
+    desired: Vec<control::PeerInfo>,
+    pending: Option<control::Snapshot>,
+    self_exit: bool,
+    host: Arc<HostEffects>,
+}
+
+/// All synchronous host work is entered on the blocking pool. Per-effect state
+/// and retry budgets are independent; the shutdown gate still serializes effects.
+struct HostEffects {
+    tun_name: String,
+    own_cidr: String,
     control_host: String,
     relay_ips: Vec<String>,
     exclude_routes: Vec<String>,
     dns_override: Vec<String>,
-    // Consumer exit selection (AD-2): which exit peer (if any) carries our
-    // internet traffic. Static for the process lifetime (a change restarts the
-    // iface via the daemon settings path).
-    use_exit: Option<String>,
-    relay_available: bool,
-    // Provider side (AD-1): local override (`exit_node`) / veto (`exit_veto`)
-    // over the control-plane's `self_exit`; shared `nat_state` so the SIGTERM
-    // handler tears down exactly the NAT we installed.
-    provider: ProviderPolicy,
+    exit_state: ExitState,
+    exit_progress: Arc<parking_lot::Mutex<route::ExitProgress>>,
     nat_state: NatState,
-    /// Our overlay CIDR (e.g. 100.72.16.0/24) — the NAT source subnet on
-    /// Windows/macOS exit-gateway setup.
-    own_cidr: String,
+    provider: ProviderPolicy,
     manage_host_routes: bool,
     shutdown: Shutdown,
-    desired: Vec<control::PeerInfo>,
-    self_exit: bool,
+    runtime: parking_lot::Mutex<HostRuntime>,
+    #[cfg(test)]
+    probe: Option<Arc<dyn Fn(HostStage) -> ApplyResult + Send + Sync>>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostStage { Routes, Exit, Dns, Nat, Retire }
+
+#[derive(Default)]
+struct HostRuntime {
+    routes: std::collections::HashSet<String>,
+    admin_dns: bool,
+    dns: DnsInstall,
+    retries: [apply::Retry; 4],
+}
+#[derive(Default)]
+struct DnsInstall { applied: Option<String>, dirty: bool }
+
+fn sync_dns_with(state: &mut DnsInstall, desired: Option<&str>, mut set: impl FnMut(&str) -> ApplyResult, mut clear: impl FnMut() -> ApplyResult) -> ApplyResult {
+    if let Some(dns) = desired {
+        if state.applied.as_deref() != Some(dns) || state.dirty {
+            state.dirty = true;
+            set(dns)?;
+            state.applied = Some(dns.to_string());
+            state.dirty = false;
+        }
+    } else if state.applied.is_some() || state.dirty {
+        clear()?;
+        state.applied = None;
+        state.dirty = false;
+    }
+    Ok(())
+}
+
+impl HostEffects {
+    fn effect(&self, _stage: HostStage, operation: impl FnOnce() -> ApplyResult) -> ApplyResult {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe { return probe(_stage); }
+        operation()
+    }
+
+    fn retire(&self, epoch: u64, selected: Option<[u8; 32]>) -> ApplyResult {
+        if !self.manage_host_routes || self.exit_state.lock().as_ref().is_none_or(|s| Some(s.exit_peer) == selected && !s.teardown_started.load(std::sync::atomic::Ordering::Relaxed)) { return Ok(()); }
+        let mut runtime = self.runtime.lock();
+        let [_, retry, _, _] = &mut runtime.retries;
+        retry.run(epoch, Instant::now(), || self.effect(HostStage::Retire, || retire_exit(&self.exit_state, &self.shutdown, selected)))
+    }
+
+    fn sync_exit(&self, peers: &[control::PeerInfo]) -> ApplyResult {
+        if !self.manage_host_routes { return Ok(()); }
+        if route::current_os() == route::RouteOs::Windows {
+            tracing::warn!("Windows exit routes unsupported; deferred to F05"); return Ok(());
+        }
+        {
+            let stopped = self.shutdown.lock();
+            if *stopped { return Ok(()); }
+            route::cleanup_exit(&self.tun_name, &mut self.exit_progress.lock())?;
+        }
+        retire_exit(&self.exit_state, &self.shutdown, selected_exit(peers))?;
+        sync_exit_with(&self.exit_state, &self.shutdown, selected_exit(peers), |s| s.exit_peer,
+            || apply_exit(peers, &self.tun_name, &self.control_host, &self.relay_ips, &self.exclude_routes, &mut self.exit_progress.lock()), remove_exit)
+    }
+
+    fn tick(&self, epoch: u64, peers: &[control::PeerInfo], self_exit: bool) -> ApplyResult {
+        let mut runtime = self.runtime.lock();
+        let HostRuntime { routes, admin_dns, dns, retries } = &mut *runtime;
+        let now = Instant::now();
+        let [route_retry, exit_retry, dns_retry, nat_retry] = retries;
+        let host = route_retry.run(epoch, now, || self.effect(HostStage::Routes, || {
+            let stopped = self.shutdown.lock();
+            if *stopped || !self.manage_host_routes { return Ok(()); }
+            sync_host(peers, &self.own_cidr, &self.tun_name, routes)
+        }));
+        let exit = exit_retry.run(epoch, now, || self.effect(HostStage::Exit, || self.sync_exit(peers)));
+        let resolver = dns_retry.run(epoch, now, || self.effect(HostStage::Dns, || {
+            let stopped = self.shutdown.lock();
+            if *stopped || !self.manage_host_routes { return Ok(()); }
+            let admin = if *admin_dns { Ok(()) } else {
+                let result = apply_dns(&self.dns_override, &self.tun_name);
+                if result.is_ok() { *admin_dns = true; }
+                result
+            };
+            let desired_dns = selected_exit(peers).and_then(|pk| peers.iter().find(|p| p.pubkey == pk))
+                .and_then(|p| self.dns_override.first().cloned().or_else(|| p.overlay.map(|a| a.to_string())));
+            let exit_dns = sync_dns_with(dns, desired_dns.as_deref(), |d| route::set_dns(&self.tun_name, d), || route::reset_dns(&self.tun_name));
+            apply::all([admin, exit_dns])
+        }));
+        let nat = nat_retry.run(epoch, now, || self.effect(HostStage::Nat, || sync_nat(self.provider, &self.nat_state, &self.shutdown, self_exit, &self.tun_name, &self.own_cidr)));
+        apply::all([host, exit, resolver, nat])
+    }
+
+    fn cleanup(&self) -> ApplyResult {
+        let mut runtime = self.runtime.lock();
+        let mut result = Ok(());
+        shutdown_with(&self.shutdown, || {
+            let exit = self.exit_state.lock().as_ref().map_or(Ok(()), remove_exit);
+            let pending = route::cleanup_exit(&self.tun_name, &mut self.exit_progress.lock());
+            let dns = sync_dns_with(&mut runtime.dns, None, |_| Ok(()), || route::reset_dns(&self.tun_name));
+            let nat = remove_nat(&self.nat_state, &self.tun_name);
+            result = apply::all([exit, pending, dns, nat]);
+        });
+        result
+    }
 }
 
 use route::{route_del, route_replace};
+use apply::{ApplyError, Result as ApplyResult};
 
 /// Whether THIS device runs exit forwarding/NAT right now (AD-1 precedence:
 /// veto > local force on/off > control-plane `self_exit`).
@@ -122,51 +225,63 @@ fn nat_on(override_: Option<bool>, veto: bool, self_exit: bool) -> bool {
 }
 
 /// Shared startup/reconcile wiring for provider policy and host effects.
-fn sync_nat(policy: ProviderPolicy, state: &NatState, shutdown: &Shutdown, approved: bool, tun: &str, own_cidr: &str) {
+fn sync_nat(policy: ProviderPolicy, state: &NatState, shutdown: &Shutdown, approved: bool, tun: &str, own_cidr: &str) -> ApplyResult {
+    #[cfg(target_os = "linux")]
+    {
+        let mut state = state.lock();
+        if state.backend.is_none() && ((policy.enabled && nat_on(policy.force, policy.veto, approved)) || state.applied.is_some() || state.dirty.is_some()) {
+            let backend = firewall::detect()?;
+            state.backend = Some(Arc::from(backend));
+        }
+    }
+    let backend = state.lock().backend.clone();
     policy.sync(state, shutdown, approved, route::physical_iface, |enabled, phys| {
         if enabled {
-            route::exit_gateway_up(phys, tun, own_cidr);
+            route::exit_gateway_up(phys, tun, own_cidr, backend.as_deref())?;
             tracing::info!(phys, tun, "exit provider: forwarding/NAT UP");
         } else {
-            route::exit_gateway_down(phys, tun);
+            route::exit_gateway_down(phys, tun, backend.as_deref())?;
             tracing::info!(phys, tun, "exit provider: forwarding/NAT DOWN");
         }
-    });
+        Ok(())
+    })
 }
 
 fn set_nat(
     state: &NatState, shutdown: &Shutdown, on: bool,
-    discover: impl FnOnce() -> Option<String>, apply: impl FnOnce(bool, &str),
-) {
+    discover: impl FnOnce() -> ApplyResult<Option<String>>, apply: impl FnMut(bool, &str) -> ApplyResult,
+) -> ApplyResult {
     let stopped = shutdown.lock();
-    if *stopped { return; }
-    reconcile_nat(&mut state.lock(), on, discover, apply);
+    if *stopped { return Ok(()); }
+    reconcile_nat(&mut state.lock(), on, discover, apply)
 }
 
-/// Track only this instance's provider transition. Inject effects so approval,
-/// revocation, and local overrides can be tested without privileged networking.
+#[derive(Default)]
+struct NatInstall { applied: Option<String>, dirty: Option<String>, backend: Option<Arc<dyn firewall::Firewall>> }
+
+/// Failed setup keeps a cleanup obligation, never an applied marker. Both failed
+/// cleanup and failed revocation retain their state for the next cycle.
 fn reconcile_nat(
-    state: &mut Option<String>,
-    on: bool,
-    discover: impl FnOnce() -> Option<String>,
-    apply: impl FnOnce(bool, &str),
-) {
-    match (on, state.is_some()) {
-        (true, false) => {
-            if let Some(phys) = discover() {
-                apply(true, &phys);
-                *state = Some(phys);
-            } else {
-                tracing::warn!("exit approved but no physical egress interface found");
-            }
+    state: &mut NatInstall, on: bool,
+    discover: impl FnOnce() -> ApplyResult<Option<String>>, mut apply: impl FnMut(bool, &str) -> ApplyResult,
+) -> ApplyResult {
+    if let Some(phys) = state.dirty.as_deref() { apply(false, phys)?; state.dirty = None; }
+    match (on, state.applied.as_deref()) {
+        (true, None) => {
+            let phys = discover()?.ok_or_else(|| ApplyError::new(&["discover", "physical-interface"], "no physical egress interface"))?;
+            if let Err(error) = apply(true, &phys) { state.dirty = Some(phys); return Err(error); }
+            state.applied = Some(phys);
         }
-        (false, true) => {
-            if let Some(phys) = state.take() {
-                apply(false, &phys);
-            }
-        }
+        (false, Some(phys)) => { apply(false, phys)?; state.applied = None; }
         _ => {}
     }
+    Ok(())
+}
+
+fn remove_nat(state: &NatState, tun: &str) -> ApplyResult {
+    let mut state = state.lock();
+    let backend = state.backend.clone();
+    reconcile_nat(&mut state, false, || Ok(None), |_, phys| route::exit_gateway_down(phys, tun, backend.as_deref()))
 }
 
 /// This gate is held through host effects. Shutdown sets the flag under the same
@@ -194,11 +309,12 @@ impl ProviderPolicy {
 
     fn sync(
         self, state: &NatState, shutdown: &Shutdown, approved: bool,
-        discover: impl FnOnce() -> Option<String>, apply: impl FnOnce(bool, &str),
-    ) {
+        discover: impl FnOnce() -> ApplyResult<Option<String>>, apply: impl FnMut(bool, &str) -> ApplyResult,
+    ) -> ApplyResult {
         if self.enabled {
-            set_nat(state, shutdown, nat_on(self.force, self.veto, approved), discover, apply);
+            set_nat(state, shutdown, nat_on(self.force, self.veto, approved), discover, apply)?;
         }
+        Ok(())
     }
 }
 
@@ -206,16 +322,16 @@ impl ProviderPolicy {
 /// The new defaults are installed only after membership/routes have been updated.
 fn retire_exit_with<T>(
     state: &parking_lot::Mutex<Option<T>>, shutdown: &Shutdown,
-    selected: Option<[u8; 32]>, key: impl Fn(&T) -> [u8; 32], down: impl FnOnce(T),
-) {
+    selected: Option<[u8; 32]>, key: impl Fn(&T) -> [u8; 32], down: impl FnOnce(&T) -> ApplyResult,
+) -> ApplyResult {
     let stopped = shutdown.lock();
-    if *stopped { return; }
+    if *stopped { return Ok(()); }
     let mut state = state.lock();
-    if state.as_ref().map(key) != selected
-        && let Some(old) = state.take()
-    {
-        down(old);
+    if state.as_ref().map(key) != selected && let Some(old) = state.as_ref() {
+        down(old)?;
+        *state = None;
     }
+    Ok(())
 }
 
 fn selected_exit(peers: &[control::PeerInfo]) -> Option<[u8; 32]> {
@@ -224,8 +340,16 @@ fn selected_exit(peers: &[control::PeerInfo]) -> Option<[u8; 32]> {
     })).map(|p| p.pubkey)
 }
 
-fn remove_exit(old: ExitTunState) {
-    route::exit_down(&old.dev, &old.bypass, old.v6_blocked);
+fn retire_exit(state: &ExitState, shutdown: &Shutdown, selected: Option<[u8; 32]>) -> ApplyResult {
+    // A partially retired exit cannot become fully applied merely because the
+    // next epoch selects the same key again. Finish cleanup before reinstalling.
+    let target = if state.lock().as_ref().is_some_and(|s| s.teardown_started.load(std::sync::atomic::Ordering::Relaxed)) { None } else { selected };
+    retire_exit_with(state, shutdown, target, |s| s.exit_peer, remove_exit)
+}
+
+fn remove_exit(old: &ExitTunState) -> ApplyResult {
+    old.teardown_started.store(true, std::sync::atomic::Ordering::Relaxed);
+    route::exit_down(&old.dev, &mut old.progress.lock())
 }
 
 /// An unsuccessful apply leaves state empty and is retried even at the same
@@ -233,13 +357,13 @@ fn remove_exit(old: ExitTunState) {
 fn sync_exit_with<T>(
     state: &parking_lot::Mutex<Option<T>>, shutdown: &Shutdown,
     selected: Option<[u8; 32]>, key: impl Fn(&T) -> [u8; 32],
-    up: impl FnOnce() -> std::io::Result<Option<T>>, down: impl FnOnce(T),
-) -> std::io::Result<()> {
+    up: impl FnOnce() -> ApplyResult<Option<T>>, down: impl FnOnce(&T) -> ApplyResult,
+) -> ApplyResult {
     let stopped = shutdown.lock();
     if *stopped { return Ok(()); }
     let mut state = state.lock();
     if state.as_ref().map(key) == selected { return Ok(()); }
-    if let Some(old) = state.take() { down(old); }
+    if let Some(old) = state.as_ref() { down(old)?; *state = None; }
     if selected.is_some() { *state = up()?; }
     Ok(())
 }
@@ -280,10 +404,10 @@ fn same_endpoints(a: &[SocketAddr], b: &[SocketAddr]) -> bool {
 /// the selected exit appears/leaves/changes) and the SIGTERM handler (which
 /// restores routing/DNS on shutdown).
 struct ExitTunState {
+    teardown_started: std::sync::atomic::AtomicBool,
     dev: String,
-    bypass: Vec<String>,
-    /// Whether WE installed the IPv6 egress block (AD-3) — torn down only if so.
-    v6_blocked: bool,
+    /// Actual installed resources; failed teardown retains only remaining work.
+    progress: parking_lot::Mutex<route::ExitProgress>,
     /// The exit peer this state was applied for — a CHANGE of selected exit
     /// re-applies bypass/DNS even though full-tunnel stays up.
     exit_peer: [u8; 32],
@@ -293,7 +417,7 @@ type ExitState = Arc<parking_lot::Mutex<Option<ExitTunState>>>;
 
 /// Live exit-provider (forwarding/NAT) state: `Some(phys_iface)` while OUR NAT is
 /// installed. Shared with the SIGTERM handler so only our own rules come down.
-type NatState = Arc<parking_lot::Mutex<Option<String>>>;
+type NatState = Arc<parking_lot::Mutex<NatInstall>>;
 
 /// Apply full-tunnel exit routing for `peers` on `dev`: if a peer routes 0.0.0.0/0
 /// (only the SELECTED exit keeps it — see `control::apply_use_exit`), install the
@@ -305,32 +429,45 @@ fn apply_exit(
     control_host: &str,
     relay_ips: &[String],
     exclude_routes: &[String],
-    dns_override: &[String],
-) -> std::io::Result<Option<ExitTunState>> {
+    progress: &mut route::ExitProgress,
+) -> ApplyResult<Option<ExitTunState>> {
     let Some(ex) = selected_exit(peers).and_then(|pk| peers.iter().find(|p| p.pubkey == pk)) else {
         return Ok(None);
     };
-    let (gw, phys) = match (route::default_gateway(), route::physical_iface()) {
+    let (gw, phys) = match (route::default_gateway()?, route::physical_iface()?) {
         (Some(g), Some(p)) => (g, p),
         _ => {
             tracing::warn!("exit peer present but no physical default gateway/iface — full-tunnel not applied");
-            return Err(std::io::Error::other("no physical gateway/interface for full-tunnel"));
+            return Err(ApplyError::new(&["discover", "default-gateway"], "no physical gateway/interface for full-tunnel"));
         }
     };
-    let bypass: Vec<String> = exit_bypass_candidates(control_host, relay_ips, ex, exclude_routes)
-        .into_iter().filter(|c| route::needs_bypass(c)).collect();
-    let dns = if !dns_override.is_empty() {
-        dns_override.first().cloned()
-    } else {
-        ex.overlay.map(|a| a.to_string())
-    };
-    let v6_blocked = route::exit_up(dev, &gw, &phys, &bypass, dns.as_deref())?;
+    use std::net::ToSocketAddrs;
+    let candidates = exit_bypass_candidates(control_host, relay_ips, ex, exclude_routes);
+    // apply_exit runs on the blocking pool, including the OS resolver.
+    let resolved = resolve_bypass_candidates(candidates, |host| (host, 0).to_socket_addrs().map(|it| it.map(|a| a.ip()).collect()));
+    let mut bypass = Vec::new();
+    for candidate in resolved { if route::needs_bypass(&candidate)? { bypass.push(candidate); } }
+    route::exit_up(dev, &gw, &phys, &bypass, progress)?;
     Ok(Some(ExitTunState {
+        teardown_started: std::sync::atomic::AtomicBool::new(false),
         dev: dev.to_string(),
-        bypass,
-        v6_blocked,
+        progress: parking_lot::Mutex::new(std::mem::take(progress)),
         exit_peer: ex.pubkey,
     }))
+}
+
+fn resolve_bypass_candidates(
+    candidates: Vec<String>, mut resolve: impl FnMut(&str) -> std::io::Result<Vec<std::net::IpAddr>>,
+) -> Vec<String> {
+    let mut resolved = Vec::new();
+    for candidate in candidates {
+        if candidate.parse::<fluxpeer_sdk::prefix::IpPrefix>().is_ok() { resolved.push(candidate); continue; }
+        match resolve(&candidate) {
+            Ok(addresses) => resolved.extend(addresses.into_iter().map(|a| a.to_string())),
+            Err(error) => tracing::warn!(%candidate, %error, "bypass resolution failed; skipping candidate"),
+        }
+    }
+    resolved.sort(); resolved.dedup(); resolved
 }
 
 /// Physical carrier addresses must escape both IPv4 and IPv6 split defaults.
@@ -350,53 +487,61 @@ impl Reconciler {
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             iv.tick().await;
-            if *self.shutdown.lock() { return Ok(()); }
-            if let Some(snap) = control::poll_peers_if_changed(&self.client, &self.device_id, &mut self.last_epoch).await {
-                let (_, desired) = control::apply_use_exit(&snap.peers, self.use_exit.as_deref(), self.relay_available);
-                retire_exit_with(&self.exit_state, &self.shutdown, selected_exit(&desired), |s| s.exit_peer, remove_exit);
-                let mut changes = Vec::new();
-                peer_changes(&self.known, &desired, |change| changes.push(change));
-                for change in changes {
-                    match change {
-                        PeerChange::Remove(pk) => self.remove_peer(pk).await,
-                        PeerChange::Add(peer) => self.add_peer(peer).await,
-                        PeerChange::Endpoints(peer) => self.update_candidates(peer).await,
-                        PeerChange::Routes(peer) => self.update_routes(peer),
-                    }
-                }
-                self.desired = desired;
-                self.self_exit = snap.self_exit;
+            match self.host.shutdown.try_lock().map(|stopped| *stopped) {
+                Some(true) => return Ok(()), None => continue, Some(false) => {}
             }
-            // Retry host effects every tick, including unchanged epochs and
-            // transient control-plane errors, using the last successful snapshot.
-            self.sync_exit(&self.desired);
-            self.sync_nat(self.self_exit);
+            let result = self.reconcile_tick().await;
+            self.apply_status.lock().complete(self.desired_epoch, result);
         }
     }
 
-    /// Re-evaluate full-tunnel: bring exit routing up when the SELECTED exit peer
-    /// (the only one keeping 0.0.0.0/0 after `apply_use_exit`) appears, tear it
-    /// down when none remains, and re-apply when the selected exit CHANGES (e.g.
-    /// a better `auto` candidate shows up) so bypass/DNS follow. Idempotent; the
-    /// shared `exit_state` lets the SIGTERM handler restore routing on shutdown.
-    fn sync_exit(&self, peers: &[control::PeerInfo]) {
-        if !self.manage_host_routes { return; }
-        if let Err(error) = sync_exit_with(
-            &self.exit_state, &self.shutdown, selected_exit(peers), |s| s.exit_peer,
-            || apply_exit(peers, &self.tun_name, &self.control_host, &self.relay_ips, &self.exclude_routes, &self.dns_override),
-            remove_exit,
-        ) {
-            tracing::error!(%error, "full-tunnel apply failed; overlay remains active; retrying next tick");
-        }
+    async fn reconcile_tick(&mut self) -> ApplyResult {
+        let applied_epoch = self.apply_status.lock().applied_epoch;
+        if let Some(snap) = control::poll_peers_if_changed(&self.client, &self.device_id, applied_epoch).await { self.pending = Some(snap); }
+        self.reconcile_effects().await
     }
 
-    /// Re-evaluate the PROVIDER side (AD-1): run local forwarding/NAT exactly
-    /// while the control-plane says this device is an approved exit (`self_exit`)
-    /// — unless locally forced on (`exit_node: true`) or vetoed (`exit_veto`).
-    /// An admin revoking the default route thus tears NAT down on the next
-    /// config update; only rules WE installed are removed.
-    fn sync_nat(&self, self_exit: bool) {
-        sync_nat(self.provider, &self.nat_state, &self.shutdown, self_exit, &self.tun_name, &self.own_cidr);
+    async fn reconcile_effects(&mut self) -> ApplyResult {
+        let membership = self.apply_pending().await;
+        let host = self.host.clone();
+        let peers = self.desired.clone();
+        let epoch = self.desired_epoch;
+        let self_exit = self.self_exit;
+        let effects = apply::blocking(move || host.tick(epoch, &peers, self_exit)).await;
+        apply::all([membership, effects])
+    }
+
+    async fn apply_pending(&mut self) -> ApplyResult {
+        if let Some(snap) = self.pending.as_ref() {
+            self.desired_epoch = snap.epoch;
+            self.self_exit = snap.self_exit;
+            let (_, desired) = control::apply_use_exit(&snap.peers, self.use_exit.as_deref(), self.relay_available);
+            let host = self.host.clone();
+            let epoch = snap.epoch;
+            let selected = selected_exit(&desired);
+            let retirement = apply::blocking(move || host.retire(epoch, selected)).await;
+            let mut errors = vec![retirement];
+            let mut changes = Vec::new();
+            peer_changes(&self.known, &desired, |change| changes.push(change));
+            for change in changes {
+                let result = match change {
+                    PeerChange::Remove(pk) => self.remove_peer(pk).await,
+                    PeerChange::Add(peer) => self.add_peer(peer).await,
+                    PeerChange::Endpoints(peer) => self.update_candidates(peer).await,
+                    PeerChange::Routes(peer) => { self.update_routes(peer); Ok(()) }
+                };
+                errors.push(result);
+            }
+            self.desired = desired;
+            if errors.iter().skip(1).all(Result::is_ok) { self.pending = None; }
+            return apply::all(errors);
+        }
+        Ok(())
+    }
+
+    async fn send_worker(&self, wid: usize, message: worker::WorkerMsg) -> ApplyResult {
+        let tx = self.wtxs.get(wid).ok_or_else(|| ApplyError::new(&["worker", "dispatch"], "missing worker"))?;
+        tx.send(message).await.map_err(|e| ApplyError::new(&["worker", "dispatch"], e.to_string()))
     }
 
     fn replace_allowed(&self, peer: [u8; 32], worker: usize, prefixes: &[String]) {
@@ -408,20 +553,11 @@ impl Reconciler {
     /// swap its routing-table entry + install/remove the TUN routes live. SYNC (no
     /// await across the RwLock guards).
     fn update_routes(&mut self, pi: control::PeerInfo) {
-        let Some((wid, cands, old_aips)) = self.known.get(&pi.pubkey).cloned() else {
+        let Some((wid, cands, _old_aips)) = self.known.get(&pi.pubkey).cloned() else {
             return;
         };
         self.replace_allowed(pi.pubkey, wid, &pi.allowed_ips);
-        for cidr in &old_aips {
-            if !pi.allowed_ips.contains(cidr) {
-                route_del(cidr, &self.tun_name);
-            }
-        }
-        for cidr in &pi.allowed_ips {
-            if !old_aips.contains(cidr) {
-                route_replace(cidr, &self.tun_name);
-            }
-        }
+        if let Some(stat) = self.status_reg.read().get(&pi.pubkey) { *stat.allowed_ips.write() = pi.allowed_ips.clone(); }
         tracing::info!(peer = %hex::encode(&pi.pubkey[..4]), "reconcile: peer routes updated");
         self.known.insert(pi.pubkey, (wid, cands, pi.allowed_ips));
     }
@@ -457,61 +593,39 @@ impl Reconciler {
     }
 
     /// Drop a revoked peer: kill its worker session, purge routing, remove TUN routes.
-    async fn remove_peer(&mut self, pk: [u8; 32]) {
-        let Some((wid, aips)) = self.route_remove(pk) else {
-            return;
-        };
-        let _ = self.wtxs[wid].send(worker::WorkerMsg::RemovePeer(pk)).await;
-        for cidr in &aips {
-            route_del(cidr, &self.tun_name);
-        }
-        tracing::info!(peer = %hex::encode(&pk[..4]), "reconcile: peer revoked → session dropped");
+    async fn remove_peer(&mut self, pk: [u8; 32]) -> ApplyResult {
+        let Some((wid, _, _)) = self.known.get(&pk).cloned() else { return Ok(()); };
+        self.replace_allowed(pk, wid, &[]);
+        self.send_worker(wid, worker::WorkerMsg::RemovePeer(pk)).await?;
+        self.route_remove(pk);
+        tracing::info!(peer = %hex::encode(&pk[..4]), "reconcile: peer revoked");
+        Ok(())
     }
 
-    /// Bring up a newly-joined peer: route it, install its TUN route, and hand the
-    /// worker an `AddPeer` so it starts handshaking.
-    async fn add_peer(&mut self, pi: control::PeerInfo) {
-        let (wid, initiator) = self.route_add(&pi);
-        for cidr in &pi.allowed_ips {
-            route_replace(cidr, &self.tun_name);
-        }
-        let _ = self.wtxs[wid]
-            .send(worker::WorkerMsg::AddPeer {
-                pubkey: pi.pubkey,
-                candidates: pi.candidates.clone(),
-                allowed_ips: pi.allowed_ips.clone(),
-                initiator,
-            })
-            .await;
-        tracing::info!(peer = %hex::encode(&pi.pubkey[..4]), "reconcile: peer joined → session added");
+    async fn add_peer(&mut self, pi: control::PeerInfo) -> ApplyResult {
+        let wid = self.ordinal % self.n;
+        self.send_worker(wid, worker::WorkerMsg::AddPeer {
+            pubkey: pi.pubkey, candidates: pi.candidates.clone(), allowed_ips: pi.allowed_ips.clone(),
+            initiator: self.own_pub.as_bytes() < &pi.pubkey,
+        }).await?;
+        self.route_add(&pi);
         self.known.insert(pi.pubkey, (wid, pi.candidates, pi.allowed_ips));
+        Ok(())
     }
 
-    /// A known peer re-reported a different endpoint set: re-point its disco
-    /// candidates (routing map + worker) WITHOUT tearing down the wg session, so its
-    /// receiver index stays registered. See `WorkerMsg::UpdateCandidates`.
-    async fn update_candidates(&mut self, pi: control::PeerInfo) {
-        let Some((wid, old_cands, aips)) = self.known.get(&pi.pubkey).cloned() else {
-            return;
-        };
+    async fn update_candidates(&mut self, pi: control::PeerInfo) -> ApplyResult {
+        let Some((wid, old_cands, aips)) = self.known.get(&pi.pubkey).cloned() else { return Ok(()); };
+        self.send_worker(wid, worker::WorkerMsg::UpdateCandidates { pubkey: pi.pubkey, candidates: pi.candidates.clone() }).await?;
         {
             let mut cw = self.cand_to_wid.write();
-            for c in &old_cands {
-                cw.remove(c);
-            }
-            for c in &pi.candidates {
-                cw.insert(*c, wid);
-            }
+            for c in &old_cands { cw.remove(c); }
+            for c in &pi.candidates { cw.insert(*c, wid); }
         }
-        self.known.insert(pi.pubkey, (wid, pi.candidates.clone(), aips));
-        let _ = self.wtxs[wid]
-            .send(worker::WorkerMsg::UpdateCandidates {
-                pubkey: pi.pubkey,
-                candidates: pi.candidates,
-            })
-            .await;
-        tracing::info!(peer = %hex::encode(&pi.pubkey[..4]), "reconcile: peer endpoints changed → candidates updated (session kept)");
+        self.known.insert(pi.pubkey, (wid, pi.candidates, aips));
+        tracing::info!(peer = %hex::encode(&pi.pubkey[..4]), "reconcile: peer endpoints updated");
+        Ok(())
     }
+
 }
 
 /// Called with every egress socket fd the engine opens so the host can exclude it
@@ -738,73 +852,34 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
     // peer (disco/relay/multi-peer/exit-as-a-peer), just without host-side routing.
     let shutdown: Shutdown = Arc::new(parking_lot::Mutex::new(false));
     let exit_state: ExitState = Arc::new(parking_lot::Mutex::new(None));
-    if embedded {
-        tracing::info!("adopted external tun fd (mobile VpnService); platform owns routes/DNS/exit");
-    } else {
-        apply_dns(&eff_dns, &dev_name);
-        for p in &peers {
-            for cidr in &p.allowed_ips {
-                route_replace(cidr, &dev_name); // 0.0.0.0/0 is skipped — handled by apply_exit
-            }
-        }
-        // Catch-all route for the WHOLE overlay subnet → tun, not just per-peer /32s.
-        // Traffic to an unallocated overlay IP (e.g..1 with no peer) is then dropped by
-        // wg ("no peer matches") instead of LEAKING out the physical default route — these
-        // addresses live in the 100.64/10 CGNAT range, which the ISP may actually answer,
-        // giving a false "connected" ping. Mirrors the Linux wg-quick connected route +
-        // Tailscale "owning" its CGNAT range; macOS utun is point-to-point so it isn't
-        // auto-created. A more-specific peer /32 still wins. Never 0.0.0.0/0 (prefix 0).
-        if cfg.prefix_len > 0 && cfg.prefix_len <= 32 {
-            let mask: u32 = u32::MAX << (32 - cfg.prefix_len);
-            let net = Ipv4Addr::from(u32::from(r.own_addr) & mask);
-            route_replace(&format!("{net}/{}", cfg.prefix_len), &dev_name);
-        }
-        // Exit node (full-tunnel): if the SELECTED exit peer routes 0.0.0.0/0, send
-        // the default over the tun (split-default) + bypass the wg
-        // carrier/LAN/control/relay + DNS = the exit's overlay, per the WireGuard
-        // exit-node model. Reconciler re-applies live.
-        if let Err(error) = sync_exit_with(
-            &exit_state, &shutdown, selected_exit(&peers), |s| s.exit_peer,
-            || apply_exit(&peers, &dev_name, &control_host, &relay_ips, &cfg.exclude_routes, &eff_dns), remove_exit,
-        ) {
-            tracing::error!(%error, "startup full-tunnel apply failed; overlay remains active; retrying next tick");
-        }
-    }
-    // Exit PROVIDER side (AD-1): enable IPv4 forwarding + NAT masquerade so peers'
-    // 0.0.0.0/0 traffic actually egresses — while the CONTROL-PLANE says this
-    // device is an approved exit (`self_exit`), unless locally forced on
-    // (`exit_node: true`, legacy) or vetoed (`exit_veto`). The Reconciler keeps
-    // this in sync on every config update (approval revoked → NAT down).
-    let own_cidr = {
-        // WinNAT masquerades by source subnet, so pass the overlay's network
-        // prefix (e.g. 100.72.16.0/24). Linux ignores it (it NATs by egress iface).
-        let plen = cfg.prefix_len;
-        let mask: u32 = if plen == 0 { 0 } else { u32::MAX << (32 - plen) };
-        let net = Ipv4Addr::from(u32::from(r.own_addr) & mask);
-        format!("{net}/{plen}")
-    };
-    let nat_state: NatState = Arc::new(parking_lot::Mutex::new(None));
-    let provider = ProviderPolicy::from_config(&cfg, embedded);
-    sync_nat(provider, &nat_state, &shutdown, r.self_exit, &dev_name, &own_cidr);
+    let exit_progress = Arc::new(parking_lot::Mutex::new(route::ExitProgress::default()));
+    let own_cidr = overlay_cidr(r.own_addr, cfg.prefix_len);
+    let apply_status = Arc::new(parking_lot::Mutex::new(apply::Status::default()));
+    let host = Arc::new(HostEffects {
+        tun_name: dev_name.clone(), own_cidr, control_host, relay_ips,
+        exclude_routes: cfg.exclude_routes.clone(), dns_override: eff_dns.clone(),
+        exit_state, exit_progress, nat_state: Arc::default(), provider: ProviderPolicy::from_config(&cfg, embedded),
+        manage_host_routes: !embedded, shutdown, runtime: parking_lot::Mutex::default(),
+        #[cfg(test)] probe: None,
+    });
+    let initial_host = host.clone();
+    let initial_peers = peers.clone();
+    let self_exit = r.self_exit;
+    let result = apply::blocking(move || initial_host.tick(init_epoch, &initial_peers, self_exit)).await;
+    apply_status.lock().complete(init_epoch, result);
 
     // Graceful teardown: restore the default route + DNS (client side) and the NAT
     // rule (exit side) on SIGTERM/SIGINT before exiting — the daemon sends SIGTERM,
     // then SIGKILL. Without this a killed full-tunnel node strands the box's routing.
     #[cfg(unix)]
     {
-        let es = exit_state.clone();
-        let ns = nat_state.clone();
-        let tun = dev_name.clone();
-        let stopping = shutdown.clone();
+        let stopping = host.clone();
         use tokio::signal::unix::{SignalKind, signal};
         let mut term = signal(SignalKind::terminate())?;
         let mut intr = signal(SignalKind::interrupt())?;
         tokio::spawn(async move {
             tokio::select! { _ = term.recv() => {}, _ = intr.recv() => {} }
-            shutdown_with(&stopping, || {
-                if let Some(old) = es.lock().take() { remove_exit(old); }
-                if let Some(phys) = ns.lock().take() { route::exit_gateway_down(&phys, &tun); }
-            });
+            if let Err(error) = apply::blocking(move || stopping.cleanup()).await { tracing::error!(%error, "host shutdown failed"); }
             std::process::exit(0);
         });
     }
@@ -812,16 +887,10 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
     // routes/DNS (and the exit-side NAT, when it lands) before exiting.
     #[cfg(windows)]
     {
-        let es = exit_state.clone();
-        let ns = nat_state.clone();
-        let tun = dev_name.clone();
-        let stopping = shutdown.clone();
+        let stopping = host.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
-            shutdown_with(&stopping, || {
-                if let Some(old) = es.lock().take() { remove_exit(old); }
-                if let Some(phys) = ns.lock().take() { route::exit_gateway_down(&phys, &tun); }
-            });
+            if let Err(error) = apply::blocking(move || stopping.cleanup()).await { tracing::error!(%error, "host shutdown failed"); }
             std::process::exit(0);
         });
     }
@@ -1121,6 +1190,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
     tokio::spawn(statusd::serve(
         statusd::socket_path(&cfg.tun_name),
         status_reg.clone(),
+        apply_status.clone(),
         hex::encode(own_priv.to_bytes()),
         hex::encode(own_pub.as_bytes()),
         cfg.tun_name.clone(),
@@ -1178,29 +1248,22 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
         Reconciler {
             client: crate::control::mk_client(&cfg),
             device_id: cfg.device_id.clone(),
-            tun_name: dev_name.clone(), // route ops target the real device (utunN on macOS)
             n,
             own_pub,
             peer_to_wid: peer_to_wid.clone(),
             cand_to_wid: cand_to_wid.clone(),
             allowed: allowed.clone(),
+            status_reg: status_reg.clone(),
             wtxs: wtxs.clone(),
             ordinal: known.len(),
             known,
-            last_epoch: init_epoch,
-            exit_state: exit_state.clone(),
-            control_host,
-            relay_ips,
-            exclude_routes: cfg.exclude_routes.clone(),
-            dns_override: eff_dns.clone(),
+            desired_epoch: init_epoch,
+            apply_status: apply_status.clone(),
+            host: host.clone(),
             use_exit: cfg.use_exit.clone(),
             relay_available,
-            provider,
-            nat_state: nat_state.clone(),
-            own_cidr: own_cidr.clone(),
-            manage_host_routes: injected_fd.is_none(),
-            shutdown: shutdown.clone(),
             desired: desired_peers,
+            pending: None,
             self_exit: r.self_exit,
         }
         .run(),
@@ -1213,10 +1276,8 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>) -> std::io::Result<()
         tokio::select! {
             _ = retry.tick() => {},
             result = &mut reconciler => {
-                shutdown_with(&shutdown, || {
-                    if let Some(old) = exit_state.lock().take() { remove_exit(old); }
-                    if let Some(phys) = nat_state.lock().take() { route::exit_gateway_down(&phys, &dev_name); }
-                });
+                let stopping = host.clone();
+                if let Err(error) = apply::blocking(move || stopping.cleanup()).await { tracing::error!(%error, "host cleanup failed"); }
                 return result.map_err(std::io::Error::other)?;
             }
         }
@@ -1233,14 +1294,14 @@ pub use join::join;
 pub use show::{list_networks, show};
 
 pub fn fw_selftest(action: &str, phys: &str, tun: &str) -> std::io::Result<()> {
-    let fw = firewall::detect();
+    let fw = firewall::detect()?;
     println!("firewall backend: {}", fw.name());
     match action {
         "detect" => {}
-        "up" => fw.up(phys, tun),
-        "down" => fw.down(phys, tun),
-        "killswitch-on" => fw.killswitch_on(phys, tun),
-        "killswitch-off" => fw.killswitch_off(phys, tun),
+        "up" => fw.up(phys, tun)?,
+        "down" => fw.down(phys, tun)?,
+        "killswitch-on" => fw.killswitch_on(phys, tun)?,
+        "killswitch-off" => fw.killswitch_off(phys, tun)?,
         other => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1263,9 +1324,9 @@ pub fn dns_selftest(action: &str, dns: Option<&str>) -> std::io::Result<()> {
                     "dns-selftest set requires a DNS server",
                 ));
             };
-            backend.set(dns);
+            backend.set(dns)?;
         }
-        "clear" => backend.clear(),
+        "clear" => backend.clear()?,
         other => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1279,67 +1340,245 @@ pub fn dns_selftest(action: &str, dns: Option<&str>) -> std::io::Result<()> {
 /// Install admin-set DNS servers (the editable `DNS =` wg setting). Writing
 /// `/etc/resolv.conf` clobbers system DNS, so it's gated behind `FLUXPEER_MANAGE_DNS=1`
 /// (opt-in, like wg-quick's DNS handling); otherwise we just log what was set.
-fn apply_dns(servers: &[String], iface: &str) {
-    if servers.is_empty() {
-        return;
+fn overlay_cidr(address: Ipv4Addr, prefix: u8) -> String {
+    match format!("{address}/{prefix}").parse::<fluxpeer_sdk::prefix::IpPrefix>() {
+        Ok(prefix) => prefix.to_string(),
+        Err(error) => { tracing::warn!(%error, "invalid overlay CIDR; skipping connected route"); String::new() }
     }
-    let manage = std::env::var("FLUXPEER_MANAGE_DNS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+}
+
+fn sync_host(
+    peers: &[control::PeerInfo], own_cidr: &str, dev: &str,
+    installed: &mut std::collections::HashSet<String>,
+) -> ApplyResult {
+    let desired = peers.iter().flat_map(|p| p.allowed_ips.iter().map(String::as_str))
+        .chain(std::iter::once(own_cidr).filter(|s| !s.is_empty())).filter(|s| !control::is_default_prefix(s)).map(str::to_string).collect();
+    apply::sync_routes(installed, &desired, |p| route_replace(p, dev), |p| route_del(p, dev))?;
+    Ok(())
+}
+
+fn apply_dns(servers: &[String], iface: &str) -> ApplyResult {
+    if servers.is_empty() { return Ok(()); }
+    let manage = std::env::var("FLUXPEER_MANAGE_DNS").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     if !manage {
         tracing::info!(?servers, "admin-set DNS (apply with FLUXPEER_MANAGE_DNS=1)");
-        return;
+        return Ok(());
     }
-    let body: String = servers.iter().map(|s| format!("nameserver {s}\n")).collect();
     #[cfg(not(windows))]
     {
         let _ = iface;
-        match std::fs::write("/etc/resolv.conf", format!("# managed by fluxpeer\n{body}")) {
-            Ok(()) => tracing::info!(?servers, "applied DNS to /etc/resolv.conf"),
-            Err(e) => tracing::warn!(error = %e, "could not write /etc/resolv.conf"),
-        }
+        let body: String = servers.iter().map(|s| format!("nameserver {s}\n")).collect();
+        apply::write("/etc/resolv.conf", format!("# managed by fluxpeer\n{body}"))?;
     }
     #[cfg(windows)]
     {
-        let _ = &body;
-        use std::os::windows::process::CommandExt;
-        let servers_csv = servers.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
-        let _ = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &format!("Set-DnsClientServerAddress -InterfaceAlias '{iface}' -ServerAddresses {servers_csv} -ErrorAction SilentlyContinue")])
-            .creation_flags(0x08000000)
-            .status();
-        tracing::info!(?servers, iface, "applied DNS via Set-DnsClientServerAddress");
+        let csv = servers.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
+        apply::run(&["powershell", "-NoProfile", "-Command", &format!("$ErrorActionPreference='Stop'; Set-DnsClientServerAddress -InterfaceAlias '{iface}' -ServerAddresses {csv}")])?;
     }
+    tracing::info!(?servers, "applied DNS");
+    Ok(())
 }
 
 #[cfg(test)]
 mod exit_contract_tests {
     use super::*;
 
+    fn test_host() -> HostEffects {
+        HostEffects { tun_name: "fp-test".into(), own_cidr: "100.72.16.0/24".into(), control_host: String::new(), relay_ips: vec![],
+            exclude_routes: vec![], dns_override: vec![], exit_state: Arc::default(), exit_progress: Arc::default(), nat_state: Arc::default(),
+            provider: ProviderPolicy { enabled: false, force: None, veto: false }, manage_host_routes: false,
+            shutdown: Arc::default(), runtime: parking_lot::Mutex::default(), probe: None }
+    }
+
+    fn test_reconciler(host: HostEffects, old: control::PeerInfo, new: control::PeerInfo, tx: mpsc::Sender<worker::WorkerMsg>) -> Reconciler {
+        let reg = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([(old.pubkey, status::PeerStat::new(old.allowed_ips.clone()))])));
+        Reconciler {
+            // An unsupported URL makes polling fail locally; pending snapshots
+            // must still be applied without a server or a live node.
+            client: fluxpeer_sdk::Client::with_password("unsupported://control", ""), device_id: "test".into(), n: 1,
+            own_pub: PublicKey::from(&StaticSecret::from([42; 32])), peer_to_wid: Arc::default(), cand_to_wid: Arc::default(),
+            allowed: Arc::new(arc_swap::ArcSwap::from_pointee(worker::RouteTable::default().with_peer(old.pubkey, 0, &old.allowed_ips))),
+            status_reg: reg, wtxs: vec![tx], ordinal: 1,
+            known: KnownPeers::from([(old.pubkey, (0, old.candidates.clone(), old.allowed_ips.clone()))]),
+            desired_epoch: 1, apply_status: Arc::default(), host: Arc::new(host), use_exit: None, relay_available: false,
+            desired: vec![old], pending: Some(control::Snapshot { epoch: 2, peers: vec![new], self_exit: false }), self_exit: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_tick_runs_exit_dns_and_nat_even_after_host_route_failure() {
+        let mut host = test_host();
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let capture = calls.clone();
+        host.probe = Some(Arc::new(move |stage| {
+            capture.lock().push(stage);
+            match stage { HostStage::Routes | HostStage::Dns => Err(ApplyError::new(&["injected-host-effect"], format!("{stage:?} denied"))), _ => Ok(()) }
+        }));
+        let (tx, mut rx) = mpsc::channel(8);
+        let old = peer(1, "192.0.2.1:1", &["100.72.16.2/32"]);
+        let new = peer(1, "192.0.2.2:2", &["100.72.16.2/32", "10.0.0.0/8"]);
+        let mut r = test_reconciler(host, old, new.clone(), tx);
+        r.apply_status.lock().complete(1, Ok(()));
+        let result = r.reconcile_tick().await;
+        r.apply_status.lock().complete(r.desired_epoch, result);
+        assert_eq!(*calls.lock(), [HostStage::Routes, HostStage::Exit, HostStage::Dns, HostStage::Nat]);
+        assert_eq!(r.apply_status.lock().applied_epoch, Some(1));
+        assert!(r.apply_status.lock().last_error.as_ref().unwrap().stderr.contains("Dns denied"));
+        assert!(r.apply_status.lock().last_error.as_ref().unwrap().stderr.contains("Routes denied"));
+        assert_eq!(r.known[&new.pubkey].2, new.allowed_ips);
+        assert!(matches!(rx.recv().await, Some(worker::WorkerMsg::UpdateCandidates { .. })));
+        calls.lock().clear();
+        assert!(r.reconcile_tick().await.is_err());
+        assert_eq!(*calls.lock(), [HostStage::Exit, HostStage::Nat]); // failed effects respect independent backoff
+    }
+
+    #[tokio::test]
+    async fn failed_old_exit_retirement_does_not_block_revoke_or_new_membership() {
+        let mut host = test_host(); host.manage_host_routes = true;
+        *host.exit_state.lock() = Some(ExitTunState { teardown_started: std::sync::atomic::AtomicBool::new(false), dev: "fp-test".into(), progress: parking_lot::Mutex::default(), exit_peer: [1; 32] });
+        host.probe = Some(Arc::new(|stage| if stage == HostStage::Retire { Err(ApplyError::new(&["route", "delete"], "denied")) } else { Ok(()) }));
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut r = test_reconciler(host, peer(1, "192.0.2.1:1", &["0.0.0.0/0"]), peer(2, "192.0.2.2:2", &["100.72.16.3/32"]), tx);
+        assert!(r.reconcile_tick().await.is_err());
+        assert!(!r.known.contains_key(&[1; 32]));
+        assert!(r.known.contains_key(&[2; 32]));
+        assert!(matches!(rx.recv().await, Some(worker::WorkerMsg::RemovePeer(pk)) if pk == [1; 32]));
+        assert!(matches!(rx.recv().await, Some(worker::WorkerMsg::AddPeer { .. })));
+        assert_eq!(r.host.exit_state.lock().as_ref().unwrap().exit_peer, [1; 32]);
+        assert!(r.pending.is_none()); // membership completed; host retirement remains retryable
+    }
+
+    #[test]
+    fn reselecting_a_partially_retired_exit_finishes_cleanup_before_reinstall() {
+        let state: ExitState = Arc::new(parking_lot::Mutex::new(Some(ExitTunState {
+            teardown_started: std::sync::atomic::AtomicBool::new(true), dev: "fp-test".into(),
+            progress: parking_lot::Mutex::default(), exit_peer: [1; 32],
+        })));
+        retire_exit(&state, &Arc::default(), Some([1; 32])).unwrap();
+        assert!(state.lock().is_none());
+    }
+
+    #[test]
+    fn dns_failure_retries_without_reinstalling_or_rolling_back_routes() {
+        let state = parking_lot::Mutex::new(None);
+        let shutdown = Arc::default();
+        let mut dns = DnsInstall::default();
+        let up = std::cell::Cell::new(0);
+        let mut dns_calls = 0;
+        for attempt in 0..3 {
+            sync_exit_with(&state, &shutdown, Some([1; 32]), |s| *s,
+                || { up.set(up.get() + 1); Ok(Some([1; 32])) }, |_| panic!("DNS must not trigger route rollback")).unwrap();
+            let result = sync_dns_with(&mut dns, Some("100.72.16.1"), |_| {
+                dns_calls += 1;
+                if attempt == 0 { Err(ApplyError::new(&["resolvectl"], "access denied")) } else { Ok(()) }
+            }, || panic!("DNS failure must not clear full-tunnel"));
+            assert_eq!(result.is_err(), attempt == 0);
+        }
+        assert_eq!(up.get(), 1); assert_eq!(dns_calls, 2);
+        assert!(!dns.dirty); assert_eq!(dns.applied.as_deref(), Some("100.72.16.1"));
+    }
+
+    #[test]
+    fn invalid_overlay_cidr_is_skipped() {
+        assert!(overlay_cidr(Ipv4Addr::LOCALHOST, 40).is_empty());
+        assert_eq!(overlay_cidr(Ipv4Addr::new(100, 72, 16, 5), 24), "100.72.16.0/24");
+    }
+
+    #[test]
+    fn nat_partial_apply_cleanup_and_revocation_failures_remain_retryable() {
+        let mut state = NatInstall::default();
+        let mut status = apply::Status::default();
+        status.complete(1, Ok(()));
+        let failure = || ApplyError::new(&["sysctl", "-w"], "permission denied");
+        let result = reconcile_nat(&mut state, true, || Ok(Some("wan0".into())), |_, _| Err(failure()));
+        status.complete(2, result);
+        assert_eq!(status.applied_epoch, Some(1));
+        assert!(status.last_error.is_some());
+        assert!(state.applied.is_none());
+        assert_eq!(state.dirty.as_deref(), Some("wan0"));
+        assert!(reconcile_nat(&mut state, true, || panic!("cleanup must finish first"), |on, _| { assert!(!on); Err(failure()) }).is_err());
+        assert!(state.dirty.is_some());
+        let mut calls = Vec::new();
+        status.complete(2, reconcile_nat(&mut state, true, || Ok(Some("wan0".into())), |on, _| { calls.push(on); Ok(()) }));
+        assert_eq!(calls, [false, true]);
+        assert_eq!(status.applied_epoch, Some(2));
+        assert!(status.last_error.is_none());
+        assert!(state.dirty.is_none());
+        assert!(reconcile_nat(&mut state, false, || Ok(None), |_, _| Err(failure())).is_err());
+        assert!(state.applied.is_some());
+        reconcile_nat(&mut state, false, || Ok(None), |_, _| Ok(())).unwrap();
+        assert!(state.applied.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_epoch_survives_dispatch_failure_then_updates_endpoints_routes_and_status() {
+        let old = peer(1, "192.0.2.1:1000", &["100.72.16.2/32"]);
+        let new = peer(1, "192.0.2.2:2000", &["100.72.16.2/32", "10.0.0.0/8"]);
+        let stat = status::PeerStat::new(old.allowed_ips.clone());
+        let reg = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([(old.pubkey, stat)])));
+        let (tx, rx) = mpsc::channel(4);
+        drop(rx); // Worker dispatch fails before either change may be acknowledged.
+        let mut r = Reconciler {
+            client: fluxpeer_sdk::Client::with_password("http://127.0.0.1:1", ""),
+            device_id: "test".into(), n: 1,
+            own_pub: PublicKey::from(&StaticSecret::from([42; 32])),
+            peer_to_wid: Arc::default(), cand_to_wid: Arc::default(),
+            allowed: Arc::new(arc_swap::ArcSwap::from_pointee(worker::RouteTable::default().with_peer(old.pubkey, 0, &old.allowed_ips))),
+            status_reg: reg, wtxs: vec![tx], ordinal: 1,
+            known: KnownPeers::from([(old.pubkey, (0, old.candidates.clone(), old.allowed_ips.clone()))]),
+            desired_epoch: 1, apply_status: Arc::default(), host: Arc::new(test_host()), use_exit: None, relay_available: false,
+            desired: vec![old.clone()], pending: Some(control::Snapshot { epoch: 2, peers: vec![new.clone()], self_exit: false }), self_exit: false,
+        };
+        r.apply_status.lock().complete(1, Ok(()));
+        let result = r.apply_pending().await;
+        r.apply_status.lock().complete(r.desired_epoch, result);
+        assert_eq!(r.apply_status.lock().applied_epoch, Some(1));
+        assert!(r.pending.is_some());
+        assert_eq!(r.known[&old.pubkey].1, old.candidates);
+        let (tx, mut rx) = mpsc::channel(4);
+        r.wtxs = vec![tx];
+        r.apply_pending().await.unwrap(); // No new control response or epoch required.
+        assert!(matches!(rx.recv().await, Some(worker::WorkerMsg::UpdateCandidates { .. })));
+        assert_eq!(r.known[&old.pubkey].1, new.candidates);
+        assert_eq!(r.known[&old.pubkey].2, new.allowed_ips);
+        assert_eq!(status::snapshot(&r.status_reg)[0].allowed_ips, new.allowed_ips);
+        assert_eq!(worker::route_tun(&packet([10, 2, 3, 4]), &r.allowed.load()), Some(([1; 32], 0)));
+        assert!(r.pending.is_none());
+        // Membership success does not acknowledge a host-route failure.
+        let wanted = new.allowed_ips.iter().cloned().collect();
+        let result = apply::sync_routes(&mut r.host.runtime.lock().routes, &wanted, |_| Err(ApplyError::new(&["ip", "route"], "permission denied")), |_| Ok(()));
+        r.apply_status.lock().complete(r.desired_epoch, result);
+        assert_eq!(r.apply_status.lock().applied_epoch, Some(1));
+        let result = apply::sync_routes(&mut r.host.runtime.lock().routes, &wanted, |_| Ok(()), |_| Ok(()));
+        r.apply_status.lock().complete(r.desired_epoch, result);
+        assert_eq!(r.apply_status.lock().applied_epoch, Some(2));
+        assert!(r.apply_status.lock().last_error.is_none());
+    }
+
     #[test]
     fn approval_and_revocation_apply_nat_once_and_only_tear_down_owned_state() {
-        let mut state = None;
+        let mut state = NatInstall::default();
         let mut calls = Vec::new();
         for approved in [false, true, true, false, false, true, false] {
-            reconcile_nat(&mut state, nat_on(None, false, approved), || Some("wan0".into()), |on, phys| calls.push((on, phys.to_string())));
+            reconcile_nat(&mut state, nat_on(None, false, approved), || Ok(Some("wan0".into())), |on, phys| { calls.push((on, phys.to_string())); Ok(()) }).unwrap();
         }
         assert_eq!(calls, vec![(true, "wan0".into()), (false, "wan0".into()), (true, "wan0".into()), (false, "wan0".into())]);
-        assert!(state.is_none());
+        assert!(state.applied.is_none());
     }
 
     #[test]
     fn local_override_veto_and_missing_egress_preserve_provider_contract() {
-        let mut state = None;
+        let mut state = NatInstall::default();
         let mut calls = Vec::new();
         for approved in [true, false] {
-            reconcile_nat(&mut state, nat_on(Some(true), true, approved), || Some("wan0".into()), |on, _| calls.push(on));
+            reconcile_nat(&mut state, nat_on(Some(true), true, approved), || Ok(Some("wan0".into())), |on, _| { calls.push(on); Ok(()) }).unwrap();
         }
         assert!(calls.is_empty());
-        reconcile_nat(&mut state, nat_on(Some(true), false, false), || None, |on, _| calls.push(on));
-        assert!(state.is_none());
-        reconcile_nat(&mut state, nat_on(Some(true), false, false), || Some("wan1".into()), |on, _| calls.push(on));
+        assert!(reconcile_nat(&mut state, nat_on(Some(true), false, false), || Ok(None), |on, _| { calls.push(on); Ok(()) }).is_err());
+        assert!(state.applied.is_none());
+        reconcile_nat(&mut state, nat_on(Some(true), false, false), || Ok(Some("wan1".into())), |on, _| { calls.push(on); Ok(()) }).unwrap();
         assert_eq!(calls, vec![true]);
-        assert_eq!(state.as_deref(), Some("wan1"));
+        assert_eq!(state.applied.as_deref(), Some("wan1"));
     }
     fn peer(id: u8, endpoint: &str, prefixes: &[&str]) -> control::PeerInfo {
         control::PeerInfo {
@@ -1365,7 +1604,7 @@ mod exit_contract_tests {
         for tick in 0..3 {
             let result = sync_exit_with(&state, &shutdown, Some([1; 32]), |s| *s, || {
                 attempts.set(attempts.get() + 1);
-                if tick == 0 { Err(std::io::ErrorKind::AlreadyExists.into()) }
+                if tick == 0 { Err(ApplyError::new(&["route", "add"], "File exists")) }
                 else { Ok(Some([1; 32])) }
             }, |_| panic!("same exit must not be torn down"));
             assert_eq!(result.is_err(), tick == 0);
@@ -1408,10 +1647,11 @@ mod exit_contract_tests {
         let shutdown = Arc::new(parking_lot::Mutex::new(false));
         let events = std::cell::RefCell::new(Vec::new());
         retire_exit_with(&state, &shutdown, selected_exit(&desired), |s| *s, |pk| {
-            assert_eq!(pk, [1; 32]);
+            assert_eq!(*pk, [1; 32]);
             assert_eq!(worker::route_tun(&packet([8, 8, 8, 8]), &table), Some(([1; 32], 0)));
             events.borrow_mut().push("remove A /1 and bypass");
-        });
+            Ok(())
+        }).unwrap();
         peer_changes(&known, &desired, |change| {
             assert!(state.lock().is_none());
             if let PeerChange::Routes(p) = change { table = table.with_peer(p.pubkey, 0, &p.allowed_ips); }
@@ -1443,19 +1683,19 @@ mod exit_contract_tests {
             value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             let cfg: Config = serde_json::from_value(value).unwrap();
             let policy = ProviderPolicy::from_config(&cfg, embedded);
-            let state = Arc::new(parking_lot::Mutex::new(None));
+            let state = Arc::new(parking_lot::Mutex::new(NatInstall::default()));
             let shutdown = Arc::new(parking_lot::Mutex::new(false));
             let mut calls = Vec::new();
             // The startup config is already approved; subsequent ticks revoke it.
             for approved in [true, true, false, false] {
-                policy.sync(&state, &shutdown, approved, || Some("wan0".into()), |on, phys| {
-                    assert_eq!(phys, "wan0"); calls.push(on);
-                });
+                policy.sync(&state, &shutdown, approved, || Ok(Some("wan0".into())), |on, phys| {
+                    assert_eq!(phys, "wan0"); calls.push(on); Ok(())
+                }).unwrap();
             }
             assert_eq!(calls, expected);
-            shutdown_with(&shutdown, || { state.lock().take(); });
-            policy.sync(&state, &shutdown, true, || panic!("shutdown must skip discovery"), |_, _| panic!("shutdown must skip NAT"));
-            assert!(state.lock().is_none());
+            shutdown_with(&shutdown, || { state.lock().applied.take(); });
+            policy.sync(&state, &shutdown, true, || panic!("shutdown must skip discovery"), |_, _| panic!("shutdown must skip NAT")).unwrap();
+            assert!(state.lock().applied.is_none());
         }
     }
 
@@ -1463,7 +1703,7 @@ mod exit_contract_tests {
     fn shutdown_serializes_with_inflight_apply_and_blocks_late_nat_and_exit() {
         let shutdown = Arc::new(parking_lot::Mutex::new(false));
         let state = Arc::new(parking_lot::Mutex::new(None));
-        let nat = Arc::new(parking_lot::Mutex::new(None));
+        let nat = Arc::new(parking_lot::Mutex::new(NatInstall::default()));
         let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -1488,11 +1728,11 @@ mod exit_contract_tests {
         release_tx.send(()).unwrap();
         apply.join().unwrap().unwrap();
         cleanup.join().unwrap();
-        set_nat(&nat, &shutdown, true, || panic!("stopped"), |_, _| panic!("stopped"));
+        set_nat(&nat, &shutdown, true, || panic!("stopped"), |_, _| panic!("stopped")).unwrap();
         sync_exit_with(&state, &shutdown, Some([1; 32]), |s| *s, || panic!("stopped"), |_| panic!("stopped")).unwrap();
         assert_eq!(*events.lock(), ["apply", "teardown"]);
         assert!(state.lock().is_none());
-        assert!(nat.lock().is_none());
+        assert!(nat.lock().applied.is_none());
     }
 
     #[test]

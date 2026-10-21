@@ -2,7 +2,7 @@
 //! Modeled on the `fp-route` crate but run directly — the node is root, so it needs no
 //! privileged-helper hop. `ip`/`resolvectl` on Linux, `route`/`scutil` on macOS.
 
-use std::process::Command;
+use crate::apply::{self, ApplyError, Result};
 
 /// Normalize a host or CIDR to a CIDR (`1.2.3.4` → `1.2.3.4/32`).
 fn cidr(s: &str) -> String {
@@ -18,66 +18,74 @@ fn cidr(s: &str) -> String {
 /// Connected route for `cidr` over the tun device. A default route (`0.0.0.0/0` /
 /// `::/0`) is NEVER installed raw — it would clobber the physical default; full-
 /// tunnel uses the split-default in [`exit_up`].
-pub(crate) fn route_replace(cidr: &str, dev: &str) {
-    if crate::control::is_default_prefix(cidr) {
-        return;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = Command::new("route").args(["-n", "delete", "-net", cidr]).status();
-        let _ = Command::new("route")
-            .args(["-n", "add", "-net", cidr, "-interface", dev])
-            .status();
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = Command::new("ip").args(["route", "replace", cidr, "dev", dev]).status();
+pub(crate) fn route_replace(cidr: &str, dev: &str) -> Result {
+    optional_route_result(current_os(), cidr, route_change_with(current_os(), cidr, dev, true, &mut apply::System))
 }
 
-/// Remove a route previously installed by [`route_replace`].
-pub(crate) fn route_del(cidr: &str, dev: &str) {
-    if crate::control::is_default_prefix(cidr) {
-        return;
+pub(crate) fn route_del(cidr: &str, dev: &str) -> Result {
+    optional_route_result(current_os(), cidr, route_change_with(current_os(), cidr, dev, false, &mut apply::System))
+}
+
+fn optional_route_result(os: RouteOs, cidr: &str, result: Result) -> Result {
+    match result {
+        Err(error) if (os == RouteOs::Windows && error.kind == std::io::ErrorKind::Unsupported)
+            || (cidr.contains(':') && apply::ipv6_unavailable(&error)) => {
+                tracing::warn!(%error, cidr, "host route unavailable; skipping unsupported route"); Ok(())
+            }
+        result => result,
     }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = dev; // macOS deletes by destination only
-        let _ = Command::new("route").args(["-n", "delete", "-net", cidr]).status();
+}
+
+fn route_change_with(os: RouteOs, cidr: &str, dev: &str, add: bool, runner: &mut impl apply::Runner) -> Result {
+    if crate::control::is_default_prefix(cidr) { return Ok(()); }
+    if os == RouteOs::Windows {
+        return Err(ApplyError::io(&["route", cidr, dev], std::io::Error::new(std::io::ErrorKind::Unsupported, "Windows host routes are deferred to F05")));
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = Command::new("ip").args(["route", "del", cidr, "dev", dev]).status();
+    if os == RouteOs::Macos {
+        let family = if cidr.contains(':') { "-inet6" } else { "-inet" };
+        missing_is_removed(runner.run(&["route", "-n", "delete", family, "-net", cidr], None).map(|_| ()))?;
+        if add { runner.run(&["route", "-n", "add", family, "-net", cidr, "-interface", dev], None)?; }
+        Ok(())
+    } else {
+        let result = runner.run(&["ip", if cidr.contains(':') { "-6" } else { "-4" }, "route", if add { "replace" } else { "del" }, cidr, "dev", dev], None).map(|_| ());
+        if add { result } else { missing_is_removed(result) }
+    }
+}
+
+fn missing_is_removed(result: Result) -> Result {
+    match result { Err(e) if e.exit_code.is_some() && e.missing() => Ok(()), result => result }
 }
 
 /// A bypass route: `dst` routes via the original physical `gateway` on `phys`
 /// instead of the tunnel. The explicit device is REQUIRED — the split-default is
 /// already installed, so a `via`-only route would resolve the gateway back through
 /// the tun and loop. More specific than `0.0.0.0/1`, so it wins (split-exclude).
-pub(crate) fn bypass_add(dst: &str, gateway: &str, phys: &str) {
+pub(crate) fn bypass_add(dst: &str, gateway: &str, phys: &str) -> Result<bool> {
     let v6 = dst.parse::<fluxpeer_sdk::prefix::IpPrefix>().is_ok_and(|p| p.network().is_ipv6());
-    let v6_route = if v6 { physical_v6_route() } else { None };
+    let v6_route = if v6 { physical_v6_route()? } else { None };
     let (gateway, phys) = if v6 {
         let Some((gateway, phys)) = v6_route.as_ref() else {
             tracing::warn!(dst, "no IPv6 physical default; carrier bypass not needed until IPv6 is available");
-            return;
+            return Ok(false);
         };
         (gateway.as_str(), phys.as_str())
     } else { (gateway, phys) };
     if current_os() == RouteOs::Macos {
         // Match the existing IPv4 replacement behavior, with the right family.
-        bypass_del(dst);
+        bypass_del(dst)?;
     }
-    if let Some(command) = bypass_cmd(current_os(), dst, Some((gateway, phys)))
-        && let Err(error) = run_route_command(&command)
-    {
-        tracing::warn!(%error, dst, "carrier bypass installation failed");
+    if let Some(command) = bypass_cmd(current_os(), dst, Some((gateway, phys))) {
+        run_route_command(&command)?;
+        return Ok(true);
     }
+    Err(ApplyError::new(&["bypass", dst], "unsupported platform"))
 }
 
-pub(crate) fn bypass_del(dst: &str) {
-    if let Some(command) = bypass_cmd(current_os(), dst, None)
-        && let Err(error) = run_route_command(&command)
-    {
-        tracing::warn!(%error, dst, "carrier bypass removal failed");
+pub(crate) fn bypass_del(dst: &str) -> Result {
+    if let Some(command) = bypass_cmd(current_os(), dst, None) {
+        missing_is_removed(run_route_command(&command).map_err(ApplyError::from))?;
     }
+    Ok(())
 }
 
 fn bypass_cmd(os: RouteOs, dst: &str, via: Option<(&str, &str)>) -> Option<Vec<String>> {
@@ -94,16 +102,17 @@ fn bypass_cmd(os: RouteOs, dst: &str, via: Option<(&str, &str)>) -> Option<Vec<S
 
 /// IPv6 carriers must bypass through the IPv6 physical gateway, never through
 /// the IPv4 gateway. Query before installing the guard's /1 routes.
-fn physical_v6_route() -> Option<(String, String)> {
-    let command = match current_os() {
-        RouteOs::Linux => argv(&["ip", "-6", "route", "show", "default"]),
-        RouteOs::Macos => argv(&["route", "-n", "get", "-inet6", "default"]),
-        RouteOs::Other => return None,
+fn physical_v6_route() -> Result<Option<(String, String)>> {
+    let command: &[&str] = match current_os() {
+        RouteOs::Linux => &["ip", "-6", "route", "show", "default"],
+        RouteOs::Macos => &["route", "-n", "get", "-inet6", "default"],
+        RouteOs::Other | RouteOs::Windows => return Ok(None),
     };
-    let (program, args) = command.split_first()?;
-    let output = Command::new(program).args(args).output().ok()?;
-    if !output.status.success() { return None; }
-    parse_physical_v6_route(current_os(), &String::from_utf8_lossy(&output.stdout))
+    match apply::output(command) {
+        Ok(output) => Ok(parse_physical_v6_route(current_os(), &output)),
+        Err(e) if apply::ipv6_unavailable(&e) => { tracing::warn!(%e, "IPv6 physical route unavailable"); Ok(None) },
+        Err(e) => Err(e),
+    }
 }
 
 fn parse_physical_v6_route(os: RouteOs, output: &str) -> Option<(String, String)> {
@@ -119,137 +128,141 @@ fn parse_physical_v6_route(os: RouteOs, output: &str) -> Option<(String, String)
 
 /// The original physical default gateway (before fp takes over) — needed so bypass
 /// routes point back at the real next hop.
-pub(crate) fn default_gateway() -> Option<String> {
+pub(crate) fn default_gateway() -> Result<Option<String>> {
+    let output = physical_default()?;
+    Ok(default_field(&output, "gateway:", "via"))
+}
+
+fn physical_default() -> Result<String> {
     #[cfg(target_os = "macos")]
-    {
-        let out = Command::new("route").args(["-n", "get", "default"]).output().ok()?;
-        let s = String::from_utf8_lossy(&out.stdout);
-        s.lines()
-            .find_map(|l| l.trim().strip_prefix("gateway:").map(|g| g.trim().to_string()))
-    }
+    { apply::output(&["route", "-n", "get", "default"]) }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    { apply::output(&["ip", "route", "show", "default"]) }
+    #[cfg(windows)]
+    { Err(ApplyError::io(&["physical-default"], std::io::Error::new(std::io::ErrorKind::Unsupported, "Windows routes are deferred to F05"))) }
+}
+
+fn default_field(output: &str, _mac_field: &str, _linux_field: &str) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    { output.lines().find_map(|l| l.trim().strip_prefix(_mac_field).map(|g| g.trim().to_string())) }
     #[cfg(not(target_os = "macos"))]
     {
-        let out = Command::new("ip").args(["route", "show", "default"]).output().ok()?;
-        let s = String::from_utf8_lossy(&out.stdout);
-        let parts: Vec<&str> = s.split_whitespace().collect();
-        parts
-            .iter()
-            .position(|w| *w == "via")
-            .and_then(|i| parts.get(i + 1))
-            .map(|g| g.to_string())
+        let parts: Vec<_> = output.split_whitespace().collect();
+        parts.iter().position(|w| *w == _linux_field).and_then(|i| parts.get(i + 1)).map(|v| v.to_string())
     }
 }
 
-/// Does `dst` need an explicit bypass route? Only REMOTE destinations (routed via
-/// the default gateway) get hijacked by the 0.0.0.0/1 split-default and must be
-/// pinned; on-link / connected destinations (the LAN, an on-link carrier) already
-/// win via their more-specific connected route, and adding a via-gateway route for
-/// them would BREAK that on-link reachability.
-pub(crate) fn needs_bypass(dst: &str) -> bool {
-    let ip = dst.split('/').next().unwrap_or(dst);
+/// Connected destinations already have a more-specific route. A failed lookup
+/// is not evidence of an on-link destination and must prevent a false full-tunnel UP.
+pub(crate) fn needs_bypass(dst: &str) -> Result<bool> {
+    let _ip = dst.split('/').next().unwrap_or(dst);
     #[cfg(target_os = "macos")]
-    {
-        let _ = ip;
-        true // macOS: pin conservatively (refine later)
-    }
+    { Ok(true) }
     #[cfg(not(target_os = "macos"))]
     {
-        match Command::new("ip").args([if ip.contains(':') { "-6" } else { "-4" }, "route", "get", ip]).output() {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).contains(" via "), // via a gateway ⇒ remote
-            Err(_) => true,
-        }
-    }
+        if _ip.contains(':') && physical_v6_route()?.is_none() { return Ok(false); }
+        Ok(apply::output(&["ip", if _ip.contains(':') { "-6" } else { "-4" }, "route", "get", _ip])?.contains(" via ")) }
 }
 
 /// The physical egress interface (the default route's device) — for exit-node NAT.
-pub(crate) fn physical_iface() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let out = Command::new("route").args(["-n", "get", "default"]).output().ok()?;
-        let s = String::from_utf8_lossy(&out.stdout);
-        s.lines()
-            .find_map(|l| l.trim().strip_prefix("interface:").map(|i| i.trim().to_string()))
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let out = Command::new("ip").args(["route", "show", "default"]).output().ok()?;
-        let s = String::from_utf8_lossy(&out.stdout);
-        let parts: Vec<&str> = s.split_whitespace().collect();
-        parts
-            .iter()
-            .position(|w| *w == "dev")
-            .and_then(|i| parts.get(i + 1))
-            .map(|d| d.to_string())
-    }
+pub(crate) fn physical_iface() -> Result<Option<String>> {
+    #[cfg(not(target_os = "windows"))]
+    { Ok(default_field(&physical_default()?, "interface:", "dev")) }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        let out = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "(Get-NetRoute -DestinationPrefix 0.0.0.0/0 -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1).InterfaceAlias",
-            ])
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .output()
-            .ok()?;
-        let s = String::from_utf8_lossy(&out.stdout);
-        let t = s.trim();
-        if t.is_empty() { None } else { Some(t.to_string()) }
+        let output = apply::output(&["powershell", "-NoProfile", "-Command",
+            "$ErrorActionPreference='Stop'; (Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | Select-Object -First 1).InterfaceAlias"])?;
+        Ok(Some(output.trim().to_string()).filter(|s| !s.is_empty()))
     }
 }
 
 /// Bring up full-tunnel (exit node): the `0.0.0.0/1` + `128.0.0.0/1` split-default
 /// over the tun (overrides the physical default WITHOUT deleting it — the wg-quick
-/// trick), bypass routes for the carrier + excluded subnets via `gateway`, and DNS.
+/// trick) and bypass routes for the carrier + excluded subnets via `gateway`.
+/// DNS is applied independently and never causes these routes to be rolled back.
 /// Returns whether IPv6 egress was blocked (see [`v6_block_up`]) so the teardown
 /// removes exactly what we installed.
-pub(crate) fn exit_up(dev: &str, gateway: &str, phys: &str, bypass: &[String], dns: Option<&str>) -> std::io::Result<bool> {
-    // Install the leak guard even without a current v6 default: connectivity
-    // may appear later while the full tunnel remains active. Fail before v4 UP.
-    // Bypass FIRST (carrier must be reachable before we hijack the default), then
-    // the split-default over the tun.
-    for b in bypass {
-        bypass_add(b, gateway, phys);
-    }
-    let v6_blocked = match v6_block_up(dev) {
-        Ok(blocked) => blocked,
-        Err(error) => {
-            for destination in bypass { bypass_del(destination); }
-            return Err(error);
-        }
-    };
-    route_replace("0.0.0.0/1", dev);
-    route_replace("128.0.0.0/1", dev);
-    if let Some(d) = dns {
-        set_dns(dev, d);
-    }
-    tracing::info!(
-        dev,
-        gateway,
-        phys,
-        bypass = bypass.len(),
-        dns,
-        v6_blocked,
-        "exit-node (full-tunnel) UP"
-    );
-    Ok(v6_blocked)
+#[derive(Default)]
+pub(crate) struct ExitProgress {
+    bypass: Vec<String>,
+    defaults: Vec<String>,
+    v6_blocked: bool,
+    v6_cleanup: Vec<Vec<String>>,
 }
 
-/// Tear down full-tunnel: remove the split-default + bypass routes + reset DNS
-/// (+ the IPv6 block iff WE installed it). MUST run on shutdown, or the box is
-/// left with a broken default route + DNS.
-pub(crate) fn exit_down(dev: &str, bypass: &[String], v6_blocked: bool) {
-    route_del("0.0.0.0/1", dev);
-    route_del("128.0.0.0/1", dev);
-    for b in bypass {
-        bypass_del(b);
+#[derive(Debug)]
+enum ExitEffect<'a> {
+    BypassAdd(&'a str), BypassDel(&'a str), GuardUp(&'a mut Vec<Vec<String>>), GuardDown(&'a mut Vec<Vec<String>>),
+    DefaultAdd(&'a str), DefaultDel(&'a str),
+}
+
+fn cleanup_exit_with(progress: &mut ExitProgress, effect: &mut impl FnMut(ExitEffect<'_>) -> Result<bool>) -> Result {
+    let mut errors = Vec::new();
+    progress.defaults.retain(|p| match effect(ExitEffect::DefaultDel(p)) {
+        Ok(_) => false, Err(e) => { errors.push(Err(e)); true }
+    });
+    if !progress.v6_cleanup.is_empty() {
+        match effect(ExitEffect::GuardDown(&mut progress.v6_cleanup)) { Ok(_) => progress.v6_blocked = false, Err(e) => errors.push(Err(e)) }
     }
-    if v6_blocked {
-        v6_block_down(dev);
+    // Keep carrier/control bypasses until every redirect is gone. Otherwise a
+    // failed default-route removal could strand the next control poll in the TUN.
+    if progress.defaults.is_empty() && progress.v6_cleanup.is_empty() {
+        progress.bypass.retain(|p| match effect(ExitEffect::BypassDel(p)) {
+            Ok(_) => false, Err(e) => { errors.push(Err(e)); true }
+        });
     }
-    reset_dns(dev);
+    apply::all(errors)
+}
+
+fn exit_up_with(
+    progress: &mut ExitProgress, bypass: &[String],
+    mut effect: impl FnMut(ExitEffect<'_>) -> Result<bool>,
+) -> Result<bool> {
+    cleanup_exit_with(progress, &mut effect)?;
+    let result: Result = (|| {
+        for b in bypass { if effect(ExitEffect::BypassAdd(b))? { progress.bypass.push(b.clone()); } }
+        progress.v6_blocked = effect(ExitEffect::GuardUp(&mut progress.v6_cleanup))?;
+        for p in ["0.0.0.0/1", "128.0.0.0/1"] {
+            effect(ExitEffect::DefaultAdd(p))?;
+            progress.defaults.push(p.into());
+        }
+        Ok(())
+    })();
+    if let Err(mut error) = result {
+        if let Err(cleanup) = cleanup_exit_with(progress, &mut effect) {
+            error.stderr.push_str(&format!("; rollback: {cleanup}"));
+        }
+        return Err(error);
+    }
+    Ok(progress.v6_blocked)
+}
+
+fn exit_effect(dev: &str, gateway: &str, phys: &str, effect: ExitEffect<'_>) -> Result<bool> {
+    match effect {
+        ExitEffect::BypassAdd(b) => return bypass_add(b, gateway, phys),
+        ExitEffect::BypassDel(b) => bypass_del(b)?,
+        ExitEffect::GuardUp(pending) => return v6_block_up(dev, pending).map_err(ApplyError::from),
+        ExitEffect::GuardDown(pending) => v6_cleanup_with(pending, run_route_command)?,
+        ExitEffect::DefaultAdd(p) => route_replace(p, dev)?,
+        ExitEffect::DefaultDel(p) => route_del(p, dev)?,
+    }
+    Ok(false)
+}
+
+pub(crate) fn cleanup_exit(dev: &str, progress: &mut ExitProgress) -> Result {
+    cleanup_exit_with(progress, &mut |e| exit_effect(dev, "", "", e))
+}
+
+pub(crate) fn exit_up(dev: &str, gateway: &str, phys: &str, bypass: &[String], progress: &mut ExitProgress) -> Result<bool> {
+    let blocked = exit_up_with(progress, bypass, |e| exit_effect(dev, gateway, phys, e))?;
+    tracing::info!(dev, gateway, phys, v6_blocked = blocked, "exit-node (full-tunnel) routes UP");
+    Ok(blocked)
+}
+
+pub(crate) fn exit_down(dev: &str, progress: &mut ExitProgress) -> Result {
+    cleanup_exit(dev, progress)?;
     tracing::info!(dev, "exit-node (full-tunnel) DOWN");
+    Ok(())
 }
 
 /// The route OS family, for command generation (unit-tested per variant).
@@ -260,6 +273,7 @@ pub(crate) fn exit_down(dev: &str, bypass: &[String], v6_blocked: bool) {
 pub(crate) enum RouteOs {
     Linux,
     Macos,
+    Windows,
     Other,
 }
 
@@ -272,7 +286,9 @@ pub(crate) const fn current_os() -> RouteOs {
     {
         RouteOs::Macos
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    { RouteOs::Windows }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         RouteOs::Other
     }
@@ -301,7 +317,7 @@ fn v6_block_cmds(os: RouteOs, dev: &str) -> Vec<Vec<String>> {
             .iter()
             .map(|p| argv(&["route", "-n", "add", "-inet6", "-net", *p, "-reject", "-interface", dev]))
             .collect(),
-        RouteOs::Other => Vec::new(),
+        RouteOs::Other | RouteOs::Windows => Vec::new(),
     }
 }
 
@@ -316,7 +332,7 @@ fn v6_unblock_cmds(os: RouteOs, dev: &str) -> Vec<Vec<String>> {
             .iter()
             .map(|p| argv(&["route", "-n", "delete", "-inet6", "-net", *p, "-reject", "-interface", dev]))
             .collect(),
-        RouteOs::Other => Vec::new(),
+        RouteOs::Other | RouteOs::Windows => Vec::new(),
     }
 }
 
@@ -328,19 +344,18 @@ fn v6_legacy_cleanup_cmds(os: RouteOs) -> Vec<Vec<String>> {
 }
 
 fn run_route_command(c: &[String]) -> std::io::Result<()> {
-    let Some((prog, args)) = c.split_first() else { return Err(std::io::Error::other("empty route command")); };
-    let output = Command::new(prog).args(args).output()?;
-    if output.status.success() { return Ok(()); }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let kind = if stderr.contains("No such process") || stderr.contains("not in table") {
-        std::io::ErrorKind::NotFound
-    } else if stderr.contains("File exists") { std::io::ErrorKind::AlreadyExists }
-    else if stderr.contains("Address family not supported") || stderr.contains("IPv6 is disabled") {
-        std::io::ErrorKind::Unsupported
-    } else { std::io::ErrorKind::Other };
-    Err(std::io::Error::new(kind, format!("{}: {}: {}", c.join(" "), output.status, stderr.trim())))
+    let refs: Vec<_> = c.iter().map(String::as_str).collect();
+    apply::run(&refs).map_err(|mut error| {
+        error.kind = if error.exit_code.is_none() { error.kind }
+        else if error.missing() { std::io::ErrorKind::NotFound }
+        else if error.stderr.contains("File exists") { std::io::ErrorKind::AlreadyExists }
+        else if error.stderr.contains("Address family not supported") || error.stderr.contains("IPv6 is disabled") { std::io::ErrorKind::Unsupported }
+        else { std::io::ErrorKind::Other };
+        error.into()
+    })
 }
 
+#[cfg(test)]
 fn v6_unblock_with(cmds: &[Vec<String>], mut run: impl FnMut(&[String]) -> std::io::Result<()>) -> std::io::Result<()> {
     let mut first = None;
     for command in cmds {
@@ -354,28 +369,38 @@ fn v6_unblock_with(cmds: &[Vec<String>], mut run: impl FnMut(&[String]) -> std::
 
 /// Roll back only additions that succeeded. Never delete an existing ordinary
 /// route after EEXIST; missing legacy unreachable routes are expected on upgrade.
-fn v6_block_with(os: RouteOs, dev: &str, mut run: impl FnMut(&[String]) -> std::io::Result<()>) -> std::io::Result<bool> {
+#[cfg(test)]
+fn v6_block_with(os: RouteOs, dev: &str, run: impl FnMut(&[String]) -> std::io::Result<()>) -> std::io::Result<bool> {
+    v6_block_tracked(os, dev, &mut Vec::new(), run)
+}
+
+fn v6_cleanup_with(pending: &mut Vec<Vec<String>>, mut run: impl FnMut(&[String]) -> std::io::Result<()>) -> std::io::Result<()> {
+    let mut first = None;
+    pending.retain(|command| match run(command) {
+        Ok(()) => false,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH)
+            || error.get_ref().and_then(|e| e.downcast_ref::<ApplyError>()).is_some_and(|e| e.exit_code.is_some() && e.missing()) => false,
+        Err(error) => { if first.is_none() { first = Some(error); } true }
+    });
+    first.map_or(Ok(()), Err)
+}
+
+fn v6_block_tracked(os: RouteOs, dev: &str, pending: &mut Vec<Vec<String>>, mut run: impl FnMut(&[String]) -> std::io::Result<()>) -> std::io::Result<bool> {
+    v6_cleanup_with(pending, &mut run)?;
     for command in v6_legacy_cleanup_cmds(os) {
-        if let Err(error) = run(&command) {
-            if error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) {
-                tracing::debug!(%error, "no legacy IPv6 guard to remove");
-            } else {
-                tracing::warn!(%error, "legacy IPv6 guard cleanup failed");
-                return Err(error);
-            }
-        }
+        if let Err(error) = run(&command)
+            && error.kind() != std::io::ErrorKind::NotFound && error.raw_os_error() != Some(libc::ESRCH) { return Err(error); }
     }
-    let cmds = v6_block_cmds(os, dev);
-    for (installed, command) in cmds.iter().enumerate() {
-        if let Err(error) = run(command) {
-            let undo: Vec<_> = v6_unblock_cmds(os, dev).into_iter().take(installed).collect();
-            if let Err(rollback) = v6_unblock_with(&undo, &mut run) {
-                tracing::error!(%rollback, "IPv6 block rollback failed");
+    for (command, undo) in v6_block_cmds(os, dev).into_iter().zip(v6_unblock_cmds(os, dev)) {
+        if let Err(error) = run(&command) {
+            if let Err(rollback) = v6_cleanup_with(pending, &mut run) {
+                tracing::error!(%rollback, "IPv6 block rollback failed; cleanup retained for retry");
             }
             return Err(error);
         }
+        pending.push(undo);
     }
-    Ok(!cmds.is_empty())
+    Ok(!pending.is_empty())
 }
 
 fn v6_guard_result(result: std::io::Result<bool>) -> std::io::Result<bool> {
@@ -388,213 +413,229 @@ fn v6_guard_result(result: std::io::Result<bool>) -> std::io::Result<bool> {
     }
 }
 
-fn v6_block_up(dev: &str) -> std::io::Result<bool> {
+fn v6_block_up(dev: &str, pending: &mut Vec<Vec<String>>) -> std::io::Result<bool> {
     #[cfg(target_os = "linux")]
     if std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6").is_ok_and(|v| v.trim() == "1") {
         tracing::warn!("IPv6 is disabled; continuing IPv4 full-tunnel");
         return Ok(false);
     }
-    let blocked = v6_guard_result(v6_block_with(current_os(), dev, run_route_command))?;
+    let result = v6_block_tracked(current_os(), dev, pending, run_route_command);
+    let blocked = if pending.is_empty() { v6_guard_result(result)? } else { result? };
     if blocked { tracing::info!("IPv6 egress blocked in full-tunnel (not supported yet)"); }
     Ok(blocked)
-}
-
-fn v6_block_down(dev: &str) {
-    if let Err(error) = v6_unblock_with(&v6_unblock_cmds(current_os(), dev), run_route_command) {
-        tracing::error!(%error, "IPv6 guard removal incomplete");
-    }
 }
 
 /// Exit SIDE: enable IPv4+IPv6 forwarding + NAT masquerade out `phys` so traffic from
 /// peers routing 0.0.0.0/0 (or ::/0) through us reaches the internet. Linux only (the
 /// common exit-node platform); idempotent on both stacks.
-pub(crate) fn exit_gateway_up(phys: &str, tun: &str, overlay_cidr: &str) {
+pub(crate) fn exit_gateway_up(phys: &str, tun: &str, overlay_cidr: &str, _backend: Option<&dyn crate::firewall::Firewall>) -> Result {
     #[cfg(target_os = "linux")]
     {
-        let _ = overlay_cidr; // Linux masquerades by egress iface, not by source subnet.
-        crate::firewall::detect().up(phys, tun);
+        let _ = overlay_cidr;
+        _backend.ok_or_else(|| ApplyError::new(&["firewall", "up"], "missing selected backend"))?.up(phys, tun)?;
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = phys; // WinNAT masquerades out the system's default route automatically.
-        // Enable IPv4 forwarding so peer traffic transits the box; simplest is to set
-        // it on every v4 interface (the tun must forward; the egress iface too).
-        win_ps(&format!(
-            "Set-NetIPInterface -InterfaceAlias '{tun}' -Forwarding Enabled -ErrorAction SilentlyContinue"
-        ));
-        win_ps(
-            "Get-NetIPInterface -AddressFamily IPv4 | Set-NetIPInterface -Forwarding Enabled -ErrorAction SilentlyContinue",
-        );
-        // WinNAT (Windows 10+ built-in): masquerade the overlay subnet out the default
-        // route. The winnat driver service defaults to manual/stopped — start it first.
-        // Idempotent: drop any stale instance of our NAT before recreating it.
-        win_ps("Start-Service winnat -ErrorAction SilentlyContinue");
-        win_ps("Remove-NetNat -Name fluxpeer-exit -Confirm:$false -ErrorAction SilentlyContinue");
-        win_ps(&format!(
-            "New-NetNat -Name fluxpeer-exit -InternalIPInterfaceAddressPrefix '{overlay_cidr}' -ErrorAction SilentlyContinue"
-        ));
-        tracing::info!(tun, overlay_cidr, "exit-node GATEWAY up (WinNAT + forwarding)");
+        let _ = phys;
+        win_ps(&format!("Set-NetIPInterface -InterfaceAlias '{tun}' -Forwarding Enabled"))?;
+        win_ps("Get-NetIPInterface -AddressFamily IPv4 | Set-NetIPInterface -Forwarding Enabled")?;
+        win_ps("Start-Service winnat")?;
+        win_ps("Get-NetNat -Name fluxpeer-exit -ErrorAction SilentlyContinue | Remove-NetNat -Confirm:$false")?;
+        win_ps(&format!("New-NetNat -Name fluxpeer-exit -InternalIPInterfaceAddressPrefix '{overlay_cidr}'"))?;
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = tun; // macOS NATs by source subnet, not by tun iface
-        // 1. IPv4 forwarding.
-        let _ = Command::new("sysctl").args(["-w", "net.inet.ip.forwarding=1"]).status();
-        // 2. NAT via pf. Write our rule into a dedicated anchor file, then load a main
-        // ruleset that PRESERVES the system (com.apple) anchors and adds ours, and
-        // enable pf. Keeping the apple anchors avoids breaking AirDrop/stealth-mode.
-        let anchor_path = "/etc/pf.anchors/fluxpeer-exit";
-        let anchor_rule = format!("nat on {phys} from {overlay_cidr} to any -> ({phys})\n");
-        if let Err(e) = std::fs::write(anchor_path, anchor_rule) {
-            tracing::warn!(anchor_path, error = %e, "exit-node: cannot write pf anchor");
-        } else {
-            let main_ruleset = "\
-scrub-anchor \"com.apple/*\"
-nat-anchor \"com.apple/*\"
-nat-anchor \"fluxpeer-exit\"
-rdr-anchor \"com.apple/*\"
-dummynet-anchor \"com.apple/*\"
-anchor \"com.apple/*\"
-load anchor \"com.apple\" from \"/etc/pf.anchors/com.apple\"
-load anchor \"fluxpeer-exit\" from \"/etc/pf.anchors/fluxpeer-exit\"
-";
-            // Remember if pf was off before us, so down() can leave no trace.
-            let was_on = Command::new("pfctl")
-                .args(["-s", "info"])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).contains("Status: Enabled"))
-                .unwrap_or(false);
-            pfctl_load(main_ruleset);
-            let _ = Command::new("pfctl").arg("-e").status(); // enable (harmless if already on)
-            if !was_on {
-                PF_ENABLED_BY_US.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            tracing::info!(phys, overlay_cidr, "exit-node GATEWAY up (pf nat + ip.forwarding)");
+        let _ = tun;
+        apply::run(&["sysctl", "-w", "net.inet.ip.forwarding=1"])?;
+        let was_on = apply::output(&["pfctl", "-s", "info"])? .contains("Status: Enabled");
+        apply::write("/etc/pf.anchors/fluxpeer-exit", format!("nat on {phys} from {overlay_cidr} to any -> ({phys})\n"))?;
+        apply::input(&["pfctl", "-f", "-"], r#"scrub-anchor "com.apple/*"
+nat-anchor "com.apple/*"
+nat-anchor "fluxpeer-exit"
+rdr-anchor "com.apple/*"
+dummynet-anchor "com.apple/*"
+anchor "com.apple/*"
+load anchor "com.apple" from "/etc/pf.anchors/com.apple"
+load anchor "fluxpeer-exit" from "/etc/pf.anchors/fluxpeer-exit"
+"#)?;
+        if !was_on {
+            apply::run(&["pfctl", "-e"])?;
+            PF_ENABLED_BY_US.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    {
-        let _ = (phys, tun, overlay_cidr);
-        tracing::warn!("exit-node gateway (forwarding+NAT) is unsupported on this platform");
-    }
+    return Err(ApplyError::new(&["exit-gateway", phys, tun, overlay_cidr], "unsupported platform"));
+    Ok(())
 }
 
-/// True if WE enabled pf (it was disabled before the exit gateway came up), so the
-/// teardown can disable it again. Same-process up→down, so an atomic suffices.
 #[cfg(target_os = "macos")]
 static PF_ENABLED_BY_US: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Feed a complete pf ruleset to `pfctl -f -` on stdin (macOS exit-node NAT).
-#[cfg(target_os = "macos")]
-fn pfctl_load(ruleset: &str) {
-    use std::io::Write;
-    if let Ok(mut c) = Command::new("pfctl")
-        .args(["-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-    {
-        if let Some(si) = c.stdin.as_mut() {
-            let _ = si.write_all(ruleset.as_bytes());
-        }
-        let _ = c.wait();
-    }
-}
-
-/// Run a PowerShell one-liner with no console window (for the Windows exit-node
-/// NAT/forwarding commands). Best-effort; errors are ignored like the unix path.
 #[cfg(target_os = "windows")]
-fn win_ps(script: &str) {
-    use std::os::windows::process::CommandExt;
-    let _ = Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .status();
+fn win_ps(script: &str) -> Result {
+    apply::run(&["powershell", "-NoProfile", "-Command", &format!("$ErrorActionPreference = 'Stop'; {script}")])
 }
 
-pub(crate) fn exit_gateway_down(phys: &str, tun: &str) {
+pub(crate) fn exit_gateway_down(phys: &str, tun: &str, _backend: Option<&dyn crate::firewall::Firewall>) -> Result {
     #[cfg(target_os = "linux")]
-    {
-        crate::firewall::detect().down(phys, tun);
-    }
+    { _backend.ok_or_else(|| ApplyError::new(&["firewall", "down"], "missing selected backend"))?.down(phys, tun)?; }
     #[cfg(target_os = "windows")]
     {
         let _ = (phys, tun);
-        win_ps("Remove-NetNat -Name fluxpeer-exit -Confirm:$false -ErrorAction SilentlyContinue");
+        win_ps("Get-NetNat -Name fluxpeer-exit -ErrorAction SilentlyContinue | Remove-NetNat -Confirm:$false")?;
     }
     #[cfg(target_os = "macos")]
     {
         let _ = (phys, tun);
-        // Flush our anchor + restore the system default ruleset (drops our nat-anchor),
-        // then remove the anchor file. Leave ip.forwarding as-is (macOS is rarely an exit
-        // node); pf itself is turned back off below only if we were the ones to enable it.
-        let _ = Command::new("pfctl")
-            .args(["-a", "fluxpeer-exit", "-F", "nat"])
-            .status();
-        let _ = Command::new("pfctl").args(["-f", "/etc/pf.conf"]).status();
-        let _ = std::fs::remove_file("/etc/pf.anchors/fluxpeer-exit");
-        // If pf was disabled before we turned it on, turn it back off (leave no trace).
-        if PF_ENABLED_BY_US.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            let _ = Command::new("pfctl").arg("-d").status();
+        let results = [apply::run(&["pfctl", "-a", "fluxpeer-exit", "-F", "nat"]), apply::run(&["pfctl", "-f", "/etc/pf.conf"]), apply::remove("/etc/pf.anchors/fluxpeer-exit")];
+        apply::all(results)?;
+        if PF_ENABLED_BY_US.load(std::sync::atomic::Ordering::Relaxed) {
+            apply::run(&["pfctl", "-d"])?;
+            PF_ENABLED_BY_US.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     let _ = (phys, tun);
+    Ok(())
 }
 
-/// Point system DNS at `dns` (the exit node's gateway). Linux: resolvectl with a
-/// catch-all routing domain (so ALL queries go through the tun), falling back to
-/// /etc/resolv.conf. macOS: scutil dynamic store (best-effort).
-fn set_dns(dev: &str, dns: &str) {
+pub(crate) fn set_dns(dev: &str, dns: &str) -> Result {
     #[cfg(target_os = "macos")]
-    {
-        let script =
-            format!("d.init\nd.add ServerAddresses * {dns}\nset State:/Network/Service/fluxpeer-{dev}/DNS\nquit\n");
-        use std::io::Write;
-        if let Ok(mut c) = Command::new("scutil").stdin(std::process::Stdio::piped()).spawn() {
-            if let Some(si) = c.stdin.as_mut() {
-                let _ = si.write_all(script.as_bytes());
-            }
-            let _ = c.wait();
-        }
-    }
+    { apply::input(&["scutil"], &format!("d.init\nd.add ServerAddresses * {dns}\nset State:/Network/Service/fluxpeer-{dev}/DNS\nquit\n"))?; }
     #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        crate::dns::detect_for_iface(Some(dev)).set(dns);
-    }
+    crate::dns::detect_for_iface(Some(dev)).set(dns)?;
     #[cfg(windows)]
-    {
-        // Point the tun adapter's DNS at the exit gateway. The low interface metric
-        // set during route setup makes Windows prefer this adapter's resolver.
-        win_ps(&format!(
-            "Set-DnsClientServerAddress -InterfaceAlias '{dev}' -ServerAddresses '{dns}' -ErrorAction SilentlyContinue"
-        ));
-        tracing::info!(dev, dns, "exit DNS via Set-DnsClientServerAddress");
-    }
+    win_ps(&format!("Set-DnsClientServerAddress -InterfaceAlias '{dev}' -ServerAddresses '{dns}'"))?;
+    Ok(())
 }
 
-fn reset_dns(dev: &str) {
+pub(crate) fn reset_dns(dev: &str) -> Result {
     #[cfg(target_os = "macos")]
-    {
-        use std::io::Write;
-        let script = format!("remove State:/Network/Service/fluxpeer-{dev}/DNS\nquit\n");
-        if let Ok(mut c) = Command::new("scutil").stdin(std::process::Stdio::piped()).spawn() {
-            if let Some(si) = c.stdin.as_mut() {
-                let _ = si.write_all(script.as_bytes());
-            }
-            let _ = c.wait();
-        }
-    }
+    { apply::input(&["scutil"], &format!("remove State:/Network/Service/fluxpeer-{dev}/DNS\nquit\n"))?; }
     #[cfg(all(unix, not(target_os = "macos")))]
-    crate::dns::detect_for_iface(Some(dev)).clear();
+    crate::dns::detect_for_iface(Some(dev)).clear()?;
     #[cfg(windows)]
-    win_ps(&format!(
-        "Set-DnsClientServerAddress -InterfaceAlias '{dev}' -ResetServerAddresses -ErrorAction SilentlyContinue"
-    ));
+    win_ps(&format!("Set-DnsClientServerAddress -InterfaceAlias '{dev}' -ResetServerAddresses"))?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_hostname_bypasses_cover_all_ips_and_resolution_failure_keeps_exit_up() {
+        let mut queried = Vec::new();
+        let candidates = crate::resolve_bypass_candidates(vec!["control.example".into(), "relay.example".into(), "missing.example".into()], |host| {
+            queried.push(host.to_string());
+            if host == "missing.example" { return Err(std::io::Error::other("resolver offline")); }
+            Ok(vec!["192.0.2.2".parse().unwrap(), "2001:db8::2".parse().unwrap()])
+        });
+        assert_eq!(queried.len(), 3);
+        assert_eq!(candidates, ["192.0.2.2", "2001:db8::2"]);
+        let mut progress = ExitProgress::default();
+        let mut installed = Vec::new();
+        exit_up_with(&mut progress, &candidates, |effect| {
+            if let ExitEffect::BypassAdd(ip) = effect { installed.push(ip.to_string()); }
+            Ok(true)
+        }).unwrap();
+        assert_eq!(installed, candidates);
+        let empty = crate::resolve_bypass_candidates(vec!["missing.example".into()], |_| Err(std::io::Error::other("unresolved")));
+        let mut progress = ExitProgress::default();
+        exit_up_with(&mut progress, &empty, |_| Ok(false)).unwrap();
+        assert_eq!(progress.defaults.len(), 2);
+    }
+
+    #[test]
+    fn route_argv_and_optional_ipv6_failure_do_not_hide_ipv4_errors() {
+        use apply::test_support::{Scripted, error};
+        let mut runner = Scripted::new(vec![Err(error(Some(2), "Address family not supported"))]);
+        let result = route_change_with(RouteOs::Linux, "fd00::/64", "fp0", true, &mut runner);
+        optional_route_result(RouteOs::Linux, "fd00::/64", result).unwrap();
+        assert_eq!(runner.commands[0], ["ip", "-6", "route", "replace", "fd00::/64", "dev", "fp0"]);
+        let mut runner = Scripted::new(vec![Err(error(Some(2), "Operation not permitted"))]);
+        let result = route_change_with(RouteOs::Linux, "10.0.0.0/8", "fp0", true, &mut runner);
+        assert!(optional_route_result(RouteOs::Linux, "10.0.0.0/8", result).is_err());
+        assert_eq!(runner.commands[0], ["ip", "-4", "route", "replace", "10.0.0.0/8", "dev", "fp0"]);
+        let mut runner = Scripted::new(vec![]);
+        let result = route_change_with(RouteOs::Windows, "10.0.0.0/8", "fp0", true, &mut runner);
+        assert_eq!(result.as_ref().unwrap_err().kind, std::io::ErrorKind::Unsupported);
+        optional_route_result(RouteOs::Windows, "10.0.0.0/8", result).unwrap();
+        assert!(runner.commands.is_empty());
+    }
+
+    #[test]
+    fn failed_default_removal_keeps_carrier_bypass_until_retry() {
+        let mut progress = ExitProgress {
+            bypass: vec!["192.0.2.1".into()], defaults: vec!["0.0.0.0/1".into()], ..Default::default()
+        };
+        assert!(cleanup_exit_with(&mut progress, &mut |effect| match effect {
+            ExitEffect::DefaultDel(_) => Err(ApplyError::new(&["ip", "route", "del"], "permission denied")),
+            ExitEffect::BypassDel(_) => panic!("carrier must remain reachable until default is gone"),
+            _ => Ok(false),
+        }).is_err());
+        assert_eq!(progress.bypass.len(), 1);
+        let mut calls = Vec::new();
+        cleanup_exit_with(&mut progress, &mut |effect| { calls.push(format!("{effect:?}")); Ok(false) }).unwrap();
+        assert!(calls[0].starts_with("DefaultDel"));
+        assert!(calls[1].starts_with("BypassDel"));
+        assert!(progress.defaults.is_empty());
+        assert!(progress.bypass.is_empty());
+    }
+
+    #[test]
+    fn exit_stage_failures_never_report_success_and_retry_after_cleanup() {
+        for fail_at in 0..4 {
+            let mut progress = ExitProgress::default();
+            let mut stage = 0;
+            let result = exit_up_with(&mut progress, &["192.0.2.1".into()], |effect| {
+                let adding = matches!(effect, ExitEffect::BypassAdd(_) | ExitEffect::GuardUp(_) | ExitEffect::DefaultAdd(_));
+                if adding {
+                    let failed = stage == fail_at;
+                    stage += 1;
+                    if failed { return Err(ApplyError::new(&["injected", "apply"], "permission denied")); }
+                }
+                match effect {
+                    ExitEffect::BypassAdd(_) => Ok(true),
+                    ExitEffect::GuardUp(pending) => { pending.push(vec!["guard".into()]); Ok(true) }
+                    ExitEffect::GuardDown(pending) => { pending.clear(); Ok(false) }
+                    _ => Ok(false),
+                }
+            });
+            assert!(result.is_err(), "stage {fail_at} must not become UP");
+            assert!(progress.bypass.is_empty());
+            assert!(progress.defaults.is_empty());
+            assert!(progress.v6_cleanup.is_empty());
+            assert!(exit_up_with(&mut progress, &["192.0.2.1".into()], |effect| {
+                match effect {
+                    ExitEffect::BypassAdd(_) => Ok(true),
+                    ExitEffect::GuardUp(pending) => { pending.push(vec!["guard".into()]); Ok(true) }
+                    _ => Ok(false),
+                }
+            }).unwrap());
+            assert_eq!(progress.defaults.len(), 2);
+        }
+    }
+
+    #[test]
+    fn guard_rollback_failure_retains_only_owned_half_and_retries_before_add() {
+        let mut pending = Vec::new();
+        let mut adds = 0;
+        assert!(v6_block_tracked(RouteOs::Linux, "fp0", &mut pending, |command| {
+            if command.iter().any(|s| s == "add") {
+                adds += 1;
+                if adds == 2 { return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "foreign second half")); }
+            } else if !command.iter().any(|s| s == "unreachable") {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "rollback denied"));
+            }
+            Ok(())
+        }).is_err());
+        assert_eq!(pending, vec![v6_unblock_cmds(RouteOs::Linux, "fp0")[0].clone()]);
+        let mut calls = Vec::new();
+        assert!(v6_block_tracked(RouteOs::Linux, "fp0", &mut pending, |command| { calls.push(command.to_vec()); Ok(()) }).unwrap());
+        assert_eq!(calls[0], v6_unblock_cmds(RouteOs::Linux, "fp0")[0]);
+        assert_eq!(pending.len(), 2);
+    }
 
     #[test]
     fn v6_block_cmds_cover_both_halves_per_os() {

@@ -32,3 +32,4 @@ socket2 = "0.6"
 portable-atomic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tempfile = "3"
