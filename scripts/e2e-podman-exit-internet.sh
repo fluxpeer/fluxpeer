@@ -11,20 +11,25 @@ for arg in "$@"; do
     case "$arg" in --keep) KEEP=1;; --fault-only) FAULT_ONLY=1;;
         *) echo 'usage: e2e-podman-exit-internet.sh [--keep] [--fault-only]' >&2; exit 2;; esac
 done
-ROOT=/opt/ops/fp/t0022
-export FPE_KEEP="$KEEP" FPE_ROOT="$ROOT" FPE_FAULT_ONLY="$FAULT_ONLY"
+ROOT="${FLUXPEER_E2E_ROOT:-/opt/ops/fp/e2e}"
+BIN="${FLUXPEER_BIN:-$ROOT/bin/fluxpeer}"
+export FPE_KEEP="$KEEP" FPE_ROOT="$ROOT" FPE_BIN="$BIN" FPE_FAULT_ONLY="$FAULT_ONLY"
 test "$(uname -s)" = Linux
-test -x "$ROOT/bin/fluxpeer"
+test -x "$BIN"
 sudo -n podman version >/dev/null
 # Python owns the finally/trap equivalent, including signals and partial setup.
 exec python3 - <<'PY'
 import datetime, hashlib, ipaddress, json, os, pathlib, re, shlex, signal
 import subprocess as sp
-import sys, time, traceback
+import sys, time, traceback, fcntl, random
 
-ROOT = pathlib.Path(os.environ['FPE_ROOT'])
+ROOT = pathlib.Path(os.environ['FPE_ROOT']).resolve()
+BIN = pathlib.Path(os.environ['FPE_BIN']).resolve()
+# Resource names are shared across roots; serialize before reclaiming --keep.
+lock = open('/tmp/fluxpeer-exit-e2e.lock', 'a')
+fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 KEEP = os.environ['FPE_KEEP'] == '1'
-STAMP = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+STAMP = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
 OUT = ROOT / 'evidence' / STAMP
 OUT.mkdir(parents=True, exist_ok=False)
 (ROOT / 'evidence' / 'latest').unlink(missing_ok=True)
@@ -72,6 +77,63 @@ def check(label, args, success=True, timeout=20):
                        actual_rc=rc, verdict='PASS' if passed else 'FAIL', evidence=fname))
     print(f'{group} {label}: {"PASS" if passed else "FAIL"} rc={rc}', flush=True)
     return rc, out
+
+# Avoid reusing a TCP four-tuple within this run, even across scenarios. Each
+# failed target gets exactly one fresh curl process with a different local port.
+probe_ports = random.SystemRandom().sample(range(20000, 60000), 40000)
+PUBLIC_TARGETS = ('https://1.1.1.1', 'https://example.com')
+DNS_TARGETS = ('https://example.com', 'https://www.cloudflare.com')
+TRACE_TARGETS = ('https://1.1.1.1/cdn-cgi/trace', 'https://1.0.0.1/cdn-cgi/trace')
+
+def public_probe(label, c='fpe-cli', targets=PUBLIC_TARGETS, success=True,
+                 max_time=8, kind='https', judge=True):
+    if len(set(targets)) < 2: raise ValueError('public probes require distinct targets')
+    attempts, replies = [], {}
+    for target in targets:
+        for attempt in (1, 2):
+            port = probe_ports.pop() if kind == 'https' else None
+            if kind == 'https':
+                args = px(c, 'curl', '--noproxy', '*', '-4', '-fsS', '--max-time', str(max_time),
+                          '--local-port', str(port), '-w',
+                          '\nLOCAL=%{local_ip}:%{local_port} REMOTE=%{remote_ip} HTTP=%{http_code}\n', target)
+            elif kind == 'ping':
+                args = px(c, 'ping', '-c', '1', '-W', '2', target)
+            elif kind == 'dns':
+                args = px(c, 'dig', '+time=2', '+tries=1', '+short', target, 'A')
+            else: raise ValueError('unknown probe kind: ' + kind)
+            rc, out, err, evidence = record(f'{label}-target-{len(attempts)}-try-{attempt}', args, timeout=max_time + 5)
+            reached = rc == 0 and (kind != 'dns' or bool(out.strip()))
+            attempts.append(dict(target=target, attempt=attempt, source_port=port,
+                                 actual_rc=rc, reached=reached, evidence=evidence))
+            if reached:
+                replies[target] = out
+                break
+    reachable = bool(replies)
+    passed = reachable == success
+    if judge:
+        checks.append(dict(scenario=group, check=label, expected='any target reachable' if success else 'all targets blocked',
+                           verdict='PASS' if passed else 'FAIL', attempts=attempts))
+        print(f'{group} {label}: {"PASS" if passed else "FAIL"}', flush=True)
+    else:
+        observations.append(dict(scenario=group, check=label, attempts=attempts))
+    return (0 if reachable else 1), replies, [a['evidence'] for a in attempts]
+
+def egress_probe(positive):
+    _, exits, ae = public_probe('exit-source-ip', 'fpe-exit', TRACE_TARGETS, judge=False)
+    _, clients, be = public_probe('client-source-ip', targets=TRACE_TARGETS, judge=False)
+    ips = lambda text: re.findall(r'^ip=(.+)$', text, re.M)
+    matched, invalid = [], []
+    for target, text in clients.items():
+        if not ips(text): invalid.append(target)
+        elif target in exits:
+            if ips(text) == ips(exits[target]): matched.append(target)
+            else: invalid.append(target)
+    # Transport failure at one target is tolerable; a successful response from
+    # the wrong egress (or malformed trace) must never be hidden by another match.
+    passed = bool(matched) and not invalid if positive else not clients
+    checks.append(dict(scenario=group, check='egress-source-match',
+        verdict='PASS' if passed else 'FAIL', evidence=ae + be, matched=matched, invalid=invalid))
+
 
 def host_snapshot(tag):
     commands = {
@@ -128,11 +190,12 @@ def stop(c):
 def stop_pair():
     stop('fpe-cli'); stop('fpe-exit')
 
-def start(c, cfg):
+def start(c, cfg, file_dns=False):
     write_container(c, '/run/fpe/node.json', json.dumps(cfg))
     # Only the process log is truncated; prior scenario snapshots remain in OUT.
+    env = 'FLUXPEER_DNS_BACKEND=resolv ' if file_dns else ''
     need(P + ['exec', '-d', c, 'sh', '-c', 'echo $$ > /run/fpe/node.pid; '
-        'exec env RUST_LOG=info,fp_transport_anytls::health=error fluxpeer node run /run/fpe/node.json > /run/fpe/node.log 2>&1'])
+        f'exec env {env}RUST_LOG=info,fp_transport_anytls::health=error fluxpeer node run /run/fpe/node.json > /run/fpe/node.log 2>&1'])
 
 def settings(use_exit='auto', transport='direct', dns=True, port=41841, force_exit=False):
     e, c = dict(state['e']), dict(state['c'])
@@ -185,12 +248,11 @@ def new_network(name, directory=None):
             network_id=state['net'], anytls=directory == 'anytls', stun_url=f'{MESH}.10:13478', node_id='fluxpeer-relay'))
 
 def observe_counters():
-    # Counter-only rules observe traversal; they do not accept/drop/masquerade.
-    phys = json.loads(need(px('fpe-exit', 'ip', '-j', 'route', 'show', 'default')))[0]['dev']
-    record('observe-forward-counter', px('fpe-exit', 'nft', 'insert', 'rule', 'inet', 'fluxpeer', 'forward',
-           'iifname', 'fpe0', 'counter', 'comment', '"fpe-observe-forward"'))
-    record('observe-nat-counter', px('fpe-exit', 'nft', 'insert', 'rule', 'inet', 'fluxpeer', 'postrouting',
-           'oifname', phys, 'counter', 'comment', '"fpe-observe-nat"'))
+    # Backend-owned rules already count packets. Read the real tables instead
+    # of inserting observers into the obsolete global inet fluxpeer table.
+    record('observe-forward-counter', px('fpe-exit', 'iptables', '-w', '10', '-nvxL', 'FORWARD'))
+    record('observe-nat-counter', px('fpe-exit', 'iptables', '-w', '10', '-t', 'nat', '-nvxL', 'POSTROUTING'))
+    record('observe-native-nft-counters', px('fpe-exit', 'nft', '-a', 'list', 'ruleset'))
 
 def capture(label='after'):
     if 'c' in state:
@@ -199,6 +261,8 @@ def capture(label='after'):
     cmds = [
         ('client-route', px('fpe-cli', 'ip', 'route')),
         ('client-route-get', px('fpe-cli', 'ip', 'route', 'get', '1.1.1.1')),
+        ('client-route6', px('fpe-cli', 'ip', '-6', 'route')),
+        ('exit-ip6tables', px('fpe-exit', 'ip6tables', '-S')),
         ('client-addr', px('fpe-cli', 'ip', '-br', 'addr')),
         ('client-show', px('fpe-cli', 'fluxpeer', 'show', '--json')),
         ('client-tcp-sockets', px('fpe-cli', 'ss', '-tnp')),
@@ -220,21 +284,75 @@ def probes(positive, mesh_positive=True):
     exit_cfg = api('GET', f'/devices/{state["e"]["device_id"]}/config', token=state['e']['auth_token'])
     check('overlay', px('fpe-cli', 'ping', '-c', '2', '-W', '2', exit_cfg['address_v4']), mesh_positive)
     check('intranet', px('fpe-cli', 'ping', '-c', '2', '-W', '2', f'{LAN}.40'), mesh_positive)
-    check('public-ip-https', px('fpe-cli', 'curl', '--noproxy', '*', '-fsS', '--max-time', '8',
-                               '-o', '/dev/null', '-w', 'HTTP=%{http_code} REMOTE=%{remote_ip}\n', 'https://1.1.1.1'), positive)
-    check('public-dns-https', px('fpe-cli', 'curl', '--noproxy', '*', '-fsS', '--max-time', '10',
-                                '-o', '/dev/null', '-w', 'HTTP=%{http_code} REMOTE=%{remote_ip}\n', 'https://example.com'), positive)
-    check('dns-query', px('fpe-cli', 'dig', '+time=2', '+tries=1', 'example.com', 'A'), positive)
-    a = record('exit-source-ip', px('fpe-exit', 'curl', '--noproxy', '*', '-fsS', '--max-time', '10',
-                                   'https://1.1.1.1/cdn-cgi/trace'))
-    b = record('client-source-ip', px('fpe-cli', 'curl', '--noproxy', '*', '-fsS', '--max-time', '8',
-                                     'https://1.1.1.1/cdn-cgi/trace'))
-    ips = lambda text: re.findall(r'^ip=(.+)$', text, re.M)
-    same = a[0] == b[0] == 0 and bool(ips(a[1])) and ips(a[1]) == ips(b[1])
-    checks.append(dict(scenario=group, check='egress-source-match', expected_rc='match' if positive else 'no successful client request',
-        actual_rc=0 if same else 1, verdict='PASS' if (same if positive else b[0] != 0) else 'FAIL', evidence=[a[3], b[3]]))
-    print(f'{group} egress-source-match: {"MATCH" if same else "NO_MATCH"}', flush=True)
+    public_probe('public-ip-https', targets=('https://1.1.1.1', 'https://1.0.0.1'), success=positive)
+    public_probe('public-dns-https', targets=DNS_TARGETS, success=positive, max_time=10)
+    public_probe('dns-query', targets=('example.com', 'www.cloudflare.com'), kind='dns', success=positive)
+    egress_probe(positive)
     capture()
+
+def require_observation(label, passed, evidence):
+    checks.append(dict(scenario=group, check=label, verdict='PASS' if passed else 'FAIL', evidence=evidence))
+    if not passed: raise RuntimeError('observation failed: ' + label)
+
+def expect_dns(label, expected):
+    # Bound asynchronous reconciliation; save the actual final bytes as evidence.
+    for _ in range(50):
+        rc, text, _ = run(px('fpe-cli', 'cat', '/etc/resolv.conf'))
+        if rc == 0 and text == expected: break
+        time.sleep(.2)
+    rc, text, _, evidence = record(label, px('fpe-cli', 'cat', '/etc/resolv.conf'))
+    require_observation(label, rc == 0 and text == expected, evidence)
+
+def dns_lifecycle(crash=False):
+    new_network('dns-crash' if crash else 'dns-bind-mount')
+    stop_pair()
+    original = need(px('fpe-cli', 'cat', '/etc/resolv.conf'))
+    baseline = '# fpe DNS baseline\nnameserver 192.0.2.53\noptions timeout:1 attempts:1\n'
+    first = '# fluxpeer exit-node\nnameserver 1.1.1.1\n'
+    second = '# fluxpeer exit-node\nnameserver 1.0.0.1\n'
+    e, c = settings()
+    guard_added = False
+    try:
+        rc, mountinfo, _, evidence = record('resolver-mountinfo', px('fpe-cli', 'cat', '/proc/self/mountinfo'))
+        require_observation('resolver-is-podman-bind-mount', rc == 0 and any(
+            line.split()[4:5] == ['/etc/resolv.conf'] for line in mountinfo.splitlines()), evidence)
+        write_container('fpe-cli', '/etc/resolv.conf', baseline)
+        start('fpe-exit', e); start('fpe-cli', c, file_dns=True)
+        expect_dns('first-instance-dns-installed', first)
+        check('dns-full-tunnel-route', px('fpe-cli', 'sh', '-ec',
+              'ip -4 route show | grep -q "^0.0.0.0/1.*dev fpe0"'))
+        if crash:
+            rc, journal, _, evidence = record('first-dns-journal', px('fpe-cli', 'cat', '/var/lib/fluxpeer/dns/state.json'))
+            require_observation('first-owner-persisted', rc == 0 and any(
+                owner['iface'] == 'fpe0' for owner in json.loads(journal)['owners']), evidence)
+            need(px('fpe-cli', 'sh', '-ec', 'p=$(cat /run/fpe/node.pid); kill -KILL "$p"; '
+                    'for n in $(seq 1 50); do test ! -e /proc/"$p" && exit 0; sleep .1; done; exit 1'))
+            expect_dns('killed-instance-left-dns', first)
+            # A distinct interface must prune the dead owner rather than save A's
+            # resolver as B's baseline. Share the same persistent DNS journal.
+            c['tun_name'] = 'fpe1'; c['dns'] = ['1.0.0.1']
+            need(px('fpe-cli', 'nft', 'insert', 'rule', 'inet', 'fpe_guard', 'output',
+                    'oifname', 'fpe1', 'accept', 'comment', '"fpe-dns-second-interface"'))
+            guard_added = True
+            start('fpe-cli', c, file_dns=True)
+            expect_dns('second-instance-dns-installed', second)
+            rc, journal, _, evidence = record('second-dns-journal', px('fpe-cli', 'cat', '/var/lib/fluxpeer/dns/state.json'))
+            require_observation('dead-owner-pruned', rc == 0 and
+                [owner['iface'] for owner in json.loads(journal)['owners']] == ['fpe1'], evidence)
+        stop('fpe-cli')
+        expect_dns('baseline-restored-after-stop', baseline)
+        rc, journal, _, evidence = record('dns-journal-after-stop', px('fpe-cli', 'cat', '/var/lib/fluxpeer/dns/state.json'))
+        require_observation('dns-owners-released', rc == 0 and not json.loads(journal)['owners'], evidence)
+    finally:
+        stop_pair()
+        if guard_added:
+            rules = json.loads(need(px('fpe-cli', 'nft', '-j', '-a', 'list', 'chain', 'inet', 'fpe_guard', 'output')))
+            for item in rules['nftables']:
+                rule = item.get('rule', {})
+                if rule.get('comment') == 'fpe-dns-second-interface':
+                    need(px('fpe-cli', 'nft', 'delete', 'rule', 'inet', 'fpe_guard', 'output', 'handle', str(rule['handle'])))
+        # This restoration is harness cleanup, after the independent assertion.
+        write_container('fpe-cli', '/etc/resolv.conf', original)
 
 def scenario(name, fn):
     global group
@@ -280,19 +398,37 @@ def cleanup():
                         ('networks', P + ['network', 'ls', '--format', '{{.Name}}']),
                         ('images', P + ['images', '--format', '{{.Repository}}:{{.Tag}}'])]:
         rc, out, err, fname = record('remaining-' + label, args)
-        matches = [x for x in out.splitlines() if 'fpe-' in x]
+        matches = [x for x in out.splitlines() if x.startswith('fpe-') or x == IMAGE]
         checks.append(dict(scenario='cleanup', check='no-fpe-' + label, actual_rc=rc,
                            verdict='PASS' if rc == 0 and not matches else 'FAIL', evidence=fname, remaining=matches))
+
+# Exact names used by this harness, including its historical LAN container.
+OWN_CONTAINERS = {'fpe-image-build', 'fpe-ctl', 'fpe-cli', 'fpe-exit', 'fpe-intra', 'fpe-lan', 'fpe-wanprobe'}
+OWN_NETWORKS = {'fpe-wan', 'fpe-mesh', 'fpe-lan'}
+
+def reclaim_kept():
+    # Never use global prune or substring matches. Foreign names and image tags
+    # are retained, including names merely containing the fpe- substring.
+    existing = need(P + ['ps', '-a', '--format', '{{.Names}}']).splitlines()
+    nets = need(P + ['network', 'ls', '--format', '{{.Name}}']).splitlines()
+    unknown = [n for n in existing if n.startswith('fpe-') and n not in OWN_CONTAINERS]
+    unknown += [n for n in nets if n.startswith('fpe-') and n not in OWN_NETWORKS]
+    if unknown: raise RuntimeError('unknown fpe- resources; refusing cleanup: ' + repr(unknown))
+    for name in sorted(set(existing) & OWN_CONTAINERS):
+        need(P + ['rm', '-f', '-t', '0', name])
+    for name in sorted(set(nets) & OWN_NETWORKS):
+        need(P + ['network', 'rm', name])
+    images = need(P + ['images', '--format', '{{.Repository}}:{{.Tag}}']).splitlines()
+    if IMAGE in images: need(P + ['rmi', IMAGE])
 
 def interrupted(sig, frame): raise KeyboardInterrupt(f'signal {sig}')
 signal.signal(signal.SIGTERM, interrupted)
 signal.signal(signal.SIGINT, interrupted)
+host_snapshot('before-reclaim')
+reclaim_kept()
 before = host_snapshot('before')
 exit_code = 0
 try:
-    # Refuse preexisting resources instead of deleting another invocation's work.
-    if any('fpe-' in before[k] for k in ('containers', 'networks', 'images')):
-        raise RuntimeError('preexisting fpe- resources; refusing to reuse/remove them')
     inspect = json.loads(need(P + ['network', 'inspect'] + need(P + ['network', 'ls', '-q']).split()))
     (OUT / 'existing-networks.json').write_text(json.dumps(inspect, indent=2))
     occupied = [ipaddress.ip_network(s['subnet']) for n in inspect for s in n.get('subnets', [])]
@@ -306,8 +442,8 @@ try:
     else: raise RuntimeError('no unused candidate subnet block')
     WAN, MESH, LAN = [str(x.network_address).rsplit('.', 1)[0] for x in candidate]
     (OUT / 'topology.json').write_text(json.dumps(dict(wan=WAN, mesh=MESH, lan=LAN,
-        binary_sha256=hashlib.sha256((ROOT/'bin/fluxpeer').read_bytes()).hexdigest(),
-        binary_size=(ROOT/'bin/fluxpeer').stat().st_size, privileged=['fpe-exit'],
+        binary_sha256=hashlib.sha256(BIN.read_bytes()).hexdigest(),
+        binary_size=BIN.stat().st_size, binary_path=str(BIN), privileged=['fpe-exit'],
         scaffold='client physical-output guard + unreachable bootstrap default; exit LAN forwarding initially 1'), indent=2))
     print('SUBNETS', WAN, MESH, LAN, flush=True)
     need(P + ['image', 'exists', BASE])
@@ -340,7 +476,7 @@ try:
         # The task's minimal package list does not include procps. Reuse only the
         # host's sysctl executable (libc-only), read-only, inside the exit netns.
         if c == 'fpe-exit': args += ['-v', '/usr/sbin/sysctl:/usr/sbin/sysctl:ro']
-        args += ['-v', f'{ROOT}/bin/fluxpeer:/usr/local/bin/fluxpeer:ro', IMAGE, 'sleep', 'infinity']
+        args += ['-v', f'{BIN}:/usr/local/bin/fluxpeer:ro', IMAGE, 'sleep', 'infinity']
         containers.append(c); need(args)
         need(px(c, 'mkdir', '-p', '/run/fpe'))
     need(px('fpe-intra', 'ip', 'route', 'replace', 'default', 'via', f'{LAN}.20'))
@@ -364,10 +500,10 @@ try:
 
     def s0():
         check('control-reachable', px('fpe-cli', 'curl', '-fsS', f'http://{MESH}.10:18080/api/v1/health'))
-        check('no-direct-public-ping', px('fpe-cli', 'ping', '-c', '1', '-W', '2', '1.1.1.1'), False)
-        check('no-direct-public-https', px('fpe-cli', 'curl', '--noproxy', '*', '-fsS', '--max-time', '5', 'https://1.1.1.1'), False)
+        public_probe('no-direct-public-ping', targets=('1.1.1.1', '1.0.0.1'), kind='ping', success=False)
+        public_probe('no-direct-public-https', success=False, max_time=5)
         check('no-intranet-bypass', px('fpe-cli', 'ping', '-c', '1', '-W', '2', f'{LAN}.40'), False)
-        check('exit-has-public', px('fpe-exit', 'curl', '--noproxy', '*', '-fsS', '--max-time', '10', 'https://1.1.1.1/cdn-cgi/trace'))
+        public_probe('exit-has-public', 'fpe-exit', max_time=10)
         capture()
     scenario('S0', s0)
     # S1 (AD-1+AD-2): only the admin's 0.0.0.0/0 approval (no exit_node flag on the
@@ -420,7 +556,7 @@ try:
         need(P + ['exec', '-i', 'fpe-exit', 'nft', '-f', '-'], 'table inet fpe_drop { chain forward { '
              'type filter hook forward priority 10; policy drop; counter drop comment "fpe-simulated-fw4-drop";\n }\n}\n')
         # The independent drop blocks LAN forwarding too; overlay remains local.
-        check('public-blocked', px('fpe-cli', 'curl', '--noproxy', '*', '-fsS', '--max-time', '5', 'https://1.1.1.1'), False)
+        public_probe('public-blocked', success=False, max_time=5)
         check('lan-blocked', px('fpe-cli', 'ping', '-c', '1', '-W', '2', f'{LAN}.40'), False)
         capture()
         need(px('fpe-exit', 'nft', 'delete', 'table', 'inet', 'fpe_drop'))
@@ -450,7 +586,7 @@ try:
             state['default_route'] = route('0.0.0.0/0')
             elapsed = time.monotonic() - started
             time.sleep(5)
-            rc, out, err, name = record(f'race-{i}-public', px('fpe-cli', 'curl', '--noproxy', '*', '-fsS', '--max-time', '6', 'https://1.1.1.1/cdn-cgi/trace'))
+            rc, replies, evidence = public_probe(f'race-{i}-public', max_time=6, judge=False)
             rr = record(f'race-{i}-route', px('fpe-cli', 'ip', 'route'))
             suspected = '0.0.0.0/1' in rr[1] and rc != 0
             observations.append(dict(scenario='S6', attempt=i, restart_to_approve_s=elapsed,
@@ -459,7 +595,7 @@ try:
             capture(f'race-{i}')
             # Rebuild the client from the same config to measure restart recovery.
             stop('fpe-cli'); start('fpe-cli', settings(port=port)[1]); time.sleep(8)
-            check(f'race-{i}-client-restart-recovery', px('fpe-cli', 'curl', '--noproxy', '*', '-fsS', '--max-time', '8', 'https://1.1.1.1/cdn-cgi/trace'))
+            public_probe(f'race-{i}-client-restart-recovery')
         capture()
     scenario('S6', s6)
     def s7():
@@ -467,18 +603,21 @@ try:
         original = need(px('fpe-cli', 'cat', '/run/fpe/resolv.original'))
         write_container('fpe-cli', '/etc/resolv.conf', original)
         capture('without-dns-override')
-        record('original-resolver-query', px('fpe-cli', 'dig', '+time=2', '+tries=1', 'example.com', 'A'))
-        record('original-resolver-https', px('fpe-cli', 'curl', '--noproxy', '*', '-fsS', '--max-time', '10', 'https://example.com'))
+        public_probe('original-resolver-query', targets=('example.com', 'www.cloudflare.com'), kind='dns', judge=False)
+        public_probe('original-resolver-https', targets=DNS_TARGETS, max_time=10, judge=False)
         # Restart with an explicit reachable resolver, then measure restoration.
         pair(dns=True)
-        check('configured-resolver-query', px('fpe-cli', 'dig', '+time=2', '+tries=1', 'example.com', 'A'))
-        check('configured-resolver-https', px('fpe-cli', 'curl', '--noproxy', '*', '-fsS', '--max-time', '10', 'https://example.com'))
+        public_probe('configured-resolver-query', targets=('example.com', 'www.cloudflare.com'), kind='dns')
+        public_probe('configured-resolver-https', targets=DNS_TARGETS, max_time=10)
         capture('configured')
         stop('fpe-cli')
         rc, out, err, name = record('resolver-after-stop', px('fpe-cli', 'cat', '/etc/resolv.conf'))
         observations.append(dict(scenario='S7', original=original, after_stop=out,
             original_restored=out == original, evidence=name))
+        require_observation('original-resolver-restored', rc == 0 and out == original, name)
     scenario('S7', s7)
+    scenario('S8-dns-bind-mount', lambda: dns_lifecycle(False))
+    scenario('S9-dns-dead-owner', lambda: dns_lifecycle(True))
     def sysctl_failure():
         # Deliberately fail the real sysctl command without modifying its binary
         # or node sources. This bind mount is private to the exit container.
@@ -495,8 +634,8 @@ try:
             cfg = api('GET', f'/devices/{state["e"]["device_id"]}/config', token=state['e']['auth_token'])
             check('overlay-works', px('fpe-cli', 'ping', '-c', '2', '-W', '2', cfg['address_v4']))
             check('forwarded-lan-blocked', px('fpe-cli', 'ping', '-c', '1', '-W', '2', f'{LAN}.40'), False)
-            check('public-blocked', px('fpe-cli', 'curl', '--noproxy', '*', '-fsS', '--max-time', '5', 'https://1.1.1.1'), False)
-            record('exit-still-has-public', px('fpe-exit', 'curl', '--noproxy', '*', '-fsS', '--max-time', '10', 'https://1.1.1.1/cdn-cgi/trace'))
+            public_probe('public-blocked', success=False, max_time=5)
+            public_probe('exit-still-has-public', 'fpe-exit', max_time=10)
             capture()
         finally:
             need(px('fpe-exit', 'mount', '-o', 'remount,bind,rw', '/proc/sys'))

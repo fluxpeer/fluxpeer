@@ -1,0 +1,204 @@
+# SPDX-License-Identifier: BSD-3-Clause
+"""Run the real harness helpers with fake commands; never create host resources."""
+import ast
+import contextlib
+import io
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import unittest
+from unittest.mock import Mock
+
+SCRIPT = Path(__file__).resolve().parents[1] / 'e2e-podman-exit-internet.sh'
+SOURCE = SCRIPT.read_text()
+INLINE = SOURCE.split("exec python3 - <<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+TREE = ast.parse(INLINE, filename=str(SCRIPT))
+
+
+def helpers():
+    constants = {'PUBLIC_TARGETS', 'DNS_TARGETS', 'TRACE_TARGETS', 'OWN_CONTAINERS', 'OWN_NETWORKS'}
+    nodes = [n for n in TREE.body if isinstance(n, ast.FunctionDef) or
+             isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in constants for t in n.targets)]
+    ns = dict(json=json, re=re, checks=[], observations=[], group='test', P=['podman'],
+              ADMIN='test-only', IMAGE='localhost/fpe-node:t0022', probe_ports=list(range(20000, 20100)),
+              time=Mock(), state={}, os=os)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SCRIPT), 'exec'), ns)
+    return ns
+
+
+class PublicProbes(unittest.TestCase):
+    def setUp(self):
+        self.ns = helpers()
+        self.outputs = []
+        self.calls = []
+        def record(label, args, **kwargs):
+            self.calls.append(args)
+            rc, body = self.outputs.pop(0)
+            return rc, body, '', f'evidence-{len(self.calls)}'
+        self.ns['record'] = record
+
+    def probe(self, outputs, **kwargs):
+        self.outputs = list(outputs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return self.ns['public_probe']('public', **kwargs)
+
+    def test_retry_once_new_port_and_keep_both_results(self):
+        rc, replies, evidence = self.probe([(28, ''), (0, 'ok'), (0, 'ok')])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(replies), 2)
+        self.assertEqual(len(evidence), 3)
+        ports = [a[a.index('--local-port') + 1] for a in self.calls]
+        self.assertEqual(len(set(ports)), 3)
+        self.assertEqual(self.calls[0][-1], self.calls[1][-1])
+        self.assertNotEqual(self.calls[1][-1], self.calls[2][-1])
+        self.assertEqual([a['actual_rc'] for a in self.ns['checks'][0]['attempts']], [28, 0, 0])
+
+    def test_other_target_success_survives_two_timeouts(self):
+        self.probe([(28, ''), (28, ''), (0, 'ok')])
+        self.assertEqual(self.ns['checks'][0]['verdict'], 'PASS')
+
+    def test_all_targets_fail_after_exactly_one_retry(self):
+        self.probe([(28, '')] * 4)
+        self.assertEqual(len(self.calls), 4)
+        self.assertEqual(self.ns['checks'][0]['verdict'], 'FAIL')
+
+    def test_negative_check_fails_if_any_target_leaks(self):
+        self.probe([(28, ''), (28, ''), (0, 'leak')], success=False)
+        self.assertEqual(self.ns['checks'][0]['verdict'], 'FAIL')
+
+    def test_negative_check_passes_only_if_all_blocked(self):
+        self.probe([(28, '')] * 4, success=False)
+        self.assertEqual(self.ns['checks'][0]['verdict'], 'PASS')
+
+    def test_empty_dns_answer_is_not_success(self):
+        self.probe([(0, '')] * 4, targets=('example.com', 'www.cloudflare.com'), kind='dns')
+        self.assertEqual(self.ns['checks'][0]['verdict'], 'FAIL')
+
+    def test_observation_records_without_changing_verdicts(self):
+        self.probe([(28, '')] * 4, judge=False)
+        self.assertFalse(self.ns['checks'])
+        self.assertEqual(len(self.ns['observations'][0]['attempts']), 4)
+
+    def test_egress_mismatch_not_hidden_by_another_match(self):
+        self.outputs = [(0, 'ip=192.0.2.1\n'), (0, 'ip=192.0.2.1\n'),
+                        (0, 'ip=192.0.2.2\n'), (0, 'ip=192.0.2.1\n')]
+        self.ns['egress_probe'](True)
+        self.assertEqual(self.ns['checks'][0]['verdict'], 'FAIL')
+        self.assertEqual(len(self.ns['checks'][0]['invalid']), 1)
+
+    def test_egress_other_target_can_match_after_timeout(self):
+        self.outputs = [(28, ''), (28, ''), (0, 'ip=192.0.2.1\n'),
+                        (28, ''), (28, ''), (0, 'ip=192.0.2.1\n')]
+        self.ns['egress_probe'](True)
+        self.assertEqual(self.ns['checks'][0]['verdict'], 'PASS')
+
+    def test_reject_single_target(self):
+        with self.assertRaises(ValueError): self.probe([], targets=('https://1.1.1.1',))
+
+
+class ReclaimKept(unittest.TestCase):
+    def setUp(self):
+        self.ns = helpers()
+        self.calls = []
+        self.containers = 'fpe-cli\nunrelated-fpe-cli\nproduction\n'
+        self.networks = 'fpe-mesh\nproduction-net\n'
+        def need(args):
+            self.calls.append(args)
+            if args[1] == 'ps': return self.containers
+            if args[1:3] == ['network', 'ls']: return self.networks
+            if args[1] == 'images': return 'localhost/fpe-node:t0022\nlocalhost/fpe-node:foreign\n'
+            return ''
+        self.ns['need'] = need
+
+    def test_only_exact_owned_resources_removed(self):
+        self.ns['reclaim_kept']()
+        mutations = [a for a in self.calls if a[1] in ('rm', 'rmi') or a[1:3] == ['network', 'rm']]
+        self.assertEqual(mutations, [['podman', 'rm', '-f', '-t', '0', 'fpe-cli'],
+                                   ['podman', 'network', 'rm', 'fpe-mesh'],
+                                   ['podman', 'rmi', 'localhost/fpe-node:t0022']])
+
+    def test_unknown_prefixed_resource_aborts_before_any_deletion(self):
+        for resource in ('container', 'network'):
+            with self.subTest(resource=resource):
+                self.setUp()
+                if resource == 'container': self.containers += 'fpe-foreign\n'
+                else: self.networks += 'fpe-foreign\n'
+                with self.assertRaisesRegex(RuntimeError, 'unknown fpe-'): self.ns['reclaim_kept']()
+                self.assertEqual(len(self.calls), 2)
+
+    def test_cleanup_failure_propagates(self):
+        self.ns['need'] = Mock(side_effect=['fpe-cli', 'fpe-mesh', RuntimeError('busy')])
+        with self.assertRaisesRegex(RuntimeError, 'busy'): self.ns['reclaim_kept']()
+
+
+class DnsAssertions(unittest.TestCase):
+    def setUp(self): self.ns = helpers()
+
+    def test_wrong_restore_fails_with_actual_evidence(self):
+        self.ns['run'] = Mock(return_value=(0, 'dead owner DNS', ''))
+        self.ns['record'] = Mock(return_value=(0, 'dead owner DNS', '', 'actual-resolver'))
+        with self.assertRaisesRegex(RuntimeError, 'baseline-restored'):
+            self.ns['expect_dns']('baseline-restored', 'original DNS')
+        self.assertEqual(self.ns['checks'][0]['verdict'], 'FAIL')
+        self.assertEqual(self.ns['checks'][0]['evidence'], 'actual-resolver')
+
+    def test_normal_and_crash_lifecycle_assert_before_cleanup(self):
+        for crash in (False, True):
+            with self.subTest(crash=crash):
+                self.setUp()
+                events = []
+                for name in ('new_network', 'stop_pair', 'check', 'stop'):
+                    self.ns[name] = Mock()
+                self.ns['settings'] = lambda: ({}, {'tun_name': 'fpe0'})
+                self.ns['start'] = lambda c, cfg, **kw: events.append(('start', c, dict(cfg), kw))
+                self.ns['expect_dns'] = lambda label, expected: events.append(('expect', label, expected))
+                self.ns['write_container'] = lambda c, path, text: events.append(('write', text))
+                commands = []
+                def need(args):
+                    commands.append(args)
+                    if 'cat' in args: return 'original resolver'
+                    if '-j' in args: return '{"nftables": []}'
+                    return ''
+                self.ns['need'] = need
+                journals = {'first-dns-journal': ['fpe0'], 'second-dns-journal': ['fpe1'], 'dns-journal-after-stop': []}
+                def record(label, args):
+                    if label == 'resolver-mountinfo': body = '1 2 0:3 /file /etc/resolv.conf rw - tmpfs tmpfs rw'
+                    else: body = json.dumps({'owners': [{'iface': f} for f in journals[label]]})
+                    return 0, body, '', label
+                self.ns['record'] = record
+                self.ns['dns_lifecycle'](crash)
+                self.assertEqual(events[-1], ('write', 'original resolver'))
+                self.assertEqual(events[-2][1], 'baseline-restored-after-stop')
+                self.assertIn('192.0.2.53', events[-2][2])
+                self.assertTrue(all(c['verdict'] == 'PASS' for c in self.ns['checks']))
+                if crash:
+                    self.assertTrue(any('kill -KILL' in ' '.join(c) for c in commands))
+                    self.assertTrue(any(e[0] == 'start' and e[2].get('tun_name') == 'fpe1' for e in events))
+                    self.assertIn('dead-owner-pruned', [c['check'] for c in self.ns['checks']])
+
+
+class ShellAndScope(unittest.TestCase):
+    def test_shell_syntax(self): subprocess.run(['bash', '-n', str(SCRIPT)], check=True)
+
+    def test_root_and_binary_defaults_and_overrides(self):
+        prefix = SOURCE.split('test "$(uname -s)"', 1)[0]
+        for overrides, expected in [({}, '/opt/ops/fp/e2e\n/opt/ops/fp/e2e/bin/fluxpeer'),
+                                    ({'FLUXPEER_E2E_ROOT': '/tmp/root with spaces'}, '/tmp/root with spaces\n/tmp/root with spaces/bin/fluxpeer'),
+                                    ({'FLUXPEER_E2E_ROOT': '/tmp/root', 'FLUXPEER_BIN': '/tmp/other binary'}, '/tmp/root\n/tmp/other binary')]:
+            env = {k: v for k, v in os.environ.items() if k not in ('FLUXPEER_BIN', 'FLUXPEER_E2E_ROOT')}
+            env.update(overrides)
+            out = subprocess.check_output(['bash', '-c', prefix + '\nprintf "%s\\n%s" "$ROOT" "$BIN"'], env=env, text=True)
+            self.assertEqual(out, expected)
+
+    def test_no_single_target_public_curl_call_sites_remain(self):
+        # Public curl commands must go through public_probe, not record/check.
+        for node in ast.walk(TREE):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'px':
+                literals = [a.value for a in node.args if isinstance(a, ast.Constant)]
+                if 'curl' in literals:
+                    self.assertFalse(any(isinstance(v, str) and v.startswith('https://') for v in literals))
+
+
+if __name__ == '__main__': unittest.main()
