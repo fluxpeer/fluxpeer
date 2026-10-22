@@ -30,6 +30,8 @@ struct Daemon {
     processes: Processes,
     admission: tokio::sync::Mutex<()>,
     guard_root: PathBuf,
+    #[cfg(target_os = "macos")]
+    pf_base: PathBuf,
     protected_members: parking_lot::Mutex<std::collections::HashSet<String>>,
     exit: tokio::sync::Notify,
 }
@@ -409,7 +411,9 @@ fn reserve_member(dir: &Path) -> std::io::Result<MemberSlot> {
 
 impl Daemon {
     fn new(dir: PathBuf, token: String) -> Self {
-        Self { dir, token, processes: Processes::default(), admission: tokio::sync::Mutex::new(()), guard_root: PathBuf::from(crate::carriers::ROOT), protected_members: parking_lot::Mutex::default(), exit: tokio::sync::Notify::new() }
+        #[cfg(target_os = "macos")]
+        let pf_base = if cfg!(test) { dir.join("pf") } else { PathBuf::from(crate::firewall::pf::BASE) };
+        Self { #[cfg(target_os = "macos")] pf_base, dir, token, processes: Processes::default(), admission: tokio::sync::Mutex::new(()), guard_root: PathBuf::from(crate::carriers::ROOT), protected_members: parking_lot::Mutex::default(), exit: tokio::sync::Notify::new() }
     }
 
     // Cover validation, config writes, stop/restart and spawn registration with
@@ -474,6 +478,11 @@ impl Daemon {
         if release && !self.processes.contains(iface) {
             let iface = iface.to_string();
             crate::apply::blocking(move || crate::firewall::client::clear(&iface)).await?;
+        }
+        #[cfg(target_os = "macos")]
+        if !self.processes.contains(iface) {
+            let iface = iface.to_string(); let base = self.pf_base.clone();
+            crate::apply::blocking(move || crate::firewall::pf::down_at(&base, &iface)).await?;
         }
         if let Err(error) = std::fs::remove_file(crate::statusd::socket_path(iface))
             && error.kind() != std::io::ErrorKind::NotFound { return Err(error); }

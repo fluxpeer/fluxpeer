@@ -167,8 +167,9 @@ with `use_exit: "auto"` or an explicitly selected exit key. Configure it with
 or the daemon `settings` command (`{"iface":"fp0","kill_switch":true}`). The
 CLI edits local configuration and requires a tunnel restart, like `use-exit`;
 daemon/desktop settings restart the member. It never enables full tunnel itself.
-macOS and other unsupported hosts reject an active kill switch explicitly;
-macOS pf integration is deferred to T-0042.
+macOS and other unsupported hosts reject an active kill switch explicitly.
+macOS client kill-switch is not supported in this release. macOS provider NAT
+support does not imply client traffic protection.
 
 Kill-switch requires a single active membership on the host. Enabling it through
 settings, set-config or `kill-switch on` is rejected while another membership is
@@ -231,3 +232,30 @@ privately — see [`SECURITY.md`](SECURITY.md).
 
 fluxpeer is part of the **openprx** family. Status: actively developed; interfaces may
 change before a tagged 1.0.
+
+## macOS exit provider (PF)
+
+Provider IPv4 NAT and forwarding rules live only in
+`com.apple/250.fluxpeer.<iface>`, keyed by the stable membership name (for example
+`fp0`), even when the kernel assigns a different `utun` device after restart.
+The live main ruleset must already contain unconditional
+`nat-anchor "com.apple/*"` and `anchor "com.apple/*"` hooks. Missing hooks or an
+occupied anchor without an ownership journal cause an explicit error; Fluxpeer
+never reloads the main ruleset or `/etc/pf.conf`. Existing host policy can still
+restrict forwarding; this does not override earlier host quick-block rules.
+
+Each provider obtains its own `pfctl -E` reference and releases only that token
+with `pfctl -X`. Disconnect flushes only that member's NAT/filter rules; other
+anchors and the shared connection state table remain untouched. IPv4 forwarding
+uses persistent per-member leases, restoring the saved value only when the last
+member leaves. IPv6 forwarding is not enabled by this backend.
+
+Private ownership records and direct command receipts are kept under
+`/var/run/fluxpeer-pf/<boot-session-uuid>/`. Startup and daemon down recover a
+member's recorded resources, including after a changed `utun` number. Old boot
+records are never applied to a new boot. Cleanup failures retain their records
+for retry. If PF enable is interrupted before a complete token receipt exists,
+ownership is reported as uncertain; Fluxpeer will not acquire another token or
+guess which foreign reference to release. Keep the journal/receipt for operator
+recovery in this exceptional case. Existing PF connection states are not purged;
+this provider backend is not a macOS client kill-switch.

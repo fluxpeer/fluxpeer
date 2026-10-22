@@ -29,7 +29,9 @@ pub(crate) fn validate_config(cfg: &serde_json::Value) -> std::io::Result<bool> 
 }
 pub(crate) fn supported(active: bool) -> std::io::Result<()> {
     if active && !cfg!(target_os = "linux") {
-        return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "client kill-switch is unsupported on this platform; macOS pf support is pending T-0042"));
+        let message = if cfg!(target_os = "macos") { "macOS client kill-switch is not supported in this release" }
+            else { "client kill-switch is not supported on this platform in this release" };
+        return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, message));
     }
     Ok(())
 }

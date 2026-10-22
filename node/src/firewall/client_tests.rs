@@ -74,6 +74,9 @@ fn opt_in_default_split_and_unsupported_are_explicit() {
     }
     if cfg!(target_os = "linux") { supported(true).unwrap(); }
     else { assert_eq!(supported(true).unwrap_err().kind(), std::io::ErrorKind::Unsupported); }
+    if cfg!(target_os = "macos") {
+        assert_eq!(supported(true).unwrap_err().to_string(), "macOS client kill-switch is not supported in this release");
+    }
     supported(false).unwrap();
 }
 

@@ -48,6 +48,19 @@ impl From<io::Error> for ApplyError {
 
 pub(crate) trait Runner {
     fn run(&mut self, command: &[&str], input: Option<&str>) -> Result<String>;
+    /// Persist stdout and stderr directly, including output from a child that
+    /// outlives a crashed caller. PF enable tokens are emitted on stderr.
+    #[cfg(any(target_os = "macos", test))]
+    fn run_recorded(&mut self, command: &[&str], receipt: &std::path::Path) -> Result<String> {
+        let output = self.run(command, None)?;
+        use std::fs::OpenOptions;
+        let mut options = OpenOptions::new(); options.write(true).create_new(true);
+        #[cfg(unix)]
+        { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+        let mut file = options.open(receipt)?;
+        file.write_all(output.as_bytes())?; file.sync_all()?;
+        Ok(output)
+    }
     fn write_file(&mut self, path: &std::path::Path, data: &[u8]) -> Result {
         write_file_with(path, data, has_selinux_label, |from, to| std::fs::rename(from, to))
             .map_err(|e| ApplyError::io(&["write", &path.to_string_lossy()], e))
@@ -120,15 +133,31 @@ impl Runner for System {
     fn run(&mut self, command: &[&str], input: Option<&str>) -> Result<String> {
         run_timeout(command, input, Duration::from_secs(10))
     }
+    #[cfg(any(target_os = "macos", test))]
+    fn run_recorded(&mut self, command: &[&str], receipt: &std::path::Path) -> Result<String> {
+        run_captured(command, None, Duration::from_secs(10), Some(receipt))
+    }
 }
 
 fn run_timeout(command: &[&str], input: Option<&str>, timeout: Duration) -> Result<String> {
+    run_captured(command, input, timeout, None)
+}
+
+fn run_captured(command: &[&str], input: Option<&str>, timeout: Duration, receipt: Option<&std::path::Path>) -> Result<String> {
     let execute = || -> io::Result<(std::process::ExitStatus, String, String, bool)> {
         let Some((program, args)) = command.split_first() else { return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty command")); };
         // Temporary files avoid pipe deadlocks (including a child that never reads
         // stdin, or a descendant keeping stdout open after its parent exits).
-        let mut stdout = tempfile::tempfile()?;
-        let mut stderr = tempfile::tempfile()?;
+        let mut stdout = if let Some(path) = receipt {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).read(true).create_new(true);
+            #[cfg(unix)]
+            { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+            let file = options.open(path)?;
+            if let Some(parent) = path.parent() { std::fs::File::open(parent)?.sync_all()?; }
+            file
+        } else { tempfile::tempfile()? };
+        let mut stderr = if receipt.is_some() { stdout.try_clone()? } else { tempfile::tempfile()? };
         let mut cmd = Command::new(program);
         cmd.args(args).env("LC_ALL", "C").stdout(stdout.try_clone()?).stderr(stderr.try_clone()?);
         #[cfg(unix)]
@@ -141,7 +170,15 @@ fn run_timeout(command: &[&str], input: Option<&str>, timeout: Duration) -> Resu
             stdin.rewind()?;
             cmd.stdin(stdin);
         } else { cmd.stdin(Stdio::null()); }
-        let mut child = cmd.spawn()?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                // No child ran: remove the pre-created receipt so recovery can
+                // distinguish a failed spawn from an ambiguous interrupted one.
+                if let Some(path) = receipt { std::fs::remove_file(path)?; }
+                return Err(error);
+            }
+        };
         let deadline = Instant::now() + timeout;
         let (status, timed_out) = loop {
             match child.try_wait() {
@@ -161,12 +198,13 @@ fn run_timeout(command: &[&str], input: Option<&str>, timeout: Duration) -> Resu
                 }
             }
         };
+        if receipt.is_some() { stdout.sync_all()?; }
         stdout.rewind()?;
-        stderr.rewind()?;
+        if receipt.is_none() { stderr.rewind()?; }
         let mut out = Vec::new();
         let mut err = Vec::new();
         stdout.read_to_end(&mut out)?;
-        stderr.read_to_end(&mut err)?;
+        if receipt.is_none() { stderr.read_to_end(&mut err)?; } else { err.clone_from(&out); }
         Ok((status, String::from_utf8_lossy(&out).into_owned(), String::from_utf8_lossy(&err).into_owned(), timed_out))
     };
     let (status, out, mut stderr, timed_out) = execute().map_err(|e| ApplyError::io(command, e))?;

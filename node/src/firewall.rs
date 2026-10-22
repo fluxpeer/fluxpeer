@@ -3,8 +3,10 @@
 
 use crate::apply::{self, ApplyError, Result};
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 mod forwarding;
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod pf;
 pub(crate) mod client;
 
 pub trait Firewall: Send + Sync {
@@ -54,7 +56,7 @@ fn detect_with(runner: &mut impl apply::Runner, requested: Option<&str>) -> Resu
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn instance(tun: &str) -> Result<String> {
     if tun.is_empty() || tun.len() > 15 || tun.bytes().any(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'-') {
         return Err(ApplyError::new(&["firewall", tun], "invalid TUN interface name"));
@@ -69,7 +71,7 @@ fn permission_denied(error: &ApplyError) -> bool {
         || message.contains("operation not permitted") || message.contains("must be root")
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn sysctl_get_with(runner: &mut impl apply::Runner, key: &str) -> Result<bool> {
     let command = ["sysctl", "-n", key];
     match runner.run(&command, None)?.trim() {
@@ -78,7 +80,7 @@ fn sysctl_get_with(runner: &mut impl apply::Runner, key: &str) -> Result<bool> {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn sysctl_set_with(runner: &mut impl apply::Runner, key: &str, on: bool) -> Result {
     let result = (|| {
         if sysctl_get_with(runner, key)? == on { return Ok(()); }

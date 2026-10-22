@@ -426,10 +426,8 @@ fn v6_block_up(dev: &str, pending: &mut Vec<Vec<String>>) -> std::io::Result<boo
     Ok(blocked)
 }
 
-/// Exit SIDE: enable IPv4+IPv6 forwarding + NAT masquerade out `phys` so traffic from
-/// peers routing 0.0.0.0/0 (or ::/0) through us reaches the internet. Linux only (the
-/// common exit-node platform); idempotent on both stacks.
-pub(crate) fn exit_gateway_up(phys: &str, tun: &str, overlay_cidr: &str, _trust_external: bool, _backend: Option<&dyn crate::firewall::Firewall>) -> Result {
+/// Provider forwarding and NAT; PF ownership uses the stable membership iface.
+pub(crate) fn exit_gateway_up(phys: &str, tun: &str, overlay_cidr: &str, _trust_external: bool, _backend: Option<&dyn crate::firewall::Firewall>, _iface: &str) -> Result {
     #[cfg(target_os = "linux")]
     {
         _backend.ok_or_else(|| ApplyError::new(&["firewall", "up"], "missing selected backend"))?.up(phys, tun, &crate::firewall::Options { overlay_cidr: overlay_cidr.into(), trust_external: _trust_external })?;
@@ -444,40 +442,19 @@ pub(crate) fn exit_gateway_up(phys: &str, tun: &str, overlay_cidr: &str, _trust_
         win_ps(&format!("New-NetNat -Name fluxpeer-exit -InternalIPInterfaceAddressPrefix '{overlay_cidr}'"))?;
     }
     #[cfg(target_os = "macos")]
-    {
-        let _ = tun;
-        apply::run(&["sysctl", "-w", "net.inet.ip.forwarding=1"])?;
-        let was_on = apply::output(&["pfctl", "-s", "info"])? .contains("Status: Enabled");
-        apply::write("/etc/pf.anchors/fluxpeer-exit", format!("nat on {phys} from {overlay_cidr} to any -> ({phys})\n"))?;
-        apply::input(&["pfctl", "-f", "-"], r#"scrub-anchor "com.apple/*"
-nat-anchor "com.apple/*"
-nat-anchor "fluxpeer-exit"
-rdr-anchor "com.apple/*"
-dummynet-anchor "com.apple/*"
-anchor "com.apple/*"
-load anchor "com.apple" from "/etc/pf.anchors/com.apple"
-load anchor "fluxpeer-exit" from "/etc/pf.anchors/fluxpeer-exit"
-"#)?;
-        if !was_on {
-            apply::run(&["pfctl", "-e"])?;
-            PF_ENABLED_BY_US.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
+    { crate::firewall::pf::up(_iface, tun, phys, overlay_cidr)?; }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     { Err(ApplyError::new(&["exit-gateway", phys, tun, overlay_cidr], "unsupported platform")) }
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-static PF_ENABLED_BY_US: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 #[cfg(target_os = "windows")]
 fn win_ps(script: &str) -> Result {
     apply::run(&["powershell", "-NoProfile", "-Command", &format!("$ErrorActionPreference = 'Stop'; {script}")])
 }
 
-pub(crate) fn exit_gateway_down(phys: &str, tun: &str, _backend: Option<&dyn crate::firewall::Firewall>) -> Result {
+pub(crate) fn exit_gateway_down(phys: &str, tun: &str, _backend: Option<&dyn crate::firewall::Firewall>, _iface: &str) -> Result {
     #[cfg(target_os = "linux")]
     { _backend.ok_or_else(|| ApplyError::new(&["firewall", "down"], "missing selected backend"))?.down(phys, tun)?; }
     #[cfg(target_os = "windows")]
@@ -486,15 +463,7 @@ pub(crate) fn exit_gateway_down(phys: &str, tun: &str, _backend: Option<&dyn cra
         win_ps("Get-NetNat -Name fluxpeer-exit -ErrorAction SilentlyContinue | Remove-NetNat -Confirm:$false")?;
     }
     #[cfg(target_os = "macos")]
-    {
-        let _ = (phys, tun);
-        let results = [apply::run(&["pfctl", "-a", "fluxpeer-exit", "-F", "nat"]), apply::run(&["pfctl", "-f", "/etc/pf.conf"]), apply::remove("/etc/pf.anchors/fluxpeer-exit")];
-        apply::all(results)?;
-        if PF_ENABLED_BY_US.load(std::sync::atomic::Ordering::Relaxed) {
-            apply::run(&["pfctl", "-d"])?;
-            PF_ENABLED_BY_US.store(false, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
+    { let _ = (phys, tun); crate::firewall::pf::down(_iface)?; }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     let _ = (phys, tun);
     Ok(())

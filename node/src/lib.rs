@@ -190,6 +190,7 @@ struct Reconciler {
 /// All synchronous host work is entered on the blocking pool. Per-effect state
 /// and retry budgets are independent; the shutdown gate still serializes effects.
 struct HostEffects {
+    membership_iface: String,
     tun_name: String,
     own_cidr: String,
     control_host: String,
@@ -381,7 +382,7 @@ impl HostEffects {
                 |dns, full| route::set_dns(&self.tun_name, dns, full), || route::reset_dns(&self.tun_name),
                 || route::verify_dns_file(&self.tun_name))
         }));
-        let nat = nat_retry.run(epoch, now, || self.effect(HostStage::Nat, || sync_nat(self.provider, &self.nat_state, &self.shutdown, self_exit, &self.tun_name, &self.own_cidr)));
+        let nat = nat_retry.run(epoch, now, || self.effect(HostStage::Nat, || sync_nat(self.provider, &self.nat_state, &self.shutdown, self_exit, &self.tun_name, &self.own_cidr, &self.membership_iface)));
         apply::all([host, exit, resolver, nat])
     }
 
@@ -392,7 +393,7 @@ impl HostEffects {
             let exit = self.exit_state.lock().as_ref().map_or(Ok(()), remove_exit);
             let pending = route::cleanup_exit(&self.tun_name, &mut self.exit_progress.lock());
             let dns = sync_dns_with(&mut runtime.dns, None, |_| Ok(()), || route::reset_dns(&self.tun_name));
-            let nat = remove_nat(&self.nat_state, &self.tun_name);
+            let nat = remove_nat(&self.nat_state, &self.tun_name, &self.membership_iface);
             let carriers = if exit.is_ok() && pending.is_ok() { runtime.bypass.sync(&[], false) } else { Ok(()) };
             result = apply::all([exit, pending, dns, nat, carriers]);
         });
@@ -416,7 +417,7 @@ fn nat_on(override_: Option<bool>, veto: bool, self_exit: bool) -> bool {
 }
 
 /// Shared startup/reconcile wiring for provider policy and host effects.
-fn sync_nat(policy: ProviderPolicy, state: &NatState, shutdown: &Shutdown, approved: bool, tun: &str, own_cidr: &str) -> ApplyResult {
+fn sync_nat(policy: ProviderPolicy, state: &NatState, shutdown: &Shutdown, approved: bool, tun: &str, own_cidr: &str, iface: &str) -> ApplyResult {
     #[cfg(target_os = "linux")]
     {
         let stopped = shutdown.lock();
@@ -428,13 +429,23 @@ fn sync_nat(policy: ProviderPolicy, state: &NatState, shutdown: &Shutdown, appro
             state.backend = Some(Arc::from(backend));
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        let stopped = shutdown.lock();
+        if *stopped || !policy.enabled { return Ok(()); }
+        let mut state = state.lock();
+        if !state.recovered {
+            firewall::pf::down(iface)?;
+            state.recovered = true;
+        }
+    }
     let backend = state.lock().backend.clone();
     policy.sync(state, shutdown, approved, route::physical_iface, |enabled, phys| {
         if enabled {
-            route::exit_gateway_up(phys, tun, own_cidr, policy.trust_external, backend.as_deref())?;
+            route::exit_gateway_up(phys, tun, own_cidr, policy.trust_external, backend.as_deref(), iface)?;
             tracing::info!(phys, tun, "exit provider: forwarding/NAT UP");
         } else {
-            route::exit_gateway_down(phys, tun, backend.as_deref())?;
+            route::exit_gateway_down(phys, tun, backend.as_deref(), iface)?;
             tracing::info!(phys, tun, "exit provider: forwarding/NAT DOWN");
         }
         Ok(())
@@ -452,7 +463,7 @@ fn set_nat(
 
 #[derive(Default)]
 struct NatInstall {
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     recovered: bool,
     #[cfg(any(target_os = "linux", test))]
     recovery_deferred: bool,
@@ -500,10 +511,22 @@ fn reconcile_nat(
     Ok(())
 }
 
-fn remove_nat(state: &NatState, tun: &str) -> ApplyResult {
+fn remove_nat(state: &NatState, tun: &str, iface: &str) -> ApplyResult {
     let mut state = state.lock();
-    let backend = state.backend.clone();
-    reconcile_nat(&mut state, false, || Ok(None), |_, phys| route::exit_gateway_down(phys, tun, backend.as_deref()))
+    #[cfg(target_os = "macos")]
+    {
+        let _ = tun;
+        // Persistent cleanup also covers a failed startup recovery with no
+        // in-memory applied/dirty marker (including foreground node shutdown).
+        firewall::pf::down(iface)?;
+        state.applied = None; state.dirty = None;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let backend = state.backend.clone();
+        reconcile_nat(&mut state, false, || Ok(None), |_, phys| route::exit_gateway_down(phys, tun, backend.as_deref(), iface))
+    }
 }
 
 /// This gate is held through host effects. Shutdown sets the flag under the same
@@ -1272,7 +1295,7 @@ async fn run_with(mut cfg: Config, protect: Option<ProtectFn>, routes: Option<mo
     let own_cidr = overlay_cidr(r.own_addr, cfg.prefix_len);
     let apply_status = Arc::new(parking_lot::Mutex::new(apply::Status::default()));
     let host = Arc::new(HostEffects {
-        tun_name: dev_name.clone(), own_cidr, control_host, relay_ips: parking_lot::Mutex::new(relay_ips),
+        membership_iface: cfg.tun_name.clone(), tun_name: dev_name.clone(), own_cidr, control_host, relay_ips: parking_lot::Mutex::new(relay_ips),
         exclude_routes: cfg.exclude_routes.clone(), dns_override: parking_lot::Mutex::new(eff_dns.clone()),
         local_dns: cfg.dns.clone(), local_mtu: cfg.mtu, initial_mtu: cfg.mtu.or(r.mtu),
         exit_state, exit_progress, nat_state: Arc::default(), provider: ProviderPolicy::from_config(&cfg, embedded),
@@ -1856,7 +1879,7 @@ mod exit_contract_tests {
     }
 
     fn test_host() -> HostEffects {
-        HostEffects { tun_name: "fp-test".into(), own_cidr: "100.72.16.0/24".into(), control_host: String::new(), relay_ips: parking_lot::Mutex::new(vec![]),
+        HostEffects { membership_iface: "fp-test".into(), tun_name: "fp-test".into(), own_cidr: "100.72.16.0/24".into(), control_host: String::new(), relay_ips: parking_lot::Mutex::new(vec![]),
             exclude_routes: vec![], dns_override: parking_lot::Mutex::new(vec![]), local_dns: vec![], local_mtu: None, initial_mtu: None, exit_state: Arc::default(), exit_progress: Arc::default(), nat_state: Arc::default(),
             provider: ProviderPolicy { enabled: false, force: None, veto: false, trust_external: false }, manage_host_routes: false,
             shutdown: Arc::default(), runtime: parking_lot::Mutex::default(), kill_switch: None, carrier_dns: None, carrier_cache: None, probe: None }

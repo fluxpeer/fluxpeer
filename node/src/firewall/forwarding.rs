@@ -38,35 +38,55 @@ impl State {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(super) fn acquire(&self, runner: &mut impl apply::Runner, id: &str) -> Result {
+        self.acquire_with(runner, id, "net.ipv4.ip_forward", Some("net.ipv6.conf.all.forwarding"))
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(super) fn acquire_macos(&self, runner: &mut impl apply::Runner, id: &str) -> Result {
+        self.acquire_with(runner, id, "net.inet.ip.forwarding", None)
+    }
+
+    fn acquire_with(&self, runner: &mut impl apply::Runner, id: &str, v4: &str, v6: Option<&str>) -> Result {
         let path = self.root.join("baseline.json");
         let baseline = match self.baseline()? {
             Some(mut baseline) => {
-                if baseline.v6.is_none() { baseline.v6 = read_v6(runner)?; }
+                if baseline.v6.is_none() { baseline.v6 = read_v6(runner, v6)?; }
                 baseline
             },
             None => {
                 if self.leases()?.next().is_some() { return Err(ApplyError::new(&["forwarding", "acquire"], "leases exist without baseline; refusing to overwrite original state")); }
-                Baseline { v4: sysctl_get_with(runner, "net.ipv4.ip_forward")?, v6: read_v6(runner)? }
+                Baseline { v4: sysctl_get_with(runner, v4)?, v6: read_v6(runner, v6)? }
             }
         };
         self.save(&path, &serde_json::to_vec(&baseline).map_err(|e| ApplyError::new(&["forwarding", "serialize"], e.to_string()))?)?;
         // Persist ownership before any mutation. Retries cannot accidentally
         // replace the original baseline with the already-enabled value.
         self.save(&self.root.join(format!("{id}.lease")), b"forwarding\n")?;
-        sysctl_set_with(runner, "net.ipv4.ip_forward", true)?;
-        if baseline.v6.is_some() { sysctl_set_with(runner, "net.ipv6.conf.all.forwarding", true)?; }
+        sysctl_set_with(runner, v4, true)?;
+        if let Some(key) = v6 && baseline.v6.is_some() { sysctl_set_with(runner, key, true)?; }
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(super) fn release(&self, runner: &mut impl apply::Runner, id: &str) -> Result {
+        self.release_with(runner, id, "net.ipv4.ip_forward", Some("net.ipv6.conf.all.forwarding"))
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(super) fn release_macos(&self, runner: &mut impl apply::Runner, id: &str) -> Result {
+        self.release_with(runner, id, "net.inet.ip.forwarding", None)
+    }
+
+    fn release_with(&self, runner: &mut impl apply::Runner, id: &str, v4: &str, v6: Option<&str>) -> Result {
         let lease = self.root.join(format!("{id}.lease"));
         let leases: Vec<_> = self.leases()?.collect();
         if !leases.contains(&lease) { return Ok(()); }
         if leases.iter().any(|p| p != &lease) { return remove(&lease); }
         let baseline = self.baseline()?.ok_or_else(|| ApplyError::new(&["forwarding", "release"], "missing forwarding baseline"))?;
-        let v4 = sysctl_set_with(runner, "net.ipv4.ip_forward", baseline.v4);
-        let v6 = baseline.v6.map_or(Ok(()), |on| sysctl_set_with(runner, "net.ipv6.conf.all.forwarding", on));
+        let v4 = sysctl_set_with(runner, v4, baseline.v4);
+        let v6 = baseline.v6.zip(v6).map_or(Ok(()), |(on, key)| sysctl_set_with(runner, key, on));
         apply::all([v4, v6])?;
         // Keep both records on a failed restore. With the lock held, no other
         // instance can race the last-owner check or capture a partial restore.
@@ -92,17 +112,18 @@ impl State {
         Ok(leases.into_iter())
     }
 
-    fn save(&self, path: &Path, bytes: &[u8]) -> Result {
+    pub(super) fn save(&self, path: &Path, bytes: &[u8]) -> Result {
         let mut temp = tempfile::NamedTempFile::new_in(&self.root).map_err(|e| file_error("create", path, e))?;
         temp.write_all(bytes).map_err(|e| file_error("write", path, e))?;
         temp.as_file().sync_all().map_err(|e| file_error("sync", path, e))?;
         temp.persist(path).map_err(|e| file_error("rename", path, e.error))?;
-        Ok(())
+        File::open(&self.root).and_then(|dir| dir.sync_all()).map_err(|e| file_error("sync", &self.root, e))
     }
 }
 
-fn read_v6(runner: &mut impl apply::Runner) -> Result<Option<bool>> {
-    match sysctl_get_with(runner, "net.ipv6.conf.all.forwarding") {
+fn read_v6(runner: &mut impl apply::Runner, key: Option<&str>) -> Result<Option<bool>> {
+    let Some(key) = key else { return Ok(None); };
+    match sysctl_get_with(runner, key) {
         Ok(on) => Ok(Some(on)),
         Err(e) if apply::ipv6_unavailable(&e) => { tracing::warn!(%e, "IPv6 forwarding unavailable"); Ok(None) }
         Err(e) => Err(e),
