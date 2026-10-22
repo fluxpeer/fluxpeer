@@ -142,6 +142,11 @@ fn report_routes(generation: jlong, json: &str) -> std::io::Result<()> {
         clear_upcall_exception(&mut env, "onRoutes");
         return Err(std::io::Error::other(error));
     }
+    if let Err(error) = env.call_static_method(class, "onReady", "(J)V", &[JValue::Long(generation)]) {
+        tracing::error!(%error, "[jni] onReady upcall failed");
+        clear_upcall_exception(&mut env, "onReady");
+        return Err(std::io::Error::other(error));
+    }
     Ok(())
 }
 

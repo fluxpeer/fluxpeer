@@ -88,7 +88,7 @@ impl D for Device {
     type Queue = Queue;
 
     fn name(&self) -> &str {
-        return "";
+        ""
     }
 
     fn set_name(&mut self, value: &str) -> Result<()> {
