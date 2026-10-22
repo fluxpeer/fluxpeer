@@ -482,8 +482,11 @@ async fn sql_list_invites(
 
 async fn sql_get_device_settings(
     State(s): State<Arc<SqlStore>>,
+    Extension(auth): Extension<Arc<auth::Auth>>,
     Path(device_id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_device_read(&s, &auth, &headers, &device_id).await?;
     let raw = s.device_settings(&device_id).await.map_err(sql_status)?;
     Ok(Json(serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}))))
 }
@@ -513,8 +516,11 @@ async fn sql_advertise_route(
 
 async fn sql_list_device_routes(
     State(s): State<Arc<SqlStore>>,
+    Extension(auth): Extension<Arc<auth::Auth>>,
     Path(device_id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<Vec<domain::Route>>, StatusCode> {
+    require_device_read(&s, &auth, &headers, &device_id).await?;
     s.list_device_routes(&device_id).await.map(Json).map_err(sql_status)
 }
 
@@ -606,6 +612,20 @@ async fn require_device(s: &SqlStore, headers: &axum::http::HeaderMap, device_id
     }
 }
 
+/// Read-only device details accept the same admin authority as management,
+/// while a device bearer remains confined to its own record. Keep node writes
+/// and watch on their existing device-only guard.
+async fn require_device_read(s: &SqlStore, auth: &auth::Auth, headers: &axum::http::HeaderMap, device_id: &str) -> Result<(), StatusCode> {
+    let token = bearer_token(headers).filter(|token| !token.is_empty()).ok_or(StatusCode::UNAUTHORIZED)?;
+    if auth.valid_bearer(token) { return Ok(()); }
+    let stored = s.device_token(device_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if stored.is_some_and(|stored| ct_eq(stored.as_bytes(), token.as_bytes())) { return Ok(()); }
+    if s.has_device_token(token).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Err(StatusCode::UNAUTHORIZED)
+}
+
 async fn sql_import_devices(
     State(s): State<Arc<SqlStore>>,
     Path(network_id): Path<String>,
@@ -650,10 +670,11 @@ async fn sql_rename_device(
 
 async fn sql_device_config(
     State(s): State<Arc<SqlStore>>,
+    Extension(auth): Extension<Arc<auth::Auth>>,
     Path(device_id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<domain::DeviceConfig>, StatusCode> {
-    require_device(&s, &headers, &device_id).await?;
+    require_device_read(&s, &auth, &headers, &device_id).await?;
     s.device_config(&device_id).await.map(Json).map_err(sql_status)
 }
 
@@ -691,11 +712,14 @@ async fn sql_report_stats(
         .map_err(sql_status)
 }
 
-/// A device's latest traffic stats (admin). Empty zeros if never reported.
+/// A device's latest traffic stats (admin or device owner). Empty zeros if never reported.
 async fn sql_get_device_stats(
     State(s): State<Arc<SqlStore>>,
+    Extension(auth): Extension<Arc<auth::Auth>>,
     Path(device_id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_device_read(&s, &auth, &headers, &device_id).await?;
     let stats = s.device_stats(&device_id).await.map_err(sql_status)?;
     let v = match stats {
         Some((rx, tx, peers, at)) => serde_json::json!({
@@ -810,7 +834,9 @@ pub fn sql_router(store: Arc<SqlStore>) -> Router {
         .route("/devices/:id/config", get(sql_device_config))
         .route("/devices/:id/gateway", get(sql_device_gateway))
         .route("/devices/:id/endpoints", post(sql_set_endpoints))
-        .route("/devices/:id/stats", post(sql_report_stats))
+        .route("/devices/:id/stats", post(sql_report_stats).get(sql_get_device_stats))
+        .route("/devices/:id/settings", get(sql_get_device_settings))
+        .route("/devices/:id/routes", get(sql_list_device_routes))
         .route("/devices/:id/watch", get(sql_watch_device))
         .route("/networks/:id/relays", get(sql_list_relays))
         .with_state(store.clone());
@@ -827,9 +853,8 @@ pub fn sql_router(store: Arc<SqlStore>) -> Router {
         .route("/networks/:id/devices/import", post(sql_import_devices))
         .route("/networks/:id/stats", get(sql_network_stats))
         .route("/devices/:id", delete(sql_revoke).patch(sql_rename_device))
-        .route("/devices/:id/stats", get(sql_get_device_stats))
-        .route("/devices/:id/settings", get(sql_get_device_settings).put(sql_set_device_settings))
-        .route("/devices/:id/routes", post(sql_advertise_route).get(sql_list_device_routes))
+        .route("/devices/:id/settings", axum::routing::put(sql_set_device_settings))
+        .route("/devices/:id/routes", post(sql_advertise_route))
         .route("/routes/:id/approve", post(sql_approve_route))
         .route("/routes/:id", delete(sql_delete_route))
         // account management

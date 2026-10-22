@@ -231,6 +231,13 @@ impl SqlStore {
         Ok(db::get_device_token(&self.pool, device_id).await?)
     }
 
+    /// Distinguish a valid token for another device from an unauthenticated caller.
+    pub(crate) async fn has_device_token(&self, token: &str) -> Result<bool> {
+        let id = sqlx::query_scalar::<_, String>("SELECT id FROM device WHERE auth_token = $1 AND status = 'active' LIMIT 1")
+            .bind(token).fetch_optional(&self.pool).await?;
+        Ok(id.is_some())
+    }
+
     /// Lowest-free dual-stack address in the device range, derived from the
     /// network's active devices (recycling-correct).
     fn allocate_address(net: &Network, devices: &[Device]) -> Result<(Ipv4Addr, Ipv6Addr)> {

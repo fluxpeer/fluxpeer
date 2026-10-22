@@ -182,11 +182,14 @@ paths:
   /devices/{id}/config:
     get:
       summary: Pull a device's config (peers + allowed-ips)
+      description: Accepts the master bearer, a live administrator session, or this device's own token. Other device tokens are forbidden.
       parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
       responses:
         "200":
           description: config
           content: { application/json: { schema: { $ref: "#/components/schemas/DeviceConfig" } } }
+        "401": { description: missing or invalid bearer }
+        "403": { description: token belongs to another device }
         "404": { description: device not found or revoked }
   /devices/{id}/watch:
     get:

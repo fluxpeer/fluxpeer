@@ -92,7 +92,7 @@ impl Auth {
     }
 
     /// A bearer authorizes if it's the master key or a live session token.
-    fn valid_bearer(&self, bearer: &str) -> bool {
+    pub(crate) fn valid_bearer(&self, bearer: &str) -> bool {
         if let Some(m) = &self.master
             && constant_eq(bearer.as_bytes(), m.as_bytes())
         {
@@ -135,8 +135,8 @@ pub(crate) fn random_hex(bytes: usize) -> String {
 /// Whether `bearer` is the master automation key (`FLUXPEER_ADMIN_PASSWORD`).
 /// Stateless (no session map), so per-device route guards can let an admin
 /// automation caller (`fp`/CLI) act on any device without an `Auth` handle. False
-/// if no master key is configured. (Interactive admin SESSIONS aren't checked here
-/// — they go through the admin-gated routes, not the per-device node endpoints.)
+/// if no master key is configured. Device-only endpoints use this stateless
+/// check; shared device reads use `Auth::valid_bearer` to also accept sessions.
 pub(crate) fn is_master_bearer(bearer: &str) -> bool {
     matches!(std::env::var("FLUXPEER_ADMIN_PASSWORD"), Ok(m) if !m.is_empty() && constant_eq(bearer.as_bytes(), m.as_bytes()))
 }
