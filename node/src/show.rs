@@ -14,32 +14,29 @@ pub async fn show(iface: Option<String>, json: bool) -> std::io::Result<()> {
         Some(i) => vec![socket_path(&i)],
         None => all_sockets(),
     };
-    if paths.is_empty() {
-        return Err(std::io::Error::other(
-            "no fluxpeer node running (no status socket). `fluxpeer up` or `fluxpeer join <token>` first.",
-        ));
+    if json {
+        // Serialize once: even zero or multiple interfaces are one JSON value.
+        println!("{}", status_array(&paths).await?);
+        return Ok(());
     }
-    // Aggregate every running network interface (one device may be in many).
-    for (i, path) in paths.iter().enumerate() {
-        if i > 0 {
-            println!();
-        }
-        if let Err(e) = show_one(path, json).await {
-            eprintln!("! {}: {e}", path.display());
-        }
+    if paths.is_empty() { return Err(std::io::Error::other("no fluxpeer node running")); }
+    for path in paths {
+        let body = read_status(&path).await?;
+        let value = serde_json::from_str(&body).map_err(std::io::Error::other)?;
+        print_human(&value);
     }
     Ok(())
 }
 
-async fn show_one(path: &std::path::Path, json: bool) -> std::io::Result<()> {
-    let body = read_status(path).await?;
-    if json {
-        println!("{body}");
-        return Ok(());
+async fn status_array(paths: &[PathBuf]) -> std::io::Result<serde_json::Value> {
+    let mut values = Vec::new();
+    for path in paths {
+        let body = tokio::time::timeout(std::time::Duration::from_secs(2), read_status(path)).await.map_err(std::io::Error::other)??;
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(std::io::Error::other)?;
+        if !value.is_object() { return Err(std::io::Error::other("status must be an object")); }
+        values.push(value);
     }
-    let v: serde_json::Value = serde_json::from_str(&body).map_err(std::io::Error::other)?;
-    print_human(&v);
-    Ok(())
+    Ok(values.into())
 }
 
 /// Aggregate every running network's status as a JSON array (one object per
@@ -54,7 +51,7 @@ pub(crate) async fn aggregate_status() -> serde_json::Value {
     serde_json::Value::Array(arr)
 }
 
-async fn read_status(path: &std::path::Path) -> std::io::Result<String> {
+pub(crate) async fn read_status(path: &std::path::Path) -> std::io::Result<String> {
     match connect_status(path).await {
         Ok(mut stream) => {
             stream.write_all(b"get-json\n").await?;
@@ -281,5 +278,28 @@ mod stopped_tests {
         assert_eq!(actual, value);
         std::fs::remove_file(path.with_extension("error")).unwrap();
         assert!(read_status(&path).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod aggregate_tests {
+    use super::*;
+    #[tokio::test]
+    async fn json_is_one_array_for_zero_one_or_two_interfaces_and_errors_propagate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for n in 0..=2 {
+            let value = status_array(&paths).await.unwrap();
+            assert_eq!(value.as_array().unwrap().len(), n);
+            let serialized = value.to_string();
+            let mut stream = serde_json::Deserializer::from_str(&serialized).into_iter::<serde_json::Value>();
+            assert_eq!(stream.next().unwrap().unwrap(), value);
+            assert!(stream.next().is_none());
+            let path = dir.path().join(format!("fp{n}.sock"));
+            std::fs::write(path.with_extension("error"), serde_json::json!({"interface":{"name":format!("fp{n}"),"up":false},"peers":[]}).to_string()).unwrap();
+            paths.push(path);
+        }
+        std::fs::write(paths[0].with_extension("error"), "invalid JSON").unwrap();
+        assert!(status_array(&paths).await.is_err());
     }
 }

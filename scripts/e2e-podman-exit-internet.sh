@@ -646,7 +646,7 @@ try:
         check('split-no-v4-default-halves', px('fpe-cli', 'sh', '-ec',
             '! ip -4 route show | grep -Eq "^(0.0.0.0/1|128.0.0.0/1).*dev fpe0"'))
         check('split-no-cryptokey-default', px('fpe-cli', 'sh', '-ec',
-            "fluxpeer show --json | jq -se 'length > 0 and ([.[].peers[].allowed_ips[] | select(. == \"0.0.0.0/0\" or . == \"::/0\")] | length == 0)'"))
+            "fluxpeer show --json | jq -e 'type == \"array\" and length > 0 and ([.[].peers[].allowed_ips[] | select(. == \"0.0.0.0/0\" or . == \"::/0\")] | length == 0)'"))
     scenario('S1-split', s1split)
     def s1off():
         need(px('fpe-exit', 'sysctl', '-w', 'net.ipv4.ip_forward=0'))

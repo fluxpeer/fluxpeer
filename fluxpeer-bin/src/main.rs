@@ -121,6 +121,14 @@ enum RelayCmd {
 
 #[derive(Subcommand)]
 enum NodeCmd {
+    /// Manage one enrolled membership without administrator credentials.
+    Member {
+        #[arg(value_parser = ["join", "status", "up", "down", "leave"])] action: String,
+        #[arg(long)] iface: Option<String>,
+        #[arg(long)] token: Option<String>,
+        #[arg(long)] name: Option<String>,
+        #[arg(long)] config_dir: Option<String>,
+    },
     /// Register a pending route using this membership's device token.
     Advertise {
         prefix: String,
@@ -237,6 +245,12 @@ async fn main() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?,
         Cmd::Node { cmd } => match cmd {
+            NodeCmd::Member { action, iface, token, name, config_dir } => {
+                let result = fluxpeer_node::membership::command(
+                    &config_dir.unwrap_or_else(fluxpeer_node::config_dir), &action,
+                    iface.as_deref(), token.as_deref(), name).await?;
+                println!("{result}");
+            }
             NodeCmd::Advertise { prefix, iface, config_dir } => {
                 let result = fluxpeer_node::member_routes::advertise(&config_dir.unwrap_or_else(fluxpeer_node::config_dir), &iface, &prefix).await?;
                 println!("{result}");

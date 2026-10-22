@@ -81,13 +81,13 @@ pub async fn daemon(dir: String, addr: Option<String>) -> std::io::Result<()> {
     std::fs::create_dir_all(&dir).ok();
     let token = ensure_token(&dir)?;
     let d = Arc::new(Daemon::new(dir.clone(), token));
+    let addr = addr.unwrap_or_else(|| DAEMON_ADDR.to_string());
+    let listener = TcpListener::bind(&addr).await?;
     for cfg in configs(&dir) {
         if read_iface(&cfg).and_then(|iface| crate::statusd::read_failure(&crate::statusd::socket_path(&iface)))
             .is_some_and(|status| status["interface"]["terminal_control"] == true) { continue; }
         if let Err(error) = d.spawn_net(&cfg) { tracing::error!(%error, "failed to start network"); }
     }
-    let addr = addr.unwrap_or_else(|| DAEMON_ADDR.to_string());
-    let listener = TcpListener::bind(&addr).await?;
     println!(
         "→ fluxpeer daemon: {} network(s) up; control API on {addr}",
         d.processes.ifaces().len()
@@ -797,6 +797,9 @@ impl Daemon {
         if let Err(error) = std::fs::remove_file(log)
             && error.kind() != std::io::ErrorKind::NotFound
         { return serde_json::json!({"error":error.to_string(), "up":false}); }
+        if let Err(error) = std::fs::remove_file(crate::statusd::socket_path(iface).with_extension("error"))
+            && error.kind() != std::io::ErrorKind::NotFound
+        { return serde_json::json!({"error":error.to_string(), "up":false}); }
         serde_json::json!({ "ok": true, "iface": iface, "left": true })
     }
 
@@ -1192,3 +1195,6 @@ mod lifecycle_tests;
 #[cfg(test)]
 #[path = "daemon_killswitch_tests.rs"]
 mod killswitch_tests;
+
+#[path = "membership.rs"]
+pub mod membership;

@@ -1734,6 +1734,7 @@ async fn run_with(mut cfg: Config, protect: Option<ProtectFn>, routes: Option<mo
 }
 
 pub use config::keygen;
+pub use daemon::membership;
 pub use daemon::{daemon, set_exit, set_use_exit, set_kill_switch, veto_exit};
 pub use join::config_dir;
 pub use join::join;

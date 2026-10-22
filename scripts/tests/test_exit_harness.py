@@ -414,4 +414,18 @@ class ExecTimeoutDiagnostics(unittest.TestCase):
         self.assertEqual(list(self.root.iterdir()), [])
 
 
+class AggregateShow(unittest.TestCase):
+    def test_split_assertion_reads_one_array_and_rejects_empty_or_default_routes(self):
+        command = next(node.value for node in ast.walk(TREE) if isinstance(node, ast.Constant)
+                       and isinstance(node.value, str) and 'fluxpeer show --json | jq' in node.value)
+        args = shlex.split(command.split('|', 1)[1])
+        member = {'interface': {'name': 'fp0'}, 'peers': [{'allowed_ips': ['10.0.0.0/8']}]}
+        for value, success in [([], False), ([member], True), ([member, member], True),
+                               ([member, {'peers': [{'allowed_ips': ['0.0.0.0/0']}]}], False),
+                               ([{'peers': [{'allowed_ips': ['::/0']}]}], False), (member, False)]:
+            with self.subTest(value=value):
+                result = subprocess.run(args, input=json.dumps(value), text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode == 0, success, result.stderr)
+
+
 if __name__ == '__main__': unittest.main()
