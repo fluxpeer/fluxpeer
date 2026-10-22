@@ -57,20 +57,33 @@ impl Default for TcpBondConfig {
     }
 }
 
-#[allow(clippy::disallowed_types)]
-static TCP_BOND_CONFIG: std::sync::RwLock<Option<TcpBondConfig>> = std::sync::RwLock::new(None);
+static TCP_BOND_CONFIG: parking_lot::RwLock<Option<TcpBondConfig>> = parking_lot::RwLock::new(None);
 
 /// Set the TCP bond config. Can be called multiple times (e.g., when switching servers).
 pub fn set_tcp_bond_config(config: TcpBondConfig) {
-    if let Ok(mut guard) = TCP_BOND_CONFIG.write() {
-        *guard = Some(config);
-    }
+    *TCP_BOND_CONFIG.write() = Some(config);
 }
 
 pub(crate) fn get_config_cloned() -> TcpBondConfig {
     TCP_BOND_CONFIG
         .read()
-        .ok()
-        .and_then(|guard| guard.clone())
+        .clone()
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn config_updates_survive_a_panicking_writer() {
+        let previous = TCP_BOND_CONFIG.read().clone();
+        assert!(std::thread::spawn(|| {
+            let _guard = TCP_BOND_CONFIG.write();
+            panic!("injected writer failure");
+        }).join().is_err());
+        set_tcp_bond_config(TcpBondConfig { bond_connections: 7, ..Default::default() });
+        assert_eq!(get_config_cloned().bond_connections, 7);
+        *TCP_BOND_CONFIG.write() = previous;
+    }
 }

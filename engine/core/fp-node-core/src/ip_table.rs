@@ -38,10 +38,12 @@ impl<D> IpTable<D> {
     pub fn insert(&mut self, key: std::net::IpAddr, cidr: u32, data: D) -> Option<D> {
         // These are networks, it doesn't make sense for host bits to be set, so
         // use new_truncate().
-        self.ips.insert(
-            ip_network::IpNetwork::new_truncate(key, cidr as u8).expect("cidr is valid length"),
-            data,
-        )
+        let network = u8::try_from(cidr).ok().and_then(|prefix| ip_network::IpNetwork::new_truncate(key, prefix).ok());
+        let Some(network) = network else {
+            tracing::error!(%key, cidr, "rejecting invalid IP prefix");
+            return None;
+        };
+        self.ips.insert(network, data)
     }
 
     #[allow(unused)]
@@ -81,6 +83,15 @@ impl<'a, D> Iterator for Iter<'a, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_prefix_is_not_inserted_or_truncated() {
+        let mut table = IpTable::new();
+        let ip = "10.0.0.1".parse().unwrap();
+        for prefix in [33, 256, u32::MAX] { assert_eq!(table.insert(ip, prefix, 'x'), None); }
+        assert_eq!(table.find(ip), None);
+        assert_eq!(table.iter().count(), 0);
+    }
 
     fn build_allowed_ips() -> IpTable<char> {
         let mut map: IpTable<char> = Default::default();

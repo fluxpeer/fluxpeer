@@ -10,27 +10,32 @@ const CLOCK_ID: ClockId = ClockId::CLOCK_BOOTTIME;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Instant {
-    t: TimeSpec,
+    t: Option<TimeSpec>,
+    fallback: std::time::Instant,
 }
 
 impl Instant {
     pub(crate) fn now() -> Self {
-        // std::time::Instant uses the same pattern; clock_gettime only fails with invalid ClockId
-        let t = clock_gettime(CLOCK_ID).expect("known-safe: CLOCK_ID is a valid clock");
-        Self { t }
+        // Keep both readings so a failed OS clock never mixes clock domains.
+        let fallback = std::time::Instant::now();
+        let t = clock_gettime(CLOCK_ID).map_err(|error| tracing::error!(%error, "clock_gettime failed; using monotonic fallback")).ok();
+        Self { t, fallback }
     }
 
     fn checked_duration_since(&self, earlier: Instant) -> Option<Duration> {
+        let (Some(current), Some(previous)) = (self.t, earlier.t) else {
+            return self.fallback.checked_duration_since(earlier.fallback);
+        };
         const NANOSECOND: nix::libc::c_long = 1_000_000_000;
-        let (tv_sec, tv_nsec) = if self.t.tv_nsec() < earlier.t.tv_nsec() {
+        let (tv_sec, tv_nsec) = if current.tv_nsec() < previous.tv_nsec() {
             (
-                self.t.tv_sec() - earlier.t.tv_sec() - 1,
-                self.t.tv_nsec() - earlier.t.tv_nsec() + NANOSECOND,
+                current.tv_sec() - previous.tv_sec() - 1,
+                current.tv_nsec() - previous.tv_nsec() + NANOSECOND,
             )
         } else {
             (
-                self.t.tv_sec() - earlier.t.tv_sec(),
-                self.t.tv_nsec() - earlier.t.tv_nsec(),
+                current.tv_sec() - previous.tv_sec(),
+                current.tv_nsec() - previous.tv_nsec(),
             )
         };
 
@@ -43,5 +48,17 @@ impl Instant {
 
     pub(crate) fn duration_since(&self, earlier: Instant) -> Duration {
         self.checked_duration_since(earlier).unwrap_or(Duration::ZERO)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn clock_failure_uses_one_consistent_fallback_domain() {
+        let earlier = Instant::now();
+        let later = Instant { t: None, fallback: earlier.fallback + Duration::from_millis(5) };
+        assert_eq!(later.duration_since(earlier), Duration::from_millis(5));
+        assert_eq!(earlier.duration_since(later), Duration::ZERO);
     }
 }

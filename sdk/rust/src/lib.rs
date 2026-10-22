@@ -14,9 +14,6 @@ pub fn valid_relay_identity(value: &str) -> bool {
     (1..=128).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
-/// Default control-server base URL.
-pub const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
-
 /// Build the device-import list from a parsed wg.conf: the `[Interface]` as one device
 /// (unless `skip_interface`), then each `[Peer]`. Returns `(devices, warnings)` suitable
 /// for [`Client::import_devices`]. The interface's private key is never sent — only its
@@ -109,35 +106,37 @@ mod import_test {
 /// HTTP client for the control-server API.
 pub struct Client {
     base: String,
-    http: reqwest::Client,
+    http: std::result::Result<reqwest::Client, String>,
 }
 
 impl Client {
+    /// Construct an anonymous client. Environment credentials are never inherited.
     pub fn new(base: impl Into<String>) -> Self {
-        // Authenticate management calls with the admin password as a bearer when
-        // `FLUXPEER_ADMIN_PASSWORD` is set (the control-server accepts the password
-        // directly or a session token). Device-scoped calls pass their enroll-issued
-        // auth token here; truly open endpoints ignore it.
-        let pw = std::env::var("FLUXPEER_ADMIN_PASSWORD").unwrap_or_default();
-        Self::with_password(base, &pw)
+        Self::with_password(base, "")
     }
 
-    /// Like [`Client::new`] but with an explicit admin bearer (e.g. typed into a
-    /// GUI), instead of reading `FLUXPEER_ADMIN_PASSWORD` from the environment. An
-    /// empty `password` sends no auth header (fine only for truly open endpoints).
+    /// Explicit bearer for a caller-selected control origin. Redirects are disabled
+    /// so credentials cannot follow a redirect to another origin.
     pub fn with_password(base: impl Into<String>, password: &str) -> Self {
-        let mut builder = reqwest::Client::builder();
-        if !password.is_empty()
-            && let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {password}"))
-        {
+        let http = (|| -> Result<reqwest::Client> {
             let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(reqwest::header::AUTHORIZATION, val);
-            builder = builder.default_headers(headers);
-        }
-        Self {
-            base: base.into().trim_end_matches('/').to_string(),
-            http: builder.build().unwrap_or_else(|_| reqwest::Client::new()),
-        }
+            if !password.is_empty() {
+                let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {password}"))?;
+                value.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+            }
+            Ok(reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| attempt.error("control-server redirects are disabled")))
+                .default_headers(headers).build()?)
+        })().map_err(|error| error.to_string());
+        Self { base: base.into().trim_end_matches('/').to_string(), http }
+    }
+
+    fn http(&self) -> Result<&reqwest::Client> {
+        let url = reqwest::Url::parse(&self.base).context("invalid control URL")?;
+        anyhow::ensure!(matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+            && url.username().is_empty() && url.password().is_none()
+            && url.query().is_none() && url.fragment().is_none(), "invalid control URL");
+        self.http.as_ref().map_err(|error| anyhow::anyhow!("HTTP client initialization failed: {error}"))
     }
 
     fn url(&self, path: &str) -> String {
@@ -151,7 +150,7 @@ impl Client {
     }
 
     pub async fn create_network(&self, name: &str) -> Result<Value> {
-        self.http
+        self.http()?
             .post(self.url("/networks"))
             .json(&json!({ "name": name }))
             .send()
@@ -164,7 +163,7 @@ impl Client {
     }
 
     pub async fn list_networks(&self) -> Result<Value> {
-        self.http
+        self.http()?
             .get(self.url("/networks"))
             .send()
             .await?
@@ -180,7 +179,7 @@ impl Client {
         max_uses: Option<u32>,
         expires_at: Option<i64>,
     ) -> Result<Value> {
-        self.http
+        self.http()?
             .post(self.url(&format!("/networks/{network_id}/invites")))
             .json(&json!({ "max_uses": max_uses, "expires_at": expires_at }))
             .send()
@@ -197,7 +196,7 @@ impl Client {
     /// key: already-enrolled keys are reported as skipped. Returns
     /// `{ "created": [...], "skipped": [...] }`.
     pub async fn import_devices(&self, network_id: &str, devices: &Value) -> Result<Value> {
-        self.http
+        self.http()?
             .post(self.url(&format!("/networks/{network_id}/devices/import")))
             .json(&json!({ "devices": devices }))
             .send()
@@ -211,7 +210,7 @@ impl Client {
     }
 
     pub async fn list_devices(&self, network_id: &str) -> Result<Value> {
-        self.http
+        self.http()?
             .get(self.url(&format!("/networks/{network_id}/devices")))
             .send()
             .await?
@@ -237,9 +236,11 @@ impl Client {
         let sk = StaticSecret::from(priv_bytes);
         let pub_hex = hex::encode(PublicKey::from(&sk).to_bytes());
 
+        let anonymous = Self::new(&self.base);
+
         // Round 1: fetch an ephemeral server key + challenge id for this public key.
-        let chal: Value = self
-            .http
+        let chal: Value = anonymous
+            .http()?
             .post(self.url("/enroll/challenge"))
             .json(&json!({ "wg_public_key": pub_hex }))
             .send()
@@ -261,7 +262,7 @@ impl Client {
         // wg_pub) and compares — equal iff we hold wg_priv.
         let proof = hex::encode(sk.diffie_hellman(&PublicKey::from(server_pub)).to_bytes());
 
-        self.http
+        anonymous.http()?
             .post(self.url("/enroll"))
             .json(&json!({
                 "invite_code": invite_code,
@@ -287,7 +288,7 @@ impl Client {
     /// mobile node merges into its `ClientStartReq` to reach the mesh via a
     /// gateway peer. 404 → no peer in the network advertises an endpoint yet.
     pub async fn gateway(&self, device_id: &str) -> Result<Value> {
-        self.http
+        self.http()?
             .get(self.url(&format!("/devices/{device_id}/gateway")))
             .send()
             .await
@@ -301,7 +302,7 @@ impl Client {
 
     /// Read a device's editable wg settings (mtu / dns / endpoint).
     pub async fn device_settings(&self, device_id: &str) -> Result<Value> {
-        self.http
+        self.http()?
             .get(self.url(&format!("/devices/{device_id}/settings")))
             .send()
             .await?
@@ -313,7 +314,7 @@ impl Client {
 
     /// Set a device's editable wg settings.
     pub async fn set_device_settings(&self, device_id: &str, settings: &Value) -> Result<()> {
-        self.http
+        self.http()?
             .put(self.url(&format!("/devices/{device_id}/settings")))
             .json(settings)
             .send()
@@ -324,7 +325,7 @@ impl Client {
 
     /// Rename a device (admin-gated).
     pub async fn rename_device(&self, device_id: &str, name: &str) -> Result<Value> {
-        self.http
+        self.http()?
             .patch(self.url(&format!("/devices/{device_id}")))
             .json(&json!({ "name": name }))
             .send()
@@ -336,7 +337,7 @@ impl Client {
     }
 
     pub async fn revoke_device(&self, device_id: &str) -> Result<()> {
-        self.http
+        self.http()?
             .delete(self.url(&format!("/devices/{device_id}")))
             .send()
             .await?
@@ -345,7 +346,7 @@ impl Client {
     }
 
     pub async fn device_config(&self, device_id: &str) -> Result<Value> {
-        self.http
+        self.http()?
             .get(self.url(&format!("/devices/{device_id}/config")))
             .send()
             .await?
@@ -358,7 +359,7 @@ impl Client {
     /// Report a device's cumulative traffic stats (node → control). Device-scoped
     /// control routes require the enroll-issued auth token as this client's bearer.
     pub async fn report_stats(&self, device_id: &str, rx: i64, tx: i64, peers: &Value) -> Result<()> {
-        self.http
+        self.http()?
             .post(self.url(&format!("/devices/{device_id}/stats")))
             .json(&json!({ "rx_bytes": rx, "tx_bytes": tx, "peers": peers }))
             .send()
@@ -369,7 +370,7 @@ impl Client {
 
     /// A device's latest traffic stats (admin).
     pub async fn device_stats(&self, device_id: &str) -> Result<Value> {
-        self.http
+        self.http()?
             .get(self.url(&format!("/devices/{device_id}/stats")))
             .send()
             .await?
@@ -381,7 +382,7 @@ impl Client {
 
     /// Per-device traffic rollup for a network (admin).
     pub async fn network_stats(&self, network_id: &str) -> Result<Value> {
-        self.http
+        self.http()?
             .get(self.url(&format!("/networks/{network_id}/stats")))
             .send()
             .await?
@@ -394,7 +395,7 @@ impl Client {
     /// Report a device's reachable candidate endpoints (disco). Device-scoped
     /// control routes require the enroll-issued auth token as this client's bearer.
     pub async fn set_endpoints(&self, device_id: &str, endpoints: &[String]) -> Result<()> {
-        self.http
+        self.http()?
             .post(self.url(&format!("/devices/{device_id}/endpoints")))
             .json(&serde_json::json!({ "endpoints": endpoints }))
             .send()
@@ -404,7 +405,7 @@ impl Client {
     }
 
     pub async fn advertise_route(&self, device_id: &str, prefix: &str) -> Result<Value> {
-        self.http
+        self.http()?
             .post(self.url(&format!("/devices/{device_id}/routes")))
             .json(&json!({ "prefix": prefix }))
             .send()
@@ -416,7 +417,7 @@ impl Client {
     }
 
     pub async fn approve_route(&self, route_id: &str) -> Result<()> {
-        self.http
+        self.http()?
             .post(self.url(&format!("/routes/{route_id}/approve")))
             .send()
             .await?
@@ -425,7 +426,7 @@ impl Client {
     }
 
     pub async fn list_device_routes(&self, device_id: &str) -> Result<Value> {
-        self.http
+        self.http()?
             .get(self.url(&format!("/devices/{device_id}/routes")))
             .send()
             .await?
@@ -436,7 +437,7 @@ impl Client {
     }
 
     pub async fn delete_route(&self, route_id: &str) -> Result<()> {
-        self.http
+        self.http()?
             .delete(self.url(&format!("/routes/{route_id}")))
             .send()
             .await?
@@ -468,7 +469,7 @@ impl Client {
         stun_url: Option<&str>,
         node_id: Option<&str>,
     ) -> Result<Value> {
-        self.http
+        self.http()?
             .post(self.url("/relays"))
             .json(&json!({ "region": region, "url": url, "network_id": network_id, "anytls": anytls, "stun_url": stun_url, "node_id": node_id }))
             .send()
@@ -480,7 +481,7 @@ impl Client {
     }
 
     pub async fn list_relays(&self, network_id: &str) -> Result<Value> {
-        self.http
+        self.http()?
             .get(self.url(&format!("/networks/{network_id}/relays")))
             .send()
             .await?
@@ -493,17 +494,17 @@ impl Client {
     /// Permanently delete a network after the caller confirms its identity.
     pub async fn delete_network(&self, network_id: &str, confirmation: &str) -> Result<()> {
         anyhow::ensure!(confirmation == network_id, "network deletion requires confirmation of the network ID");
-        self.http.delete(self.segment_url(&["networks", network_id])?).send().await?.error_for_status()?;
+        self.http()?.delete(self.segment_url(&["networks", network_id])?).send().await?.error_for_status()?;
         Ok(())
     }
 
     pub async fn revoke_invite(&self, network_id: &str, code: &str) -> Result<()> {
-        self.http.delete(self.segment_url(&["networks", network_id, "invites", code])?).send().await?.error_for_status()?;
+        self.http()?.delete(self.segment_url(&["networks", network_id, "invites", code])?).send().await?.error_for_status()?;
         Ok(())
     }
 
     pub async fn resolve(&self, network_id: &str, name: &str) -> Result<Value> {
-        self.http
+        self.http()?
             .get(self.segment_url(&["networks", network_id, "resolve", name])?)
             .send()
             .await?

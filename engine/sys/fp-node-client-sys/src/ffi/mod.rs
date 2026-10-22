@@ -51,7 +51,7 @@ fn err_val(message: impl std::fmt::Display) -> Value {
 
 fn into_cstr(v: Value) -> *mut c_char {
     CString::new(v.to_string())
-        .unwrap_or_else(|_| CString::new("{}").unwrap())
+        .unwrap_or_else(|_| c"{}".to_owned())
         .into_raw()
 }
 
@@ -81,7 +81,11 @@ pub unsafe extern "C" fn fp_free_string(p: *mut c_char) {
 
 /// Core: generate a fresh x25519 device keypair as an OK envelope.
 fn keypair_val() -> Value {
-    let sk = fp_crypto::x25519::StaticSecret::random_from_rng(rand_core::OsRng);
+    let mut secret = [0u8; 32];
+    if let Err(error) = rand_core::RngCore::try_fill_bytes(&mut rand_core::OsRng, &mut secret) {
+        return err_val(format!("OS CSPRNG failed: {error}"));
+    }
+    let sk = fp_crypto::x25519::StaticSecret::from(secret);
     let pk = fp_crypto::x25519::PublicKey::from(&sk);
     ok_val(json!({
         "private_key": hex::encode(sk.to_bytes()),
@@ -535,8 +539,7 @@ fn enroll_impl(raw: &str) -> Value {
         return err_val("engine unavailable: tokio runtime build failed");
     };
 
-    // `Client::new` reads FLUXPEER_ADMIN_PASSWORD for admin bearer; unset on
-    // mobile, which is correct — `/enroll` is an open (invite-gated) endpoint.
+    // Enrollment is anonymous even when the host has an admin password in its environment.
     let client = fluxpeer_sdk::Client::new(ctrl.clone());
     match rt.block_on(client.enroll(&code, &parsed.name, &parsed.wg_private_key)) {
         Ok(mut dev) => {

@@ -83,17 +83,17 @@ impl Noise {
         }
 
         // Checks the type, as well as the reserved zero fields
-        let packet_type = u32::from_le_bytes(src[0..4].try_into().expect("known-safe: length >= 4 checked above"));
+        let packet_type = u32::from_le_bytes(src[0..4].try_into().map_err(|_| fp_crypto::Error::InvalidPacket)?);
 
         Ok(match (packet_type, src.len()) {
             (crate::HANDSHAKE_INIT, crate::HANDSHAKE_INIT_SZ) => Packet::HandshakeInit(HandshakeInit {
                 sender_idx: u32::from_le_bytes(
                     src[4..8]
                         .try_into()
-                        .expect("known-safe: HANDSHAKE_INIT_SZ guarantees 148 bytes"),
+                        .map_err(|_| fp_crypto::Error::InvalidPacket)?,
                 ),
                 unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[8..40])
-                    .expect("known-safe: HANDSHAKE_INIT_SZ guarantees 148 bytes"),
+                    .map_err(|_| fp_crypto::Error::InvalidPacket)?,
                 encrypted_static: &src[40..88],
                 encrypted_timestamp: &src[88..116],
             }),
@@ -101,27 +101,27 @@ impl Noise {
                 sender_idx: u32::from_le_bytes(
                     src[4..8]
                         .try_into()
-                        .expect("known-safe: HANDSHAKE_RESP_SZ guarantees 92 bytes"),
+                        .map_err(|_| fp_crypto::Error::InvalidPacket)?,
                 ),
                 receiver_idx: u32::from_le_bytes(
                     src[8..12]
                         .try_into()
-                        .expect("known-safe: HANDSHAKE_RESP_SZ guarantees 92 bytes"),
+                        .map_err(|_| fp_crypto::Error::InvalidPacket)?,
                 ),
                 unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
-                    .expect("known-safe: HANDSHAKE_RESP_SZ guarantees 92 bytes"),
+                    .map_err(|_| fp_crypto::Error::InvalidPacket)?,
                 encrypted_nothing: &src[44..60],
             }),
             (crate::DATA, crate::DATA_MIN_SZ..=usize::MAX) => Packet::PacketData(PacketData {
                 receiver_idx: u32::from_le_bytes(
                     src[4..8]
                         .try_into()
-                        .expect("known-safe: DATA_MIN_SZ guarantees >= 33 bytes"),
+                        .map_err(|_| fp_crypto::Error::InvalidPacket)?,
                 ),
                 counter: u64::from_le_bytes(
                     src[8..16]
                         .try_into()
-                        .expect("known-safe: DATA_MIN_SZ guarantees >= 33 bytes"),
+                        .map_err(|_| fp_crypto::Error::InvalidPacket)?,
                 ),
                 encrypted_encapsulated_packet: &src[16..],
             }),
@@ -318,19 +318,19 @@ impl Noise {
             _ if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => {
                 let len_bytes: [u8; IP_LEN_SZ] = packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ]
                     .try_into()
-                    .expect("known-safe: IPV4_MIN_HEADER_SIZE guarantees sufficient length");
+                    .map_err(|_| fp_crypto::Error::InvalidPacket)?;
                 let addr_bytes: [u8; IPV4_IP_SZ] = packet[IPV4_SRC_IP_OFF..IPV4_SRC_IP_OFF + IPV4_IP_SZ]
                     .try_into()
-                    .expect("known-safe: IPV4_MIN_HEADER_SIZE guarantees sufficient length");
+                    .map_err(|_| fp_crypto::Error::InvalidPacket)?;
                 (u16::from_be_bytes(len_bytes) as usize, IpAddr::from(addr_bytes))
             }
             _ if packet[0] >> 4 == 6 && packet.len() >= IPV6_MIN_HEADER_SIZE => {
                 let len_bytes: [u8; IP_LEN_SZ] = packet[IPV6_LEN_OFF..IPV6_LEN_OFF + IP_LEN_SZ]
                     .try_into()
-                    .expect("known-safe: IPV6_MIN_HEADER_SIZE guarantees sufficient length");
+                    .map_err(|_| fp_crypto::Error::InvalidPacket)?;
                 let addr_bytes: [u8; IPV6_IP_SZ] = packet[IPV6_SRC_IP_OFF..IPV6_SRC_IP_OFF + IPV6_IP_SZ]
                     .try_into()
-                    .expect("known-safe: IPV6_MIN_HEADER_SIZE guarantees sufficient length");
+                    .map_err(|_| fp_crypto::Error::InvalidPacket)?;
                 (
                     u16::from_be_bytes(len_bytes) as usize + IPV6_MIN_HEADER_SIZE,
                     IpAddr::from(addr_bytes),

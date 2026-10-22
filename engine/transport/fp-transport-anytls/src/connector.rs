@@ -8,23 +8,19 @@ use fp_transport::{AcceptResponse, Config, Listener, SenderAndReceiver};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-#[allow(clippy::disallowed_types)]
-static ANYTLS_CONFIG: std::sync::RwLock<Option<AnytlsConfig>> = std::sync::RwLock::new(None);
+static ANYTLS_CONFIG: parking_lot::RwLock<Option<AnytlsConfig>> = parking_lot::RwLock::new(None);
 
 /// Set the AnyTLS config. Can be called multiple times (e.g., when switching servers).
 #[allow(dead_code)]
 pub fn set_anytls_config(config: AnytlsConfig) {
-    if let Ok(mut guard) = ANYTLS_CONFIG.write() {
-        *guard = Some(config);
-    }
+    *ANYTLS_CONFIG.write() = Some(config);
 }
 
 /// Snapshot the currently configured AnyTLS config (defaulted if unset).
 pub fn get_config_cloned() -> AnytlsConfig {
     ANYTLS_CONFIG
         .read()
-        .ok()
-        .and_then(|guard| guard.clone())
+        .clone()
         .unwrap_or_default()
 }
 
@@ -184,5 +180,22 @@ async fn accept_loop(
         // Hand the established stream to the acceptor, which spawns a
         // per-connection task — never blocks the accept loop (no HOL blocking).
         acceptor.feed_stream(tcp, peer_addr);
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn config_updates_survive_a_panicking_writer() {
+        let previous = ANYTLS_CONFIG.read().clone();
+        assert!(std::thread::spawn(|| {
+            let _guard = ANYTLS_CONFIG.write();
+            panic!("injected writer failure");
+        }).join().is_err());
+        set_anytls_config(AnytlsConfig { bond_connections: 7, ..Default::default() });
+        assert_eq!(get_config_cloned().bond_connections, 7);
+        *ANYTLS_CONFIG.write() = previous;
     }
 }

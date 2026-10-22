@@ -113,7 +113,7 @@ async fn enroll(token: &str, name: Option<String>) -> std::io::Result<Enrollment
     let name = name.unwrap_or_else(default_name);
 
     // enroll derives the public key + ECDH proof-of-possession from the private key.
-    let (priv_hex, _pub_hex) = keypair();
+    let (priv_hex, _pub_hex) = keypair()?;
     let client = Client::new(ctrl.clone());
     let dev = client
         .enroll(&code, &name, &priv_hex)
@@ -218,5 +218,60 @@ mod tests {
         write_config(&path, &cfg).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap(), cfg);
+    }
+}
+
+#[cfg(test)]
+mod credential_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn join_and_enroll_never_send_environment_or_explicit_admin_credentials() {
+        const CHILD: &str = "FLUXPEER_T0037_CREDENTIAL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "join::credential_boundary_tests::join_and_enroll_never_send_environment_or_explicit_admin_credentials", "--nocapture"])
+                .env(CHILD, "1").env("FLUXPEER_ADMIN_PASSWORD", "test-admin-secret")
+                .output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use axum::{routing::post, Json, Router};
+            use base64::Engine;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let challenge_tx = tx.clone();
+            let router = Router::new()
+                .route("/api/v1/enroll/challenge", post(move |headers: axum::http::HeaderMap| {
+                    let tx = challenge_tx.clone();
+                    async move {
+                        tx.send(headers).await.unwrap();
+                        Json(serde_json::json!({"challenge_id": "c1", "server_pub": "55".repeat(32)}))
+                    }
+                }))
+                .route("/api/v1/enroll", post(move |headers: axum::http::HeaderMap| {
+                    let tx = tx.clone();
+                    async move {
+                        tx.send(headers).await.unwrap();
+                        Json(serde_json::json!({"id": "d1", "auth_token": "device-only", "address_v4": "10.1.0.2"}))
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::json!({"ctrl": origin, "code": "invite-only"}).to_string());
+            let config = enroll_config(&format!("fp://join/{token}"), Some("test".into())).await.unwrap();
+            assert_eq!(config["control_server"], origin);
+            assert_eq!(config["auth_token"], "device-only");
+            for client in [Client::new(&origin), Client::with_password(&origin, "explicit-admin-secret")] {
+                client.enroll("invite-only", "test", &"11".repeat(32)).await.unwrap();
+            }
+            for _ in 0..6 {
+                let headers = rx.recv().await.unwrap();
+                assert!(!headers.contains_key("authorization"), "enrollment leaked credentials");
+            }
+            server.abort();
+        });
     }
 }

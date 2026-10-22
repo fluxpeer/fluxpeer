@@ -1,7 +1,6 @@
 use crate::handshake::LABEL_MAC1;
 use crate::handshake::{b2s_hash, b2s_keyed_mac_16};
 use crate::{HandshakeInit, HandshakeResponse, Noise, Packet};
-use rand_core::{OsRng, RngCore};
 #[allow(deprecated)]
 use ring::constant_time::verify_slices_are_equal;
 
@@ -23,8 +22,6 @@ pub(crate) struct Verifier {
 
 impl Verifier {
     pub(crate) fn new(public_key: &crate::x25519::PublicKey) -> Self {
-        let mut secret_key = [0u8; 16];
-        OsRng.fill_bytes(&mut secret_key);
         Verifier {
             mac1_key: b2s_hash(LABEL_MAC1, public_key.as_bytes()),
         }

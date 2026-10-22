@@ -190,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("{e}"))?,
         Cmd::Node { cmd } => match cmd {
             NodeCmd::Run { config } => fluxpeer_node::run(&config).await?,
-            NodeCmd::Keygen => fluxpeer_node::keygen(),
+            NodeCmd::Keygen => fluxpeer_node::keygen()?,
             NodeCmd::SetExit { state, config_dir } => {
                 let updated = if matches!(state, ExitState::Veto) {
                     fluxpeer_node::veto_exit(&config_dir)?

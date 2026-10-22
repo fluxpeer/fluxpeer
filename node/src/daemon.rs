@@ -808,6 +808,10 @@ fn read_iface(cfg: &Path) -> Option<String> {
 
 /// Load (or create) the daemon control token from `<dir>/daemon.token`.
 fn ensure_token(dir: &Path) -> std::io::Result<String> {
+    ensure_token_with_rng(dir, getrandom::getrandom)
+}
+
+fn ensure_token_with_rng(dir: &Path, fill: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>) -> std::io::Result<String> {
     let path = dir.join("daemon.token");
     if let Ok(t) = std::fs::read_to_string(&path)
         && t.trim().len() >= 16
@@ -817,7 +821,7 @@ fn ensure_token(dir: &Path) -> std::io::Result<String> {
     // CSPRNG bearer token, cross-platform via getrandom (no /dev/urandom, which
     // is absent on Windows; the old time/pid fallback was guessable).
     let mut buf = [0u8; 24];
-    getrandom::getrandom(&mut buf).expect("OS CSPRNG (getrandom) failed");
+    fill(&mut buf).map_err(|error| std::io::Error::other(format!("OS CSPRNG failed: {error}")))?;
     let token: String = buf.iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(&path, &token)?;
     #[cfg(unix)]
@@ -831,6 +835,14 @@ fn ensure_token(dir: &Path) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_rng_failure_does_not_create_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = ensure_token_with_rng(dir.path(), |_| Err(getrandom::Error::UNSUPPORTED));
+        assert!(result.unwrap_err().to_string().contains("OS CSPRNG failed"));
+        assert!(!dir.path().join("daemon.token").exists());
+    }
 
     /// A fresh temp config dir with one minimal membership config per iface.
     struct TempDir { path: PathBuf, _owner: tempfile::TempDir }

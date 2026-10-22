@@ -5,15 +5,18 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-pub use fluxpeer_sdk::{Client, DEFAULT_SERVER, build_import_devices, wgconf};
+pub use fluxpeer_sdk::{Client, build_import_devices, wgconf};
 use serde_json::Value;
 
 #[derive(Parser, Debug)]
 #[command(name = "fp", about = "fluxpeer control-server CLI")]
 pub struct Cli {
-    /// Control-server base URL.
-    #[arg(long, env = "FLUXPEER_CONTROL_URL", default_value = DEFAULT_SERVER, global = true)]
-    pub server: String,
+    /// Control-server URL (then FLUXPEER_CONTROL_URL, FLUXPEER_SERVER, joined config).
+    #[arg(long, global = true)]
+    pub server: Option<String>,
+    /// Directory containing joined node configurations.
+    #[arg(long, global = true)]
+    pub config_dir: Option<std::path::PathBuf>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -137,9 +140,63 @@ fn relay_identity_warning(anytls: bool, node_id: Option<&str>) -> Option<&'stati
     (anytls && node_id.is_none()).then_some("--anytls without --node-id or FLUXPEER_RELAY_NODE_ID uses fluxpeer-relay; ensure it matches the relay process identity")
 }
 
+fn config_dir() -> std::path::PathBuf {
+    #[cfg(windows)]
+    { std::path::PathBuf::from(std::env::var_os("PROGRAMDATA").unwrap_or_else(|| r"C:\ProgramData".into())).join("fluxpeer") }
+    #[cfg(not(windows))]
+    { std::path::PathBuf::from("/etc/fluxpeer") }
+}
+
+fn explicit_server(flag: Option<String>) -> Result<Option<String>> {
+    let read_env = |name: &str| -> Result<Option<String>> {
+        match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{name} must contain valid Unicode"),
+        }
+    };
+    let primary = read_env("FLUXPEER_CONTROL_URL")?;
+    let alias = read_env("FLUXPEER_SERVER")?;
+    anyhow::ensure!(primary.as_ref().zip(alias.as_ref()).is_none_or(|(a, b)| a == b),
+        "FLUXPEER_CONTROL_URL and FLUXPEER_SERVER disagree; unset one or make them equal");
+    Ok(flag.or(primary).or(alias))
+}
+
+fn resolve_server(explicit: Option<&str>, directory: &std::path::Path) -> Result<String> {
+    if let Some(server) = explicit {
+        anyhow::ensure!(!server.trim().is_empty(), "--server/FLUXPEER_CONTROL_URL/FLUXPEER_SERVER must not be empty");
+        return Ok(server.to_string());
+    }
+    let mut servers = std::collections::BTreeSet::new();
+    match std::fs::read_dir(directory) {
+        Ok(entries) => for entry in entries {
+            let path = entry?.path();
+            if path.extension().is_none_or(|ext| ext != "json") { continue; }
+            let config: Value = serde_json::from_slice(&std::fs::read(&path)?)
+                .with_context(|| format!("reading joined config {}", path.display()))?;
+            if config["device_id"].as_str().is_some_and(|id| !id.is_empty())
+                && let Some(server) = config["control_server"].as_str().filter(|s| !s.is_empty())
+            {
+                servers.insert(server.trim_end_matches('/').to_string());
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error.into()),
+    }
+    anyhow::ensure!(servers.len() <= 1, "multiple joined control servers; select --server, FLUXPEER_CONTROL_URL or FLUXPEER_SERVER");
+    servers.into_iter().next().context("no control server; set --server, FLUXPEER_CONTROL_URL or FLUXPEER_SERVER, or join a network first")
+}
+
 /// Execute a parsed CLI invocation, printing JSON results to stdout.
 pub async fn run(cli: Cli) -> Result<()> {
-    let client = Client::new(&cli.server);
+    if let Command::Import { files, network, dry_run: true, skip_interface } = &cli.command {
+        return import(None, files, network.as_deref(), true, *skip_interface).await;
+    }
+    let selected = explicit_server(cli.server)?;
+    let explicit = selected.is_some();
+    let server = resolve_server(selected.as_deref(), &cli.config_dir.unwrap_or_else(config_dir))?;
+    let password = if explicit { std::env::var("FLUXPEER_ADMIN_PASSWORD").unwrap_or_default() } else { String::new() };
+    let client = Client::with_password(server, &password);
     match cli.command {
         Command::Network { command } => match command {
             NetworkCmd::Create { name } => print_json(&client.create_network(&name).await?),
@@ -190,7 +247,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             network,
             dry_run,
             skip_interface,
-        } => import(&client, &files, network.as_deref(), dry_run, skip_interface).await?,
+        } => import(Some(&client), &files, network.as_deref(), dry_run, skip_interface).await?,
     }
     Ok(())
 }
@@ -239,7 +296,7 @@ fn collect_sources(files: &[String]) -> Result<Vec<Source>> {
     Ok(out)
 }
 
-async fn import(client: &Client, files: &[String], network: Option<&str>, dry_run: bool, skip_interface: bool) -> Result<()> {
+async fn import(client: Option<&Client>, files: &[String], network: Option<&str>, dry_run: bool, skip_interface: bool) -> Result<()> {
     let sources = collect_sources(files)?;
     if sources.is_empty() {
         anyhow::bail!("no wg.conf input found (pass file(s), a directory, or `-` for stdin)");
@@ -276,6 +333,8 @@ async fn import(client: &Client, files: &[String], network: Option<&str>, dry_ru
             }
             continue;
         }
+
+        let client = client.context("control server required for import")?;
 
         // Resolve the target network: an explicit existing one, or a fresh one per file.
         let target = match network {
@@ -354,7 +413,7 @@ mod test {
                 command: NetworkCmd::Create { .. }
             }
         ));
-        assert_eq!(cli.server, DEFAULT_SERVER);
+        assert!(cli.server.is_none());
     }
 
     #[test]
@@ -370,7 +429,7 @@ mod test {
             "5",
         ])
         .unwrap();
-        assert_eq!(cli.server, "http://x:9");
+        assert_eq!(cli.server.as_deref(), Some("http://x:9"));
         match cli.command {
             Command::Invite {
                 command: InviteCmd::Create {

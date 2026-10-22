@@ -7,7 +7,8 @@ use crate::x25519;
 use crate::{HandshakeInit, HandshakeResponse};
 use blake2::digest::{FixedOutput, KeyInit};
 use blake2::{Blake2s256, Blake2sMac, Digest};
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
+use zeroize::{Zeroize, Zeroizing};
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use std::convert::TryInto;
 use std::time::{Duration, SystemTime};
@@ -39,35 +40,43 @@ pub(crate) fn b2s_hash(data1: &[u8], data2: &[u8]) -> [u8; 32] {
 
 #[inline]
 /// RFC 2401 HMAC+Blake2s, not to be confused with *keyed* Blake2s
-pub(crate) fn b2s_hmac(key: &[u8], data1: &[u8]) -> [u8; 32] {
+pub(crate) fn b2s_hmac(key: &[u8; 32], data1: &[u8]) -> [u8; 32] {
     use blake2::digest::Update;
     type HmacBlake2s = hmac::SimpleHmac<Blake2s256>;
-    let mut hmac = HmacBlake2s::new_from_slice(key).expect("known-safe: HMAC accepts keys of any length");
+    // HMAC pads keys shorter than its 64-byte block with zeroes. Use the
+    // infallible fixed-size constructor for our protocol's 32-byte keys.
+    let mut block = [0u8; 64];
+    block[..32].copy_from_slice(key);
+    let mut hmac = HmacBlake2s::new(&block.into());
     hmac.update(data1);
     hmac.finalize_fixed().into()
 }
 
 #[inline]
 /// Like b2s_hmac, but chain data1 and data2 together
-pub(crate) fn b2s_hmac2(key: &[u8], data1: &[u8], data2: &[u8]) -> [u8; 32] {
+pub(crate) fn b2s_hmac2(key: &[u8; 32], data1: &[u8], data2: &[u8]) -> [u8; 32] {
     use blake2::digest::Update;
     type HmacBlake2s = hmac::SimpleHmac<Blake2s256>;
-    let mut hmac = HmacBlake2s::new_from_slice(key).expect("known-safe: HMAC accepts keys of any length");
+    // HMAC pads keys shorter than its 64-byte block with zeroes. Use the
+    // infallible fixed-size constructor for our protocol's 32-byte keys.
+    let mut block = [0u8; 64];
+    block[..32].copy_from_slice(key);
+    let mut hmac = HmacBlake2s::new(&block.into());
     hmac.update(data1);
     hmac.update(data2);
     hmac.finalize_fixed().into()
 }
 
 #[inline]
-pub(crate) fn b2s_keyed_mac_16(key: &[u8], data1: &[u8]) -> [u8; 16] {
-    let mut hmac = Blake2sMac::new_from_slice(key).expect("known-safe: Blake2sMac accepts keys 1..=32 bytes");
+pub(crate) fn b2s_keyed_mac_16(key: &[u8; 32], data1: &[u8]) -> [u8; 16] {
+    let mut hmac = Blake2sMac::new(key.into());
     blake2::digest::Update::update(&mut hmac, data1);
     hmac.finalize_fixed().into()
 }
 
 #[inline]
 /// This wrapper involves an extra copy and MAY BE SLOWER
-fn aead_chacha20_seal(ciphertext: &mut [u8], key: &[u8], counter: u64, data: &[u8], aad: &[u8]) {
+fn aead_chacha20_seal(ciphertext: &mut [u8], key: &[u8], counter: u64, data: &[u8], aad: &[u8]) -> Result<(), fp_crypto::Error> {
     let mut nonce: [u8; 12] = [0; 12];
     nonce[4..12].copy_from_slice(&counter.to_le_bytes());
 
@@ -75,22 +84,17 @@ fn aead_chacha20_seal(ciphertext: &mut [u8], key: &[u8], counter: u64, data: &[u
 }
 
 #[inline]
-fn aead_chacha20_seal_inner(ciphertext: &mut [u8], key: &[u8], nonce: [u8; 12], data: &[u8], aad: &[u8]) {
-    let key = LessSafeKey::new(
-        UnboundKey::new(&CHACHA20_POLY1305, key).expect("known-safe: caller provides 32-byte CHACHA20_POLY1305 key"),
-    );
-
-    ciphertext[..data.len()].copy_from_slice(data);
-
-    let tag = key
-        .seal_in_place_separate_tag(
-            Nonce::assume_unique_for_key(nonce),
-            Aad::from(aad),
-            &mut ciphertext[..data.len()],
-        )
-        .expect("known-safe: AEAD seal with valid key and nonce cannot fail");
-
-    ciphertext[data.len()..].copy_from_slice(tag.as_ref());
+fn aead_chacha20_seal_inner(ciphertext: &mut [u8], key: &[u8], nonce: [u8; 12], data: &[u8], aad: &[u8]) -> Result<(), fp_crypto::Error> {
+    let key = LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).map_err(|_| fp_crypto::Error::WrongKey)?);
+    if data.len().checked_add(16) != Some(ciphertext.len()) {
+        return Err(fp_crypto::Error::DestinationBufferTooSmall);
+    }
+    let (body, tag_out) = ciphertext.split_at_mut(data.len());
+    body.copy_from_slice(data);
+    let tag = key.seal_in_place_separate_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), body)
+        .map_err(|_| fp_crypto::Error::InvalidAeadTag)?;
+    tag_out.copy_from_slice(tag.as_ref());
+    Ok(())
 }
 
 #[inline]
@@ -118,13 +122,14 @@ fn aead_chacha20_open_inner(
     aad: &[u8],
 ) -> Result<(), ring::error::Unspecified> {
     let key = LessSafeKey::new(
-        UnboundKey::new(&CHACHA20_POLY1305, key).expect("known-safe: caller provides 32-byte CHACHA20_POLY1305 key"),
+        UnboundKey::new(&CHACHA20_POLY1305, key)?,
     );
 
     let mut inner_buffer = data.to_owned();
 
     let plaintext = key.open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(aad), &mut inner_buffer)?;
 
+    if buffer.len() != plaintext.len() { return Err(ring::error::Unspecified); }
     buffer.copy_from_slice(plaintext);
 
     Ok(())
@@ -140,7 +145,7 @@ struct Tai64N {
 #[derive(Debug)]
 /// This struct computes a [Tai64N](https://cr.yp.to/libtai/tai64.html) timestamp from current system time
 struct TimeStamper {
-    duration_at_start: Duration,
+    duration_at_start: Option<Duration>,
     instant_at_start: Instant,
 }
 
@@ -150,19 +155,21 @@ impl TimeStamper {
         TimeStamper {
             duration_at_start: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("known-safe: system clock is after UNIX epoch"),
+                .ok(),
             instant_at_start: Instant::now(),
         }
     }
 
     /// Take time reading and generate a 12 byte timestamp
-    pub(crate) fn stamp(&self) -> [u8; 12] {
+    pub(crate) fn stamp(&self) -> Result<[u8; 12], fp_crypto::Error> {
         const TAI64_BASE: u64 = (1u64 << 62) + 37;
         let mut ext_stamp = [0u8; 12];
-        let stamp = Instant::now().duration_since(self.instant_at_start) + self.duration_at_start;
-        ext_stamp[0..8].copy_from_slice(&(stamp.as_secs() + TAI64_BASE).to_be_bytes());
+        let stamp = Instant::now().duration_since(self.instant_at_start)
+            .checked_add(self.duration_at_start.ok_or(fp_crypto::Error::InvalidTai64nTimestamp)?)
+            .ok_or(fp_crypto::Error::InvalidTai64nTimestamp)?;
+        ext_stamp[0..8].copy_from_slice(&(stamp.as_secs().checked_add(TAI64_BASE).ok_or(fp_crypto::Error::InvalidTai64nTimestamp)?).to_be_bytes());
         ext_stamp[8..12].copy_from_slice(&stamp.subsec_nanos().to_be_bytes());
-        ext_stamp
+        Ok(ext_stamp)
     }
 }
 
@@ -182,12 +189,12 @@ impl Tai64N {
         let secs = u64::from_be_bytes(
             sec_bytes
                 .try_into()
-                .expect("known-safe: split_at(8) on 12-byte array yields 8 bytes"),
+                .map_err(|_| fp_crypto::Error::InvalidTai64nTimestamp)?,
         );
         let nano = u32::from_be_bytes(
             nano_bytes
                 .try_into()
-                .expect("known-safe: split_at(8) on 12-byte array yields 4 bytes"),
+                .map_err(|_| fp_crypto::Error::InvalidTai64nTimestamp)?,
         );
 
         Ok(Tai64N { secs, nano })
@@ -233,7 +240,7 @@ struct HandshakeInitSentState {
     local_index: u32,
     hash: [u8; KEY_LEN],
     chaining_key: [u8; KEY_LEN],
-    ephemeral_private: x25519::ReusableSecret,
+    ephemeral_private: x25519::StaticSecret,
     time_sent: Instant,
 }
 
@@ -524,7 +531,7 @@ impl Handshake {
         } else {
             self.state = HandshakeState::None;
         }
-        Ok(Session::new(local_index, peer_index, temp3, temp2))
+        Session::new(local_index, peer_index, temp3, temp2)
     }
 
     // Compute and append mac1 to a handshake message
@@ -565,7 +572,10 @@ impl Handshake {
         let mut hash = INITIAL_CHAIN_HASH;
         hash = b2s_hash(&hash, self.params.peer_static_public.as_bytes());
         // initiator.ephemeral_private = DH_GENERATE()
-        let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
+        let mut secret = Zeroizing::new([0u8; 32]);
+        OsRng.try_fill_bytes(secret.as_mut()).map_err(|_| fp_crypto::Error::RandomnessUnavailable)?;
+        let ephemeral_private = x25519::StaticSecret::from(*secret);
+        secret.zeroize(); // Wipe the source immediately; Zeroizing also covers RNG errors.
         // msg.message_type = 1
         // msg.reserved_zero = { 0, 0, 0 }
         message_type.copy_from_slice(&super::HANDSHAKE_INIT.to_le_bytes());
@@ -586,7 +596,7 @@ impl Handshake {
         // key = HMAC(temp, initiator.chaining_key || 0x2)
         let key = b2s_hmac2(&temp, &chaining_key, &[0x02]);
         // msg.encrypted_static = AEAD(key, 0, initiator.static_public, initiator.hash)
-        aead_chacha20_seal(encrypted_static, &key, 0, self.params.static_public.as_bytes(), &hash);
+        aead_chacha20_seal(encrypted_static, &key, 0, self.params.static_public.as_bytes(), &hash)?;
         // initiator.hash = HASH(initiator.hash || msg.encrypted_static)
         hash = b2s_hash(&hash, encrypted_static);
         // temp = HMAC(initiator.chaining_key, DH(initiator.static_private, responder.static_public))
@@ -596,8 +606,8 @@ impl Handshake {
         // key = HMAC(temp, initiator.chaining_key || 0x2)
         let key = b2s_hmac2(&temp, &chaining_key, &[0x02]);
         // msg.encrypted_timestamp = AEAD(key, 0, TAI64N(), initiator.hash)
-        let timestamp = self.stamper.stamp();
-        aead_chacha20_seal(encrypted_timestamp, &key, 0, &timestamp, &hash);
+        let timestamp = self.stamper.stamp()?;
+        aead_chacha20_seal(encrypted_timestamp, &key, 0, &timestamp, &hash)?;
         // initiator.hash = HASH(initiator.hash || msg.encrypted_timestamp)
         hash = b2s_hash(&hash, encrypted_timestamp);
 
@@ -644,7 +654,10 @@ impl Handshake {
         let (encrypted_nothing, _) = rest.split_at_mut(16);
 
         // responder.ephemeral_private = DH_GENERATE()
-        let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
+        let mut secret = Zeroizing::new([0u8; 32]);
+        OsRng.try_fill_bytes(secret.as_mut()).map_err(|_| fp_crypto::Error::RandomnessUnavailable)?;
+        let ephemeral_private = x25519::StaticSecret::from(*secret);
+        secret.zeroize(); // Wipe the source immediately; Zeroizing also covers RNG errors.
         let local_index = self.inc_index();
         // msg.message_type = 2
         // msg.reserved_zero = { 0, 0, 0 }
@@ -686,7 +699,7 @@ impl Handshake {
         // responder.hash = HASH(responder.hash || temp2)
         hash = b2s_hash(&hash, &temp2);
         // msg.encrypted_nothing = AEAD(key, 0, [empty], responder.hash)
-        aead_chacha20_seal(encrypted_nothing, &key, 0, &[], &hash);
+        aead_chacha20_seal(encrypted_nothing, &key, 0, &[], &hash)?;
 
         // Derive keys
         // temp1 = HMAC(initiator.chaining_key, [empty])
@@ -702,12 +715,49 @@ impl Handshake {
 
         let dst = self.append_mac1(&mut dst[..super::HANDSHAKE_RESP_SZ])?;
 
-        Ok((dst, Session::new(local_index, peer_index, temp2, temp3)))
+        Ok((dst, Session::new(local_index, peer_index, temp2, temp3)?))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_aead_keys_and_buffer_lengths_return_errors() {
+        use super::*;
+        assert!(aead_chacha20_seal(&mut [0; 17], &[0; 31], 0, &[1], &[]).is_err());
+        assert!(aead_chacha20_seal(&mut [0; 1], &[0; 32], 0, &[1], &[]).is_err());
+        assert!(aead_chacha20_seal(&mut [0; 18], &[0; 32], 0, &[1], &[]).is_err());
+        let mut ciphertext = [0; 17];
+        aead_chacha20_seal(&mut ciphertext, &[0; 32], 0, &[1], &[]).unwrap();
+        assert!(aead_chacha20_open(&mut [0; 1], &[0; 31], 0, &ciphertext, &[]).is_err());
+        assert!(aead_chacha20_open(&mut [0; 2], &[0; 32], 0, &ciphertext, &[]).is_err());
+    }
+
+    #[test]
+    fn invalid_start_time_returns_error_instead_of_fabricating_timestamp() {
+        use super::*;
+        let stamper = TimeStamper { duration_at_start: None, instant_at_start: Instant::now() };
+        assert!(matches!(stamper.stamp(), Err(fp_crypto::Error::InvalidTai64nTimestamp)));
+    }
+
+    #[test]
+    fn fixed_key_macs_match_variable_length_constructors() {
+        use super::*;
+        for key in [[0; 32], [0xff; 32], [0x5a; 32]] {
+            for data in [b"".as_slice(), b"handshake payload", &[0xff; 128]] {
+                let mut reference = hmac::SimpleHmac::<Blake2s256>::new_from_slice(&key).unwrap();
+                blake2::digest::Update::update(&mut reference, data);
+                let expected: [u8; 32] = reference.finalize_fixed().into();
+                assert_eq!(b2s_hmac(&key, data), expected);
+                assert_eq!(b2s_hmac2(&key, data, &[]), expected);
+                let mut reference = Blake2sMac::new_from_slice(&key).unwrap();
+                blake2::digest::Update::update(&mut reference, data);
+                let expected: [u8; 16] = reference.finalize_fixed().into();
+                assert_eq!(b2s_keyed_mac_16(&key, data), expected);
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -721,7 +771,7 @@ mod tests {
         let nonce: [u8; 12] = [0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47];
         let mut buffer = vec![0; plaintext.len() + 16];
 
-        aead_chacha20_seal_inner(&mut buffer, &key, nonce, plaintext, &aad);
+        aead_chacha20_seal_inner(&mut buffer, &key, nonce, plaintext, &aad).unwrap();
 
         const EXPECTED_CIPHERTEXT: [u8; 114] = [
             0xd3, 0x1a, 0x8d, 0x34, 0x64, 0x8e, 0x60, 0xdb, 0x7b, 0x86, 0xaf, 0xbc, 0x53, 0xef, 0x7e, 0xc2, 0xa4, 0xad,
@@ -748,7 +798,7 @@ mod tests {
 
         let mut encrypted_nothing: [u8; 16] = Default::default();
 
-        aead_chacha20_seal(&mut encrypted_nothing, &key, counter, &[], &aad);
+        aead_chacha20_seal(&mut encrypted_nothing, &key, counter, &[], &aad).unwrap();
 
         eprintln!("encrypted_nothing: {:?}", encrypted_nothing);
 

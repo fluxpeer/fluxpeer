@@ -6,9 +6,9 @@ async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt::init();
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("keygen") => fluxpeer_node::keygen(),
+        Some("keygen") => fluxpeer_node::keygen()?,
         Some("run") => {
-            let cfg = args.next().expect("usage: fp-node run <config.json>");
+            let cfg = args.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: fp-node run <config.json>"))?;
             fluxpeer_node::run(&cfg).await?;
         }
         _ => {

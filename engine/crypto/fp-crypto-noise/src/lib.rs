@@ -32,7 +32,7 @@ use session::Session;
 mod sleepyinstant;
 
 pub(crate) mod x25519 {
-    pub(crate) use x25519_dalek::{PublicKey, ReusableSecret, SharedSecret, StaticSecret};
+    pub(crate) use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 }
 
 /// number of sessions in the ring, better keep a PoT

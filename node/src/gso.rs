@@ -74,7 +74,13 @@ impl GsoBatch {
         if self.count == 0 {
             return;
         }
-        let dst = self.dst.take().unwrap();
+        let Some(dst) = self.dst.take() else {
+            tracing::error!("discarding UDP batch without a destination");
+            self.buf.clear();
+            self.seg = 0;
+            self.count = 0;
+            return;
+        };
         if self.count == 1 {
             let _ = udp.send_to(&self.buf, dst).await;
         } else if self.gso_ok && send_segmented(udp, &self.buf, self.seg, dst).await {

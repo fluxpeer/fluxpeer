@@ -126,28 +126,39 @@ impl Config {
 
 /// Generate a fresh x25519 keypair, returning `(private_hex, public_hex)`. Shared by
 /// `keygen` (prints them) and `join` (enrolls the public key, writes the private).
-pub(crate) fn keypair() -> (String, String) {
+pub(crate) fn keypair() -> std::io::Result<(String, String)> {
+    keypair_with_rng(getrandom::getrandom)
+}
+
+fn keypair_with_rng(fill: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>) -> std::io::Result<(String, String)> {
     // x25519 private key — must come from the OS CSPRNG. getrandom maps to
     // getrandom(2) on Linux, BCryptGenRandom on Windows, getentropy on macOS;
     // NOT /dev/urandom, which doesn't exist on Windows.
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("OS CSPRNG (getrandom) failed");
+    fill(&mut bytes).map_err(|error| std::io::Error::other(format!("OS CSPRNG failed: {error}")))?;
     let priv_key = StaticSecret::from(bytes);
-    (
+    Ok((
         hex::encode(priv_key.to_bytes()),
         hex::encode(PublicKey::from(&priv_key).to_bytes()),
-    )
+    ))
 }
 
-pub fn keygen() {
-    let (priv_hex, pub_hex) = keypair();
+pub fn keygen() -> std::io::Result<()> {
+    let (priv_hex, pub_hex) = keypair()?;
     println!("private_key = {priv_hex}");
     println!("public_key  = {pub_hex}");
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keypair_reports_rng_failure() {
+        let error = keypair_with_rng(|_| Err(getrandom::Error::UNSUPPORTED)).unwrap_err();
+        assert!(error.to_string().contains("OS CSPRNG failed"));
+    }
 
     fn cfg_json(extra: &str) -> String {
         format!(

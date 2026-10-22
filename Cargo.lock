@@ -913,6 +913,7 @@ dependencies = [
  "fluxpeer-control-server",
  "fluxpeer-sdk",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -1056,6 +1057,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -1194,6 +1196,7 @@ dependencies = [
  "futures",
  "hex",
  "md5",
+ "parking_lot",
  "portable-atomic",
  "rand 0.8.6",
  "rcgen",
@@ -1233,6 +1236,7 @@ dependencies = [
  "bytes",
  "fp-transport",
  "futures",
+ "parking_lot",
  "portable-atomic",
  "rand 0.8.6",
  "socket2 0.5.10",

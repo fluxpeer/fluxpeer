@@ -155,21 +155,21 @@ impl ReceivingKeyCounterValidator {
 }
 
 impl Session {
-    pub(super) fn new(local_index: u32, peer_index: u32, receiving_key: [u8; 32], sending_key: [u8; 32]) -> Session {
-        Session {
+    pub(super) fn new(local_index: u32, peer_index: u32, receiving_key: [u8; 32], sending_key: [u8; 32]) -> Result<Session, fp_crypto::Error> {
+        Ok(Session {
             receiving_index: local_index,
             sending_index: peer_index,
             receiver: LessSafeKey::new(
                 UnboundKey::new(&CHACHA20_POLY1305, &receiving_key)
-                    .expect("known-safe: 32-byte key is valid for CHACHA20_POLY1305"),
+                    .map_err(|_| fp_crypto::Error::WrongKey)?,
             ),
             sender: LessSafeKey::new(
                 UnboundKey::new(&CHACHA20_POLY1305, &sending_key)
-                    .expect("known-safe: 32-byte key is valid for CHACHA20_POLY1305"),
+                    .map_err(|_| fp_crypto::Error::WrongKey)?,
             ),
             sending_key_counter: AtomicU64::new(0),
             receiving_key_counter: Default::default(),
-        }
+        })
     }
 
     pub(super) fn local_index(&self) -> usize {
@@ -219,7 +219,9 @@ impl Session {
 
         // Add random padding to prevent traffic-length analysis.
         // Layout of plaintext before encryption: [padding_len: u8] [random_padding: padding_len bytes] [payload]
-        let padding_len = (OsRng.next_u32() % (MAX_PADDING as u32 + 1)) as u8;
+        let mut random = [0u8; 4];
+        OsRng.try_fill_bytes(&mut random).map_err(|_| fp_crypto::Error::RandomnessUnavailable)?;
+        let padding_len = (u32::from_ne_bytes(random) % (MAX_PADDING as u32 + 1)) as u8;
         let padded_len = 1 + padding_len as usize + src.len();
 
         // Write padding header: first byte is the padding length
@@ -227,7 +229,7 @@ impl Session {
         // Fill random padding bytes
         if padding_len > 0 {
             let mut padding_buf = [0u8; MAX_PADDING as usize];
-            OsRng.fill_bytes(&mut padding_buf[..padding_len as usize]);
+            OsRng.try_fill_bytes(&mut padding_buf[..padding_len as usize]).map_err(|_| fp_crypto::Error::RandomnessUnavailable)?;
             data[1..1 + padding_len as usize].copy_from_slice(&padding_buf[..padding_len as usize]);
         }
         // Copy actual payload after padding

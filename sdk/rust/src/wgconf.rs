@@ -90,7 +90,7 @@ pub fn parse(input: &str) -> Result<WgConf> {
                 match sec {
                     Sec::Iface if iface.name.is_none() => iface.name = Some(c.to_string()),
                     Sec::Peer if peers.last().is_some_and(|p| p.name.is_none()) => {
-                        peers.last_mut().expect("peer present").name = Some(c.to_string());
+                        if let Some(peer) = peers.last_mut() { peer.name = Some(c.to_string()); }
                     }
                     _ => {}
                 }
@@ -133,7 +133,7 @@ pub fn parse(input: &str) -> Result<WgConf> {
                 _ => {} // ignore Table/PreUp/PostUp/etc.
             },
             Sec::Peer => {
-                let p = peers.last_mut().expect("peer pushed on section header");
+                let p = peers.last_mut().ok_or_else(|| anyhow!("missing [Peer] section"))?;
                 match key.as_str() {
                     "publickey" => p.public_key = Some(val.to_string()),
                     "allowedips" => p.allowed_ips.extend(split_list(val)),

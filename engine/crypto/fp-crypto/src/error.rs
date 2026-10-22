@@ -1,5 +1,7 @@
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
+    #[error("OS CSPRNG unavailable")]
+    RandomnessUnavailable,
     #[error("MustHandshakeFirst")]
     MustHandshakeFirst,
     #[error("AlreadyHandshake")]

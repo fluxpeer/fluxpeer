@@ -34,14 +34,14 @@ pub fn dst_address(packet: &[u8]) -> Option<std::net::IpAddr> {
         4 if packet.len() >= IPV4_MIN_HEADER_SIZE => {
             let addr_bytes: [u8; IPV4_IP_SZ] = packet[IPV4_DST_IP_OFF..IPV4_DST_IP_OFF + IPV4_IP_SZ]
                 .try_into()
-                .expect("known-safe: IPV4_MIN_HEADER_SIZE guarantees sufficient length");
+                .ok()?;
             let addr = std::net::IpAddr::from(addr_bytes);
             Some(addr)
         }
         6 if packet.len() >= IPV6_MIN_HEADER_SIZE => {
             let addr_bytes: [u8; IPV6_IP_SZ] = packet[IPV6_DST_IP_OFF..IPV6_DST_IP_OFF + IPV6_IP_SZ]
                 .try_into()
-                .expect("known-safe: IPV6_MIN_HEADER_SIZE guarantees sufficient length");
+                .ok()?;
             let addr = std::net::IpAddr::from(addr_bytes);
             Some(addr)
         }
@@ -57,14 +57,14 @@ pub fn src_address(packet: &[u8]) -> Option<std::net::IpAddr> {
         4 if packet.len() >= IPV4_MIN_HEADER_SIZE => {
             let addr_bytes: [u8; IPV4_IP_SZ] = packet[IPV4_SRC_IP_OFF..IPV4_SRC_IP_OFF + IPV4_IP_SZ]
                 .try_into()
-                .expect("known-safe: IPV4_MIN_HEADER_SIZE guarantees sufficient length");
+                .ok()?;
             let addr = std::net::IpAddr::from(addr_bytes);
             Some(addr)
         }
         6 if packet.len() >= IPV6_MIN_HEADER_SIZE => {
             let addr_bytes: [u8; IPV6_IP_SZ] = packet[IPV6_SRC_IP_OFF..IPV6_SRC_IP_OFF + IPV6_IP_SZ]
                 .try_into()
-                .expect("known-safe: IPV6_MIN_HEADER_SIZE guarantees sufficient length");
+                .ok()?;
             let addr = std::net::IpAddr::from(addr_bytes);
             Some(addr)
         }

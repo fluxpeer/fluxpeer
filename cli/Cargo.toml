@@ -15,6 +15,7 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"
 fluxpeer-control-server = { path = "../control-server" }
 axum = { workspace = true, features = ["json", "http1", "tokio"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
