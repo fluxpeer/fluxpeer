@@ -5,7 +5,7 @@
 # OpenWrt-default path) — AND that the route is gated by admin approval:
 #   * BEFORE the advertised route is approved → client CANNOT reach the LAN host (negative)
 #   * AFTER approval                          → client CAN reach it (0% loss)
-#   * the router's nft `inet fluxpeer` table is present while up, gone after teardown
+#   * the router's per-instance nft table (inet fluxpeer_<hex tun>) is present while up, gone after teardown
 # Single host, netns/veth, root + nft. Build on a Linux host. Mirrors the
 # proven e2e-exit-transport.sh topology but forces nft and adds the approval gate check.
 set -u
@@ -23,8 +23,11 @@ ok(){ echo "  PASS: $1"; pass=$((pass+1)); }
 no(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 jget(){ python3 -c "import sys,json;print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }
 
+PIDS=()
 teardown(){
-  sudo pkill -x fluxpeer 2>/dev/null
+  # Only processes this script started: host control/relay by PID, nodes by netns.
+  for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
+  for ns in $NSC $NSE $NSL; do sudo ip netns pids $ns 2>/dev/null | xargs -r sudo kill 2>/dev/null; done
   for ns in $NSC $NSE $NSL; do sudo ip netns del $ns 2>/dev/null; done
   sudo ip link del $BR 2>/dev/null
   [ -n "${KEEP:-}" ] || rm -rf "$D"
@@ -55,10 +58,10 @@ sudo ip netns exec $NSC ping -c1 -W1 $INTRA >/dev/null 2>&1 && no "LAN reachable
 
 echo "===== control + relay ====="
 DATABASE_URL="sqlite://$D/db.sqlite?mode=rwc" FLUXPEER_CONTROL_ADDR=0.0.0.0:$CPORT FLUXPEER_ADMIN_PASSWORD=reg \
-  nohup "$B" control >"$D/control.log" 2>&1 & sleep 2
+  nohup "$B" control >"$D/control.log" 2>&1 & PIDS+=($!); sleep 2
 RELAY_PUBLIC_KEY=$("$B" relay public-key --key-file "$D/relay/relay.key") || exit 1
 [[ "$RELAY_PUBLIC_KEY" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid relay public key" >&2; exit 1; }
-FLUXPEER_RELAY_KEY_FILE="$D/relay/relay.key" FLUXPEER_RELAY_ADDR=0.0.0.0:$RPORT_TCP FLUXPEER_RELAY_NODE_ID=fluxpeer-relay nohup "$B" relay >"$D/relay.log" 2>&1 & sleep 2
+FLUXPEER_RELAY_KEY_FILE="$D/relay/relay.key" FLUXPEER_RELAY_ADDR=0.0.0.0:$RPORT_TCP FLUXPEER_RELAY_NODE_ID=fluxpeer-relay nohup "$B" relay >"$D/relay.log" 2>&1 & PIDS+=($!); sleep 2
 curl -s $CTRL/health >/dev/null && ok "control up" || { no "control down"; echo "RESULTS: $pass/$fail"; exit 1; }
 export FLUXPEER_CONTROL_URL=$CTRL FLUXPEER_ADMIN_PASSWORD=reg
 
@@ -88,7 +91,7 @@ sudo RUST_LOG=warn nohup ip netns exec $NSC "$B" node run "$D/cfg/C.json" >"$D/C
 echo "  waiting 12s for handshake…"; sleep 12
 
 echo "===== router uses nft backend? ====="
-sudo ip netns exec $NSE nft list table inet fluxpeer >/dev/null 2>&1 && ok "router has nft inet fluxpeer table" || no "router missing nft table (backend not nft?)"
+sudo ip netns exec $NSE nft list tables 2>/dev/null | grep -qE '^table inet fluxpeer_[0-9a-f]+$' && ok "router has its per-instance nft table" || no "router missing per-instance nft table (backend not nft?)"
 
 echo "===== NEGATIVE: before approval, client must NOT reach LAN ====="
 if sudo ip netns exec $NSC ping -c2 -i0.3 -W2 $INTRA >/dev/null 2>&1; then
