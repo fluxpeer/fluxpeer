@@ -484,6 +484,11 @@ impl Daemon {
             let iface = iface.to_string(); let base = self.pf_base.clone();
             crate::apply::blocking(move || crate::firewall::pf::down_at(&base, &iface)).await?;
         }
+        #[cfg(windows)]
+        if !self.processes.contains(iface) {
+            let iface = iface.to_string();
+            crate::apply::blocking(move || crate::route::windows::recover(&iface).map_err(crate::apply::ApplyError::from)).await?;
+        }
         if let Err(error) = std::fs::remove_file(crate::statusd::socket_path(iface))
             && error.kind() != std::io::ErrorKind::NotFound { return Err(error); }
         #[cfg(target_os = "linux")]

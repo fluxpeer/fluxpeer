@@ -130,7 +130,8 @@ use std::sync::Arc;
 ///
 /// For more information see [`libloading`]'s dynamic library safety guarantees: [`libloading`][`libloading::Library::new`]
 pub unsafe fn load() -> Result<Wintun, libloading::Error> {
-    load_from_path("wintun")
+    // SAFETY: the caller guarantees the library loaded from this path is trusted.
+    unsafe { load_from_path("wintun") }
 }
 
 /// Attempts to load the Wintun library as a dynamic library from the given path.
@@ -149,7 +150,8 @@ pub unsafe fn load_from_path<P>(path: P) -> Result<Wintun, libloading::Error>
 where
     P: AsRef<::std::ffi::OsStr>,
 {
-    check_version(wintun_raw::wintun::new(path)?)
+    // SAFETY: forwards the caller's library trust and ABI contract.
+    check_version(unsafe { wintun_raw::wintun::new(path)? })
 }
 
 /// Attempts to load the Wintun library from an existing [`libloading::Library`].
@@ -166,7 +168,8 @@ pub unsafe fn load_from_library<L>(library: L) -> Result<Wintun, libloading::Err
 where
     L: Into<libloading::Library>,
 {
-    check_version(wintun_raw::wintun::from_library(library)?)
+    // SAFETY: forwards the caller's exported-symbol ABI contract.
+    check_version(unsafe { wintun_raw::wintun::from_library(library)? })
 }
 
 fn check_version(lib: wintun_raw::wintun) -> Result<Wintun, libloading::Error> {

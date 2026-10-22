@@ -293,28 +293,44 @@ impl wintun {
     where
         P: AsRef<::std::ffi::OsStr>,
     {
-        let library = ::libloading::Library::new(path)?;
-        Self::from_library(library)
+        // SAFETY: the caller guarantees a trusted Wintun library and ABI.
+        let library = unsafe { ::libloading::Library::new(path)? };
+        // SAFETY: the loaded library has the caller-guaranteed Wintun ABI.
+        unsafe { Self::from_library(library) }
     }
     pub unsafe fn from_library<L>(library: L) -> Result<Self, ::libloading::Error>
     where
         L: Into<::libloading::Library>,
     {
         let __library = library.into();
-        let WintunCreateAdapter = __library.get(b"WintunCreateAdapter\0").map(|sym| *sym)?;
-        let WintunCloseAdapter = __library.get(b"WintunCloseAdapter\0").map(|sym| *sym)?;
-        let WintunOpenAdapter = __library.get(b"WintunOpenAdapter\0").map(|sym| *sym)?;
-        let WintunGetAdapterLUID = __library.get(b"WintunGetAdapterLUID\0").map(|sym| *sym)?;
-        let WintunGetRunningDriverVersion = __library.get(b"WintunGetRunningDriverVersion\0").map(|sym| *sym)?;
-        let WintunDeleteDriver = __library.get(b"WintunDeleteDriver\0").map(|sym| *sym)?;
-        let WintunSetLogger = __library.get(b"WintunSetLogger\0").map(|sym| *sym)?;
-        let WintunStartSession = __library.get(b"WintunStartSession\0").map(|sym| *sym)?;
-        let WintunEndSession = __library.get(b"WintunEndSession\0").map(|sym| *sym)?;
-        let WintunGetReadWaitEvent = __library.get(b"WintunGetReadWaitEvent\0").map(|sym| *sym)?;
-        let WintunReceivePacket = __library.get(b"WintunReceivePacket\0").map(|sym| *sym)?;
-        let WintunReleaseReceivePacket = __library.get(b"WintunReleaseReceivePacket\0").map(|sym| *sym)?;
-        let WintunAllocateSendPacket = __library.get(b"WintunAllocateSendPacket\0").map(|sym| *sym)?;
-        let WintunSendPacket = __library.get(b"WintunSendPacket\0").map(|sym| *sym)?;
+        // SAFETY: the caller guarantees that the exported symbol has the Wintun ABI.
+        let WintunCreateAdapter = unsafe { __library.get(b"WintunCreateAdapter\0") }.map(|sym| *sym)?;
+        // SAFETY: the caller guarantees that the exported symbol has the Wintun ABI.
+        let WintunCloseAdapter = unsafe { __library.get(b"WintunCloseAdapter\0") }.map(|sym| *sym)?;
+        // SAFETY: the caller guarantees that the exported symbol has the Wintun ABI.
+        let WintunOpenAdapter = unsafe { __library.get(b"WintunOpenAdapter\0") }.map(|sym| *sym)?;
+        // SAFETY: the caller guarantees that the exported symbol has the Wintun ABI.
+        let WintunGetAdapterLUID = unsafe { __library.get(b"WintunGetAdapterLUID\0") }.map(|sym| *sym)?;
+        // SAFETY: the caller guarantees that the exported symbol has the Wintun ABI.
+        let WintunGetRunningDriverVersion = unsafe { __library.get(b"WintunGetRunningDriverVersion\0") }.map(|sym| *sym)?;
+        // SAFETY: the caller guarantees that the exported symbol has the Wintun ABI.
+        let WintunDeleteDriver = unsafe { __library.get(b"WintunDeleteDriver\0") }.map(|sym| *sym)?;
+        // SAFETY: the caller guarantees that the exported symbol has the Wintun ABI.
+        let WintunSetLogger = unsafe { __library.get(b"WintunSetLogger\0") }.map(|sym| *sym)?;
+        // SAFETY: the caller guarantees that the exported symbol has the Wintun ABI.
+        let WintunStartSession = unsafe { __library.get(b"WintunStartSession\0") }.map(|sym| *sym)?;
+        // SAFETY: the caller guarantees that the exported symbol has the Wintun ABI.
+        let WintunEndSession = unsafe { __library.get(b"WintunEndSession\0") }.map(|sym| *sym)?;
+        // SAFETY: the caller guarantees that the exported symbol has the Wintun ABI.
+        let WintunGetReadWaitEvent = unsafe { __library.get(b"WintunGetReadWaitEvent\0") }.map(|sym| *sym)?;
+        // SAFETY: the caller guarantees that the exported symbol has the Wintun ABI.
+        let WintunReceivePacket = unsafe { __library.get(b"WintunReceivePacket\0") }.map(|sym| *sym)?;
+        // SAFETY: the caller guarantees that the exported symbol has the Wintun ABI.
+        let WintunReleaseReceivePacket = unsafe { __library.get(b"WintunReleaseReceivePacket\0") }.map(|sym| *sym)?;
+        // SAFETY: the caller guarantees that the exported symbol has the Wintun ABI.
+        let WintunAllocateSendPacket = unsafe { __library.get(b"WintunAllocateSendPacket\0") }.map(|sym| *sym)?;
+        // SAFETY: the caller guarantees that the exported symbol has the Wintun ABI.
+        let WintunSendPacket = unsafe { __library.get(b"WintunSendPacket\0") }.map(|sym| *sym)?;
         Ok(wintun {
             __library,
             WintunCreateAdapter,
@@ -334,45 +350,59 @@ impl wintun {
         })
     }
     pub unsafe fn WintunCreateAdapter(&self, arg1: LPCWSTR, arg2: LPCWSTR, arg3: *const GUID) -> WINTUN_ADAPTER_HANDLE {
-        (self.WintunCreateAdapter)(arg1, arg2, arg3)
+        // SAFETY: forwards the pointer and handle contract of this unsafe binding.
+        unsafe { (self.WintunCreateAdapter)(arg1, arg2, arg3) }
     }
     pub unsafe fn WintunCloseAdapter(&self, arg1: WINTUN_ADAPTER_HANDLE) -> () {
-        (self.WintunCloseAdapter)(arg1)
+        // SAFETY: forwards the pointer and handle contract of this unsafe binding.
+        unsafe { (self.WintunCloseAdapter)(arg1) }
     }
     pub unsafe fn WintunOpenAdapter(&self, arg1: LPCWSTR) -> WINTUN_ADAPTER_HANDLE {
-        (self.WintunOpenAdapter)(arg1)
+        // SAFETY: forwards the pointer and handle contract of this unsafe binding.
+        unsafe { (self.WintunOpenAdapter)(arg1) }
     }
     pub unsafe fn WintunGetAdapterLUID(&self, arg1: WINTUN_ADAPTER_HANDLE, arg2: *mut NET_LUID) -> () {
-        (self.WintunGetAdapterLUID)(arg1, arg2)
+        // SAFETY: forwards the pointer and handle contract of this unsafe binding.
+        unsafe { (self.WintunGetAdapterLUID)(arg1, arg2) }
     }
     pub unsafe fn WintunGetRunningDriverVersion(&self) -> DWORD {
-        (self.WintunGetRunningDriverVersion)()
+        // SAFETY: the loaded DLL symbol has the declared ABI and is still live.
+        unsafe { (self.WintunGetRunningDriverVersion)() }
     }
     pub unsafe fn WintunDeleteDriver(&self) -> BOOL {
-        (self.WintunDeleteDriver)()
+        // SAFETY: the loaded DLL symbol has the declared ABI and is still live.
+        unsafe { (self.WintunDeleteDriver)() }
     }
     pub unsafe fn WintunSetLogger(&self, arg1: WINTUN_LOGGER_CALLBACK) -> () {
-        (self.WintunSetLogger)(arg1)
+        // SAFETY: forwards the pointer and handle contract of this unsafe binding.
+        unsafe { (self.WintunSetLogger)(arg1) }
     }
     pub unsafe fn WintunStartSession(&self, arg1: WINTUN_ADAPTER_HANDLE, arg2: DWORD) -> WINTUN_SESSION_HANDLE {
-        (self.WintunStartSession)(arg1, arg2)
+        // SAFETY: forwards the pointer and handle contract of this unsafe binding.
+        unsafe { (self.WintunStartSession)(arg1, arg2) }
     }
     pub unsafe fn WintunEndSession(&self, arg1: WINTUN_SESSION_HANDLE) -> () {
-        (self.WintunEndSession)(arg1)
+        // SAFETY: forwards the pointer and handle contract of this unsafe binding.
+        unsafe { (self.WintunEndSession)(arg1) }
     }
     pub unsafe fn WintunGetReadWaitEvent(&self, arg1: WINTUN_SESSION_HANDLE) -> HANDLE {
-        (self.WintunGetReadWaitEvent)(arg1)
+        // SAFETY: forwards the pointer and handle contract of this unsafe binding.
+        unsafe { (self.WintunGetReadWaitEvent)(arg1) }
     }
     pub unsafe fn WintunReceivePacket(&self, arg1: WINTUN_SESSION_HANDLE, arg2: *mut DWORD) -> *mut BYTE {
-        (self.WintunReceivePacket)(arg1, arg2)
+        // SAFETY: forwards the pointer and handle contract of this unsafe binding.
+        unsafe { (self.WintunReceivePacket)(arg1, arg2) }
     }
     pub unsafe fn WintunReleaseReceivePacket(&self, arg1: WINTUN_SESSION_HANDLE, arg2: *const BYTE) -> () {
-        (self.WintunReleaseReceivePacket)(arg1, arg2)
+        // SAFETY: forwards the pointer and handle contract of this unsafe binding.
+        unsafe { (self.WintunReleaseReceivePacket)(arg1, arg2) }
     }
     pub unsafe fn WintunAllocateSendPacket(&self, arg1: WINTUN_SESSION_HANDLE, arg2: DWORD) -> *mut BYTE {
-        (self.WintunAllocateSendPacket)(arg1, arg2)
+        // SAFETY: forwards the pointer and handle contract of this unsafe binding.
+        unsafe { (self.WintunAllocateSendPacket)(arg1, arg2) }
     }
     pub unsafe fn WintunSendPacket(&self, arg1: WINTUN_SESSION_HANDLE, arg2: *const BYTE) -> () {
-        (self.WintunSendPacket)(arg1, arg2)
+        // SAFETY: forwards the pointer and handle contract of this unsafe binding.
+        unsafe { (self.WintunSendPacket)(arg1, arg2) }
     }
 }

@@ -12,6 +12,7 @@
 
 #[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(unix)]
 use std::sync::OnceLock;
 
 /// Called with every egress socket fd so the host can exclude it from the tunnel.

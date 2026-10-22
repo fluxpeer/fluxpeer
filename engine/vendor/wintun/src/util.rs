@@ -3,7 +3,6 @@ use winapi::{
     um::{winbase, winnt::MAKELANGID},
 };
 
-use std::mem::MaybeUninit;
 use std::ptr;
 
 use widestring::U16Str;
@@ -19,13 +18,9 @@ unsafe impl<T> Sync for UnsafeHandle<T> {}
 /// Returns a a human readable error message from a windows error code
 pub fn get_error_message(err_code: u32) -> String {
     const LEN: usize = 256;
-    let mut buf = MaybeUninit::<[u16; LEN]>::uninit();
-
-    //SAFETY: name is a allocated on the stack above therefore it must be valid, non-null and
-    //aligned for u16
-    let first = unsafe { *buf.as_mut_ptr() }.as_mut_ptr();
-    //Write default null terminator in case WintunGetAdapterName leaves name unchanged
-    unsafe { first.write(0u16) };
+    let mut buf = [0_u16; LEN];
+    let first = buf.as_mut_ptr();
+    // SAFETY: first points to LEN initialized u16 elements for the entire call.
     let chars_written = unsafe {
         winbase::FormatMessageW(
             winbase::FORMAT_MESSAGE_FROM_SYSTEM | winbase::FORMAT_MESSAGE_IGNORE_INSERTS,

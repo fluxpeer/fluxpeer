@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #![cfg(test)]
-use std::{path::Path, process::{Child, Command, Stdio}, time::{Duration, Instant}};
+#[cfg(unix)]
+use std::process::Stdio;
+use std::{path::Path, process::{Child, Command}, time::{Duration, Instant}};
 use fluxpeer_relay_server::auth::{load_identity, ServerAuth};
 
 fn command(data: &Path) -> Command {

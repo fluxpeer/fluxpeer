@@ -21,6 +21,7 @@ ioctl = { version = "0.8", package = "ioctl-sys" }
 # MARKER BEGIN
 [target.'cfg(target_os = "windows")'.dependencies]
 wintun = { workspace = true }
+parking_lot = "0.12"
 packet = "0.1"
 ipconfig = "0.3.0"
 log = "0.4"

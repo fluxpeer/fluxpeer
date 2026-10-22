@@ -30,6 +30,8 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+#[cfg(any(windows, test))]
+mod member_stop;
 mod apply;
 mod bypass;
 mod carriers;
@@ -257,12 +259,6 @@ fn sync_dns_mode_with(
     Ok(())
 }
 
-fn skip_windows_exit(os: route::RouteOs, warning: &std::sync::Once, notify: impl FnOnce()) -> bool {
-    if os != route::RouteOs::Windows { return false; }
-    warning.call_once(notify);
-    true
-}
-
 impl HostEffects {
     fn effect(&self, _stage: HostStage, operation: impl FnOnce() -> ApplyResult) -> ApplyResult {
         #[cfg(test)]
@@ -279,10 +275,6 @@ impl HostEffects {
 
     fn sync_exit(&self, peers: &[control::PeerInfo]) -> ApplyResult {
         if !self.manage_host_routes { return Ok(()); }
-        static WINDOWS_WARNING: std::sync::Once = std::sync::Once::new();
-        if skip_windows_exit(route::current_os(), &WINDOWS_WARNING, || {
-            tracing::warn!("Windows exit routes unsupported; deferred to F05");
-        }) { return Ok(()); }
         {
             let stopped = self.shutdown.lock();
             if *stopped { return Ok(()); }
@@ -346,7 +338,7 @@ impl HostEffects {
         self.effect(HostStage::Bypass, || {
             let mut runtime = self.runtime.lock();
             let stopped = self.shutdown.lock();
-            if *stopped || !self.manage_host_routes || route::current_os() == route::RouteOs::Windows { return Ok(()); }
+            if *stopped || !self.manage_host_routes { return Ok(()); }
             runtime.bypass.sync(bypass, retain)
         })
     }
@@ -395,7 +387,10 @@ impl HostEffects {
             let dns = sync_dns_with(&mut runtime.dns, None, |_| Ok(()), || route::reset_dns(&self.tun_name));
             let nat = remove_nat(&self.nat_state, &self.tun_name, &self.membership_iface);
             let carriers = if exit.is_ok() && pending.is_ok() { runtime.bypass.sync(&[], false) } else { Ok(()) };
-            result = apply::all([exit, pending, dns, nat, carriers]);
+            let effects = apply::all([exit, pending, dns, nat, carriers]);
+            #[cfg(windows)]
+            let effects = apply::all([effects, route::windows::cleanup().map_err(ApplyError::from)]);
+            result = effects;
         });
         result
     }
@@ -978,7 +973,7 @@ impl Reconciler {
 /// Called with every egress socket fd the engine opens so the host can exclude it
 /// from the tunnel — on Android `VpnService.protect(fd)`, else the engine's own wg
 /// packets would route back INTO the tun (a loop). Desktop/server pass `None`.
-pub type ProtectFn = std::sync::Arc<dyn Fn(std::os::fd::RawFd) + Send + Sync>;
+pub type ProtectFn = std::sync::Arc<dyn Fn(i32) + Send + Sync>;
 
 /// Owns the OS-injected tun fd until fp-tun adopts it. If `run_with` errors out
 /// before adoption (a bind failure, an unreachable control server, …), the guard
@@ -1026,6 +1021,8 @@ pub async fn run(cfg_path: &str) -> std::io::Result<()> {
     let cfg: Config = serde_json::from_slice(&std::fs::read(cfg_path)?)?;
     if !daemon::valid_iface(&cfg.tun_name) { return Err(std::io::Error::other("invalid interface name")); }
     let iface = cfg.tun_name.clone();
+    #[cfg(windows)]
+    route::windows::begin(&iface)?;
     let result = match firewall::client::ensure_exclusive_at(std::path::Path::new(carriers::ROOT), &iface) {
         Ok(()) => run_with(cfg, None, None).await,
         Err(error) => Err(error),
@@ -1118,6 +1115,10 @@ async fn start_client_guard(cfg: &mut Config, shutdown: &Shutdown) -> std::io::R
 }
 
 async fn run_with(mut cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile::RoutesFn>) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    if protect.is_some() || cfg.tun_fd.is_some() {
+        return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "injected POSIX descriptors require Unix"));
+    }
     let mut tasks = tokio::task::JoinSet::new();
     // Own the injected fd before parsing keys so early errors also close it.
     #[cfg(unix)]
@@ -1126,7 +1127,7 @@ async fn run_with(mut cfg: Config, protect: Option<ProtectFn>, routes: Option<mo
     let own_pub = PublicKey::from(&own_priv);
 
     let shutdown: Shutdown = Arc::new(parking_lot::Mutex::new(false));
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let shutdown_host: Arc<parking_lot::Mutex<Option<Arc<HostEffects>>>> = Arc::default();
     #[cfg(unix)]
     {
@@ -1142,6 +1143,25 @@ async fn run_with(mut cfg: Config, protect: Option<ProtectFn>, routes: Option<mo
                 else { *gate.lock() = true; }
                 if down { firewall::client::clear(&tun)?; }
                 Ok(())
+            }).await;
+            if let Err(error) = &result { tracing::error!(%error, "host shutdown failed"); }
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        });
+    }
+    #[cfg(windows)]
+    {
+        let slot = shutdown_host.clone(); let gate = shutdown.clone();
+        tasks.spawn(async move {
+            let member = std::env::var_os("FLUXPEER_MEMBER_STDIN_STOP").is_some();
+            let request = tokio::select! {
+                result = tokio::signal::ctrl_c() => result,
+                result = member_stop::stdin(), if member => result,
+            };
+            let result = apply::blocking(move || {
+                let host = slot.lock().clone();
+                if let Some(host) = host { host.cleanup()?; }
+                else { *gate.lock() = true; route::windows::cleanup()?; }
+                request.map_err(ApplyError::from)
             }).await;
             if let Err(error) = &result { tracing::error!(%error, "host shutdown failed"); }
             std::process::exit(if result.is_ok() { 0 } else { 1 });
@@ -1166,6 +1186,7 @@ async fn run_with(mut cfg: Config, protect: Option<ProtectFn>, routes: Option<mo
     // Mobile: exclude our egress socket from the VPN (else wg packets loop into the
     // tun). No-op on desktop/server (protect = None). Relay/tcp-direct sockets are
     // protected the same way where they're opened (see relay/tcp_direct).
+    #[cfg(unix)]
     if let Some(p) = &protect {
         use std::os::fd::AsRawFd;
         p(udp.as_raw_fd());
@@ -1302,20 +1323,8 @@ async fn run_with(mut cfg: Config, protect: Option<ProtectFn>, routes: Option<mo
         manage_host_routes: !embedded, shutdown, runtime: parking_lot::Mutex::new(HostRuntime::default()), kill_switch, carrier_dns: cfg.carrier_dns.clone(), carrier_cache: cfg.carrier_cache.clone(),
         #[cfg(test)] probe: None,
     });
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     { *shutdown_host.lock() = Some(host.clone()); }
-    // Windows has no SIGTERM/SIGINT; hook Ctrl-C so a foreground node still restores
-    // routes/DNS (and the exit-side NAT, when it lands) before exiting.
-    #[cfg(windows)]
-    {
-        let stopping = host.clone();
-        tasks.spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            if let Err(error) = apply::blocking(move || stopping.cleanup()).await { tracing::error!(%error, "host shutdown failed"); }
-            std::process::exit(0);
-        });
-    }
-
     let initial_host = host.clone();
     let initial_peers = peers.clone();
     initial_host.guard_carriers(&initial_peers, false).await?;
@@ -2064,16 +2073,6 @@ mod exit_contract_tests {
         assert!(host.runtime.lock().retries[1].waiting(2, Instant::now()));
     }
 
-    #[test]
-    fn unsupported_windows_exit_warns_once_across_ticks() {
-        let warning = std::sync::Once::new();
-        let calls = std::cell::Cell::new(0);
-        assert!(!skip_windows_exit(route::RouteOs::Linux, &warning, || calls.set(calls.get() + 1)));
-        for _ in 0..20 {
-            assert!(skip_windows_exit(route::RouteOs::Windows, &warning, || calls.set(calls.get() + 1)));
-        }
-        assert_eq!(calls.get(), 1);
-    }
 
     #[tokio::test]
     async fn bypass_dns_refreshes_even_during_exit_retry_backoff() {

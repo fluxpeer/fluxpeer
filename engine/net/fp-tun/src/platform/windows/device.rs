@@ -5,16 +5,18 @@ use std::{
     net::Ipv4Addr,
     pin::Pin,
     process::Command,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll},
     thread,
     vec::Vec,
 };
 
 use wintun::Session;
+use parking_lot::Mutex;
 
 /// A TUN device using the wintun driver.
 pub struct Device {
+    name: String,
     queue: Queue,
 }
 
@@ -61,6 +63,7 @@ impl Device {
             return Err(Error::InvalidConfig);
         }
         let mut device = Device {
+            name,
             queue: Queue {
                 session,
                 cached: Arc::new(Mutex::new(Vec::with_capacity(1504))),
@@ -104,7 +107,7 @@ impl D for Device {
     type Queue = Queue;
 
     fn name(&self) -> &str {
-        "wintun"
+        &self.name
     }
 
     fn set_name(&mut self, value: &str) -> Result<()> {
@@ -168,11 +171,8 @@ pub struct Queue {
 impl Queue {
     pub fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, mut buf: &mut [u8]) -> Poll<io::Result<usize>> {
         {
-            let mut guard = match self.cached.lock() {
-                Ok(g) => g,
-                Err(_) => return Poll::Ready(Err(io::Error::other("mutex poisoned"))),
-            };
-            if guard.len() > 0 {
+            let mut guard = self.cached.lock();
+            if !guard.is_empty() {
                 let res = match io::copy(&mut guard.as_slice(), &mut buf) {
                     Ok(n) => Poll::Ready(Ok(n as usize)),
                     Err(e) => Poll::Ready(Err(e)),
@@ -192,10 +192,7 @@ impl Queue {
                 let waker = cx.waker().clone();
                 let cached = self.cached.clone();
                 thread::spawn(move || {
-                    let Ok(mut guard) = cached.lock() else {
-                        waker.wake();
-                        return;
-                    };
+                    let mut guard = cached.lock();
                     match reader_session.receive_blocking() {
                         Ok(packet) => guard.extend_from_slice(packet.bytes()),
                         Err(_e) => {}

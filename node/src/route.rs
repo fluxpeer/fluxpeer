@@ -4,6 +4,9 @@
 
 use crate::apply::{self, ApplyError, Result};
 
+#[cfg(any(windows, test))]
+pub(crate) mod windows;
+
 /// Normalize a host or CIDR to a CIDR (`1.2.3.4` → `1.2.3.4/32`).
 fn cidr(s: &str) -> String {
     if s.contains('/') {
@@ -27,10 +30,9 @@ pub(crate) fn route_del(cidr: &str, dev: &str) -> Result {
     optional_route_result(current_os(), cidr, route_change_with(current_os(), cidr, dev, false, &mut apply::System)).map(|_| ())
 }
 
-fn optional_route_result(os: RouteOs, cidr: &str, result: Result) -> Result<apply::RouteOutcome> {
+fn optional_route_result(_os: RouteOs, cidr: &str, result: Result) -> Result<apply::RouteOutcome> {
     match result {
-        Err(error) if (os == RouteOs::Windows && error.kind == std::io::ErrorKind::Unsupported)
-            || (cidr.contains(':') && apply::ipv6_unavailable(&error)) => {
+        Err(error) if cidr.contains(':') && apply::ipv6_unavailable(&error) => {
                 Ok(apply::RouteOutcome::Skipped(error))
             }
         result => result.map(|()| apply::RouteOutcome::Installed),
@@ -40,7 +42,10 @@ fn optional_route_result(os: RouteOs, cidr: &str, result: Result) -> Result<appl
 fn route_change_with(os: RouteOs, cidr: &str, dev: &str, add: bool, runner: &mut impl apply::Runner) -> Result {
     if crate::control::is_default_prefix(cidr) { return Ok(()); }
     if os == RouteOs::Windows {
-        return Err(ApplyError::io(&["route", cidr, dev], std::io::Error::new(std::io::ErrorKind::Unsupported, "Windows host routes are deferred to F05")));
+        #[cfg(windows)]
+        return if add { windows::add(cidr, dev, None) } else { windows::remove(cidr, dev) }.map_err(ApplyError::from);
+        #[cfg(not(windows))]
+        return Err(ApplyError::io(&["route", cidr, dev], std::io::Error::new(std::io::ErrorKind::Unsupported, "IP Helper requires Windows")));
     }
     if os == RouteOs::Macos {
         let family = if cidr.contains(':') { "-inet6" } else { "-inet" };
@@ -71,6 +76,10 @@ pub(crate) fn bypass_add(dst: &str, gateway: &str, phys: &str) -> Result<bool> {
         };
         (gateway.as_str(), phys.as_str())
     } else { (gateway, phys) };
+    if current_os() == RouteOs::Windows {
+        #[cfg(windows)]
+        { windows::add(&cidr(dst), phys, Some(gateway))?; return Ok(true); }
+    }
     if current_os() == RouteOs::Macos {
         // Match the existing IPv4 replacement behavior, with the right family.
         bypass_del(dst)?;
@@ -83,6 +92,10 @@ pub(crate) fn bypass_add(dst: &str, gateway: &str, phys: &str) -> Result<bool> {
 }
 
 pub(crate) fn bypass_del(dst: &str) -> Result {
+    if current_os() == RouteOs::Windows {
+        #[cfg(windows)]
+        return windows::remove_bypass(&cidr(dst)).map_err(ApplyError::from);
+    }
     if let Some(command) = bypass_cmd(current_os(), dst, None) {
         missing_is_removed(run_route_command(&command).map_err(ApplyError::from))?;
     }
@@ -104,6 +117,10 @@ fn bypass_cmd(os: RouteOs, dst: &str, via: Option<(&str, &str)>) -> Option<Vec<S
 /// IPv6 carriers must bypass through the IPv6 physical gateway, never through
 /// the IPv4 gateway. Query before installing the guard's /1 routes.
 pub(crate) fn physical_v6_route() -> Result<Option<(String, String)>> {
+    if current_os() == RouteOs::Windows {
+        #[cfg(windows)]
+        return windows::default_route(true).map_err(ApplyError::from);
+    }
     let command: &[&str] = match current_os() {
         RouteOs::Linux => &["ip", "-6", "route", "show", "default"],
         RouteOs::Macos => &["route", "-n", "get", "-inet6", "default"],
@@ -140,7 +157,7 @@ fn physical_default() -> Result<String> {
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     { apply::output(&["ip", "route", "show", "default"]) }
     #[cfg(windows)]
-    { Err(ApplyError::io(&["physical-default"], std::io::Error::new(std::io::ErrorKind::Unsupported, "Windows routes are deferred to F05"))) }
+    { Ok(windows::default_route(false)?.map(|(gateway, dev)| format!("default via {gateway} dev {dev}")).unwrap_or_default()) }
 }
 
 fn default_field(output: &str, _mac_field: &str, _linux_field: &str) -> Option<String> {
@@ -159,7 +176,9 @@ pub(crate) fn needs_bypass(dst: &str) -> Result<bool> {
     let _ip = dst.split('/').next().unwrap_or(dst);
     #[cfg(target_os = "macos")]
     { Ok(true) }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    { windows::needs_bypass(&cidr(dst)).map_err(ApplyError::from) }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
     {
         if _ip.contains(':') && physical_v6_route()?.is_none() { return Ok(false); }
         Ok(apply::output(&["ip", if _ip.contains(':') { "-6" } else { "-4" }, "route", "get", _ip])?.contains(" via ")) }
@@ -167,14 +186,7 @@ pub(crate) fn needs_bypass(dst: &str) -> Result<bool> {
 
 /// The physical egress interface (the default route's device) — for exit-node NAT.
 pub(crate) fn physical_iface() -> Result<Option<String>> {
-    #[cfg(not(target_os = "windows"))]
-    { Ok(default_field(&physical_default()?, "interface:", "dev")) }
-    #[cfg(target_os = "windows")]
-    {
-        let output = apply::output(&["powershell", "-NoProfile", "-Command",
-            "$ErrorActionPreference='Stop'; (Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | Select-Object -First 1).InterfaceAlias"])?;
-        Ok(Some(output.trim().to_string()).filter(|s| !s.is_empty()))
-    }
+    Ok(default_field(&physical_default()?, "interface:", "dev"))
 }
 
 /// Bring up full-tunnel (exit node): the `0.0.0.0/1` + `128.0.0.0/1` split-default
@@ -318,7 +330,8 @@ fn v6_block_cmds(os: RouteOs, dev: &str) -> Vec<Vec<String>> {
             .iter()
             .map(|p| argv(&["route", "-n", "add", "-inet6", "-net", *p, "-reject", "-interface", dev]))
             .collect(),
-        RouteOs::Other | RouteOs::Windows => Vec::new(),
+        RouteOs::Windows => V6_HALVES.iter().map(|p| argv(&["windows-route", "add", p, dev])).collect(),
+        RouteOs::Other => Vec::new(),
     }
 }
 
@@ -333,7 +346,8 @@ fn v6_unblock_cmds(os: RouteOs, dev: &str) -> Vec<Vec<String>> {
             .iter()
             .map(|p| argv(&["route", "-n", "delete", "-inet6", "-net", *p, "-reject", "-interface", dev]))
             .collect(),
-        RouteOs::Other | RouteOs::Windows => Vec::new(),
+        RouteOs::Windows => V6_HALVES.iter().map(|p| argv(&["windows-route", "del", p, dev])).collect(),
+        RouteOs::Other => Vec::new(),
     }
 }
 
@@ -345,6 +359,13 @@ fn v6_legacy_cleanup_cmds(os: RouteOs) -> Vec<Vec<String>> {
 }
 
 fn run_route_command(c: &[String]) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if let [kind, operation, prefix, dev] = c && kind == "windows-route" {
+        return match operation.as_str() {
+            "add" => windows::add(prefix, dev, None), "del" => windows::remove(prefix, dev),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "unknown route operation")),
+        };
+    }
     let refs: Vec<_> = c.iter().map(String::as_str).collect();
     apply::run(&refs).map_err(|mut error| {
         error.kind = if error.exit_code.is_none() { error.kind }
@@ -556,8 +577,9 @@ mod tests {
         assert_eq!(runner.commands[0], ["ip", "-4", "route", "replace", "10.0.0.0/8", "dev", "fp0"]);
         let mut runner = Scripted::new(vec![]);
         let result = route_change_with(RouteOs::Windows, "10.0.0.0/8", "fp0", true, &mut runner);
+        #[cfg(not(windows))]
         assert_eq!(result.as_ref().unwrap_err().kind, std::io::ErrorKind::Unsupported);
-        optional_route_result(RouteOs::Windows, "10.0.0.0/8", result).unwrap();
+        assert!(optional_route_result(RouteOs::Windows, "10.0.0.0/8", result).is_err());
         assert!(runner.commands.is_empty());
     }
 
@@ -632,6 +654,24 @@ mod tests {
         assert!(v6_block_tracked(RouteOs::Linux, "fp0", &mut pending, |command| { calls.push(command.to_vec()); Ok(()) }).unwrap());
         assert_eq!(calls[0], v6_unblock_cmds(RouteOs::Linux, "fp0")[0]);
         assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn windows_guard_uses_ip_helper_operations_and_rolls_back_partial_add() {
+        assert_eq!(v6_block_cmds(RouteOs::Windows, "fp0"), vec![
+            argv(&["windows-route", "add", "::/1", "fp0"]),
+            argv(&["windows-route", "add", "8000::/1", "fp0"]),
+        ]);
+        let mut calls = Vec::new(); let mut pending = Vec::new();
+        assert!(v6_block_tracked(RouteOs::Windows, "fp0", &mut pending, |command| {
+            calls.push(command.to_vec());
+            if command == argv(&["windows-route", "add", "8000::/1", "fp0"]) {
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "route denied"))
+            } else { Ok(()) }
+        }).is_err());
+        assert!(pending.is_empty());
+        assert_eq!(calls.last().unwrap(), &argv(&["windows-route", "del", "::/1", "fp0"]));
+        assert!(calls.iter().all(|command| command.first().unwrap() == "windows-route"));
     }
 
     #[test]
