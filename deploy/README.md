@@ -14,6 +14,23 @@ see the optional configuration in `docker-compose.yml`. `Dockerfile` builds the
 standalone control server. `Containerfile` builds the unified `fluxpeer` binary
 for control, relay and node roles, with `FLUXPEER_DATA_DIR=/data`.
 
+## Control request deadlines
+
+HTTP handlers (including authentication and request body reads) have a 30-second
+deadline. Set `FLUXPEER_CONTROL_HTTP_TIMEOUT_SECS` in the control process environment
+to an integer from 1 to 3600; invalid values warn and fall back to 30. For Compose,
+add it to the control service's `environment`. Expiry returns an empty HTTP 503
+and logs ERROR with the method, route template and elapsed milliseconds. Upgraded
+WebSocket watch connections keep their existing heartbeat/idle lifecycle.
+
+SQLite and PostgreSQL pool acquisition is limited to 5 seconds. Acquisition
+timeouts log ERROR, including in login/watch paths; existing error responses are
+preserved. Requests taking over 1 second log WARN, while other completed requests
+log DEBUG. These request logs omit credentials, query strings and path parameters.
+Deadlines cancel asynchronous work; they cannot preempt synchronous code that
+blocks runtime threads. A timed-out write may already have committed: clients
+must check state before repeating a mutation.
+
 ## Relay identity and registration
 
 Enable the optional relay service and its persistent `fprelaydata` volume:

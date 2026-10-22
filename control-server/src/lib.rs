@@ -18,6 +18,7 @@ pub mod ipam;
 pub mod persistence;
 mod pop;
 mod integrity;
+mod http_limits;
 pub mod sql_store;
 pub mod state;
 
@@ -448,8 +449,11 @@ async fn send_config(socket: &mut WebSocket, store: &Arc<Store>, device_id: &str
 
 // ---- Persistent (SqlStore-backed) variant of the REST API ----
 
-pub(crate) fn internal_error(error: impl std::fmt::Debug) -> StatusCode {
-    tracing::error!(error = ?error, "control request failed");
+pub(crate) fn internal_error(error: SqlStoreError) -> StatusCode {
+    // Pool deadlines are logged at the store boundary, including non-HTTP callers.
+    if !matches!(error, SqlStoreError::Db(sqlx::Error::PoolTimedOut)) {
+        tracing::error!(error = ?error, "control request failed");
+    }
     StatusCode::INTERNAL_SERVER_ERROR
 }
 
@@ -949,7 +953,7 @@ pub fn sql_router(store: Arc<SqlStore>) -> Router {
         .with_state(store)
         .layer(axum::middleware::from_fn(auth::require_admin));
     let api = open.merge(admin).layer(Extension(auth));
-    Router::new().nest("/api/v1", api)
+    http_limits::apply(Router::new().nest("/api/v1", api), http_limits::configured_timeout())
 }
 
 /// Build the control-server router (versioned under `/api/v1`).
@@ -975,7 +979,7 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/relays/:id", put(update_relay))
         .route("/networks/:id/relays", get(list_relays))
         .with_state(store);
-    Router::new().nest("/api/v1", api)
+    http_limits::apply(Router::new().nest("/api/v1", api), http_limits::configured_timeout())
 }
 
 #[cfg(test)]
@@ -1246,3 +1250,6 @@ fn storage_kind(url: &str) -> &'static str {
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod control_hang_tests;

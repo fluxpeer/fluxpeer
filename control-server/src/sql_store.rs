@@ -45,7 +45,18 @@ pub enum SqlStoreError {
     #[error("bad network pool config: {0}")]
     BadPool(String),
     #[error(transparent)]
-    Db(#[from] sqlx::Error),
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for SqlStoreError {
+    fn from(error: sqlx::Error) -> Self {
+        // Log here because login and watch callers can deliberately hide errors
+        // from clients. Never include query parameters or credentials.
+        if matches!(error, sqlx::Error::PoolTimedOut) {
+            tracing::error!(timeout_ms = 5000, "control database pool acquire timed out");
+        }
+        Self::Db(error)
+    }
 }
 
 type Result<T> = std::result::Result<T, SqlStoreError>;
@@ -392,7 +403,10 @@ impl SqlStore {
         Ok(())
     }
     pub async fn record_audit(&self, ts: i64, actor: &str, action: &str) {
-        let _ = db::insert_audit(&self.pool, ts, actor, action).await;
+        if let Err(error) = db::insert_audit(&self.pool, ts, actor, action).await {
+            // Audit remains best-effort, but database failure must be visible.
+            crate::internal_error(error.into());
+        }
     }
     pub async fn recent_audit(&self, limit: i64) -> Result<Vec<crate::domain::AuditEntry>> {
         Ok(db::list_audit(&self.pool, limit).await?)

@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 fluxpeer-sdk = { path = "../sdk/rust" }
-axum = { workspace = true, features = ["json", "http1", "tokio", "ws"] }
+axum = { workspace = true, features = ["json", "http1", "tokio", "ws", "matched-path"] }
 futures-util = { version = "0.3", default-features = false }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
 serde = { workspace = true }
@@ -24,11 +24,11 @@ thiserror = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "any", "sqlite", "postgres"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tower = { version = "0.5", features = ["timeout", "util"] }
 
 [dev-dependencies]
 tempfile = "3"
 base64 = { workspace = true }
-tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.24"
 futures-util = "0.3"

@@ -52,7 +52,12 @@ def run(args, data=None, timeout=40):
         return p.returncode, p.stdout, p.stderr
     except sp.TimeoutExpired as e:
         def txt(v): return v.decode(errors='replace') if isinstance(v, bytes) else (v or '')
+        # A synthetic 124 is an outer command deadline, not curl's exit status.
+        # Keep partial output so API diagnostics can detect a completed response.
         return 124, txt(e.stdout), txt(e.stderr) + '\nHARNESS_TIMEOUT\n'
+
+def outer_timeout(rc, err):
+    return rc == 124 and '\nHARNESS_TIMEOUT\n' in err
 
 def record(label, args, data=None, timeout=40, secret=False):
     global seq
@@ -153,13 +158,78 @@ def host_snapshot(tag):
         (OUT / f'host-{tag}-{label}.txt').write_text(out)
     return snap
 
+def api_timeout_snapshots():
+    # comm excludes argv: an in-flight curl command can carry a bearer header.
+    files = []
+    for label, args in [
+        ('podman-ps', P + ['ps', '-a', '--format', '{{.ID}} {{.Names}} {{.Status}}']),
+        ('host-processes', ['ps', '-eo', 'pid,ppid,stat,etime,comm']),
+        ('control-processes', P + ['top', 'fpe-ctl', 'pid,ppid,state,etime,comm']),
+    ]:
+        _, _, _, fname = record('api-timeout-' + label, args, timeout=3)
+        files.append(fname)
+    return files
+
+def api_curl_metadata(err):
+    metrics, inner_exit = None, None
+    for line in err.splitlines():
+        if line.startswith('FPE_CURL_METRICS '):
+            try:
+                data = json.loads(line.removeprefix('FPE_CURL_METRICS '))
+                code = data['http_code']
+                times = [data['time_starttransfer'], data['time_total']]
+                if isinstance(code, str) and re.fullmatch(r'\d{3}', code) and all(
+                    isinstance(t, (int, float)) and 0 <= t < 86400 for t in times
+                ):
+                    metrics = dict(http_code=code, time_starttransfer=times[0], time_total=times[1])
+            except (ValueError, KeyError, TypeError): pass
+        if re.fullmatch(r'FPE_CURL_EXIT=\d{1,3}', line):
+            inner_exit = int(line.split('=')[1])
+    return metrics, inner_exit
+
 def api(method, path, body=None, token=ADMIN):
-    args = px('fpe-ctl', 'curl', '-fsS', '--max-time', '10', '-X', method,
+    global seq
+    method = method.upper()
+    # 10 s curl < 12 s container timeout (+2 s kill grace) < 20 s outer exec.
+    # The exit marker distinguishes curl completion from a stuck podman exec.
+    wrapper = 'timeout --signal=TERM --kill-after=2s 12s "$@"; rc=$?; printf "\\nFPE_CURL_EXIT=%s\\n" "$rc" >&2; exit "$rc"'
+    metrics = '\nFPE_CURL_METRICS {"http_code":"%{http_code}","time_starttransfer":%{time_starttransfer},"time_total":%{time_total}}\n'
+    args = px('fpe-ctl', 'sh', '-c', wrapper, 'sh', 'curl', '-fsS', '--max-time', '10',
+              '-w', '%{stderr}' + metrics, '-X', method,
               '-H', 'Content-Type: application/json', '-H', f'Authorization: Bearer {token}')
     if body is not None: args += ['--data', json.dumps(body)]
     args += ['http://127.0.0.1:18080/api/v1' + path]
-    out = need(args, timeout=15)
-    return json.loads(out) if out.strip() else None
+    evidence = []
+    for attempt in (1, 2):
+        rc, out, err = run(args, timeout=20)
+        try:
+            value = json.loads(out)
+            complete = True
+        except ValueError:
+            value, complete = None, False
+        outer = outer_timeout(rc, err)
+        retry = method == 'GET' and outer and not complete and attempt == 1
+        curl_metrics, inner_exit = api_curl_metadata(err)
+        seq += 1
+        fname = f'{seq:04d}-{group}-api-{method}-attempt-{attempt}.json'
+        evidence.append(fname)
+        # Responses can contain enroll/admin secrets. Store diagnostics, never
+        # raw response bodies, authorization headers, or arbitrary stderr.
+        detail = dict(method=method, path=re.sub(r'(/invites/)[^/]+', r'\1<redacted>', path.split('?')[0]),
+                      attempt=attempt, command_rc=rc, outer_timeout=outer,
+                      stdout_present=bool(out), stdout_complete_json=complete,
+                      stdout_bytes=len(out.encode()), curl=curl_metrics, container_exit=inner_exit,
+                      retry=retry, retry_reason='GET outer timeout without complete JSON' if retry else None,
+                      classification=('outer_timeout_complete_json' if complete else 'outer_timeout_incomplete_json')
+                          if outer else ('command_failed' if rc else 'completed'), snapshots=[])
+        (OUT / fname).write_text(json.dumps(detail, indent=2) + '\n')
+        if outer:
+            detail['snapshots'] = api_timeout_snapshots()
+            (OUT / fname).write_text(json.dumps(detail, indent=2) + '\n')
+        if retry: continue
+        if rc or (out.strip() and not complete):
+            raise RuntimeError(f'API {method}: rc={rc}; outer_timeout={outer}; complete_json={complete}; evidence={evidence}')
+        return value
 
 def write_container(c, path, text):
     need(P + ['exec', '-i', c, 'sh', '-c', 'cat > "$1"', 'sh', path], text)

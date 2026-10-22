@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import shlex
+import tempfile
 import unittest
 from unittest.mock import Mock
 
@@ -23,7 +25,7 @@ def helpers():
              isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in constants for t in n.targets)]
     ns = dict(json=json, re=re, checks=[], observations=[], group='test', P=['podman'],
               ADMIN='test-only', IMAGE='localhost/fpe-node:t0022', probe_ports=list(range(20000, 20100)),
-              time=Mock(), state={}, os=os)
+              time=Mock(), state={}, os=os, sp=subprocess, shlex=shlex)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SCRIPT), 'exec'), ns)
     return ns
 
@@ -242,6 +244,119 @@ class RelayIdentity(unittest.TestCase):
                 for cfg in ns['settings'](transport=transport):
                     self.assertNotIn('relay_public_key', cfg)
                     self.assertNotIn('relay', cfg)
+
+
+class ApiDiagnostics(unittest.TestCase):
+    METRICS = '\nFPE_CURL_METRICS {"http_code":"200","time_starttransfer":0.012,"time_total":0.015}\nFPE_CURL_EXIT=0\n'
+
+    def setUp(self):
+        self.ns = helpers()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.ns.update(OUT=self.root, seq=0)
+        self.results = []
+        self.calls = []
+        def run(args, data=None, timeout=40):
+            self.calls.append((args, timeout))
+            if 'curl' in args: return self.results.pop(0)
+            return 0, 'process snapshot', ''
+        self.ns['run'] = run
+
+    def evidence(self):
+        return [json.loads(p.read_text()) for p in sorted(self.root.glob('*-api-*-attempt-*.json'))]
+
+    def test_success_records_metrics_and_uses_nested_deadlines_without_secrets(self):
+        self.results = [(0, '{"token":"secret-response"}', self.METRICS)]
+        result = self.ns['api']('POST', '/networks/n/invites/secret-code', {'password': 'secret-body'}, token='secret-header')
+        self.assertEqual(result, {'token': 'secret-response'})
+        data = self.evidence()[0]
+        self.assertEqual(data['curl'], dict(http_code='200', time_starttransfer=0.012, time_total=0.015))
+        self.assertEqual(data['container_exit'], 0)
+        self.assertTrue(data['stdout_complete_json'])
+        self.assertFalse(data['outer_timeout'])
+        args, outer = self.calls[0]
+        wrapper = args[args.index('-c') + 1]
+        self.assertIn('timeout --signal=TERM --kill-after=2s 12s "$@"', wrapper)
+        self.assertGreater(outer, 14)
+        self.assertEqual(args[args.index('--max-time') + 1], '10')
+        self.assertIn('%{stderr}', args[args.index('-w') + 1])
+        for path in self.root.iterdir(): self.assertNotIn('secret-', path.read_text())
+
+    def test_outer_timeout_complete_json_is_not_retried_or_relabelled_success(self):
+        self.results = [(124, '{"id":"net-47"}', self.METRICS + '\nHARNESS_TIMEOUT\n')]
+        with self.assertRaisesRegex(RuntimeError, 'complete_json=True'): self.ns['api']('GET', '/networks')
+        data = self.evidence()[0]
+        self.assertEqual(data['classification'], 'outer_timeout_complete_json')
+        self.assertEqual(data['container_exit'], 0)
+        self.assertFalse(data['retry'])
+        self.assertEqual(len(data['snapshots']), 3)
+        self.assertEqual(len(self.calls), 4)
+        self.assertTrue(all(t == 3 for _, t in self.calls[1:]))
+        self.assertEqual(self.calls[1][0][1:3], ['ps', '-a'])
+        for args, _ in self.calls[2:]: self.assertIn('comm', args[-1])
+        for name in data['snapshots']: self.assertTrue((self.root / name).exists())
+
+    def test_get_incomplete_outer_timeout_retries_once_and_keeps_both_attempts(self):
+        self.results = [(124, '{"id":', '\nHARNESS_TIMEOUT\n'), (0, '[]', self.METRICS)]
+        self.assertEqual(self.ns['api']('GET', '/networks'), [])
+        first, second = self.evidence()
+        self.assertTrue(first['retry'])
+        self.assertIn('GET outer timeout', first['retry_reason'])
+        self.assertFalse(first['stdout_complete_json'])
+        self.assertTrue(second['stdout_complete_json'])
+        self.assertEqual(second['attempt'], 2)
+        self.assertEqual(len(self.calls), 5)
+
+    def test_second_get_timeout_is_terminal(self):
+        self.results = [(124, '', '\nHARNESS_TIMEOUT\n')] * 2
+        with self.assertRaises(RuntimeError): self.ns['api']('GET', '/networks')
+        first, second = self.evidence()
+        self.assertTrue(first['retry'])
+        self.assertFalse(second['retry'])
+        self.assertEqual(len(self.calls), 8)
+
+    def test_writes_never_retry_even_if_output_is_incomplete(self):
+        for method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            with self.subTest(method=method):
+                self.results = [(124, '', '\nHARNESS_TIMEOUT\n')]
+                self.calls.clear()
+                with self.assertRaises(RuntimeError): self.ns['api'](method, '/networks', {})
+                self.assertEqual(len(self.calls), 4)
+                self.assertFalse(self.evidence()[-1]['retry'])
+
+    def test_curl_and_container_failures_are_not_outer_timeouts_and_do_not_retry(self):
+        for rc in (22, 28, 124):
+            with self.subTest(rc=rc):
+                self.results = [(rc, '', f'FPE_CURL_EXIT={rc}\n')]
+                self.calls.clear()
+                with self.assertRaises(RuntimeError): self.ns['api']('GET', '/networks')
+                self.assertEqual(len(self.calls), 1)
+                self.assertFalse(self.evidence()[-1]['outer_timeout'])
+                self.assertFalse(self.evidence()[-1]['retry'])
+
+    def test_invalid_nonempty_response_fails_without_secret_in_exception(self):
+        self.results = [(0, '{"secret-partial":', self.METRICS)]
+        with self.assertRaises(RuntimeError) as raised: self.ns['api']('GET', '/networks')
+        self.assertNotIn('secret-partial', str(raised.exception))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_empty_delete_response_and_unavailable_metrics_are_preserved(self):
+        self.results = [(0, '', 'FPE_CURL_METRICS incomplete\nFPE_CURL_EXIT=0\n')]
+        self.assertIsNone(self.ns['api']('DELETE', '/networks/n'))
+        self.assertIsNone(self.evidence()[0]['curl'])
+
+    def test_run_preserves_partial_bytes_and_identifies_only_outer_deadline(self):
+        ns = helpers()
+        ns['sp'] = Mock(PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired)
+        ns['sp'].run.side_effect = subprocess.TimeoutExpired(['fake'], 20, output=b'{"id":"n"}', stderr=b'partial')
+        rc, out, err = ns['run'](['fake'], timeout=20)
+        self.assertEqual((rc, out), (124, '{"id":"n"}'))
+        self.assertTrue(ns['outer_timeout'](rc, err))
+        ns['sp'].run.side_effect = None
+        ns['sp'].run.return_value = subprocess.CompletedProcess(['fake'], 124, '', 'FPE_CURL_EXIT=124')
+        rc, _, err = ns['run'](['fake'])
+        self.assertFalse(ns['outer_timeout'](rc, err))
 
 
 if __name__ == '__main__': unittest.main()

@@ -210,3 +210,35 @@ async fn http_500_logs_database_root_cause_without_changing_response_body() {
     assert!(output.contains("no such table: device"), "{output}");
     assert!(!output.contains(&token), "bearer credentials must not be logged");
 }
+
+#[tokio::test]
+async fn pool_acquire_timeout_is_visible_and_recovers_after_release() {
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use tower::ServiceExt;
+    use std::io::{Read, Seek};
+    let store = std::sync::Arc::new(SqlStore::connect("sqlite::memory:").await.unwrap());
+    let app = crate::sql_router(store.clone());
+    let held = store.pool.acquire().await.unwrap();
+    let capture = tempfile::tempfile().unwrap();
+    let mut reader = capture.try_clone().unwrap();
+    let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+        .with_max_level(tracing::Level::ERROR).with_writer(move || capture.try_clone().unwrap()).finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(7), app.clone().oneshot(Request::builder()
+        .uri("/api/v1/devices/missing/config").header("authorization", "Bearer private-fixture")
+        .body(Body::empty()).unwrap())).await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+    reader.rewind().unwrap();
+    let mut output = String::new(); reader.read_to_string(&mut output).unwrap();
+    assert_eq!(output.matches("ERROR").count(), 1, "{output}");
+    assert!(output.contains("pool acquire timed out"), "{output}");
+    assert!(!output.contains("private-fixture"));
+    drop(held);
+    tokio::time::timeout(std::time::Duration::from_secs(1), store.list_networks()).await.unwrap().unwrap();
+    let response = app.oneshot(Request::builder().uri("/api/v1/devices/missing/config")
+        .header("authorization", "Bearer private-fixture").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    store.pool.close().await;
+}

@@ -14,6 +14,7 @@ pub async fn connect(url: &str) -> Result<AnyPool, sqlx::Error> {
     sqlx::any::install_default_drivers();
     let sqlite = url.starts_with("sqlite:");
     AnyPoolOptions::new().max_connections(if url == "sqlite::memory:" { 1 } else { 5 })
+        .acquire_timeout(std::time::Duration::from_secs(5))
         .after_connect(move |conn, _| Box::pin(async move {
             if sqlite {
                 // Connection-local settings must also apply to replacement pool
