@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use fp_crypto::x25519::{StaticSecret, PublicKey};
 use fp_transport::link::LinkAuthenticator;
-use fluxpeer_relay_server::auth::ClientAuth;
+use fluxpeer_relay_server::auth::{AuthenticationFailure, ClientAuth};
 use std::time::Duration;
 
 use fluxpeer_relay_server::proto::Frame as RelayFrame;
@@ -135,11 +135,11 @@ pub(crate) async fn connect_relay_bonded(
             .encode(),
         )
         .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        .map_err(transport_error)?;
     let reply = receiver
         .recv()
         .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        .map_err(transport_error)?;
     validate_server_info(&reply)?;
 
     let (in_tx, in_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
@@ -175,6 +175,25 @@ pub(crate) async fn connect_relay_bonded(
         }
     });
     Ok((in_rx, out_tx))
+}
+
+fn transport_error(error: fp_transport::Error) -> std::io::Error {
+    match error {
+        fp_transport::Error::IO(error) => error,
+        error => std::io::Error::other(error),
+    }
+}
+
+#[derive(Default)]
+struct AuthBackoff { failures: u32 }
+impl AuthBackoff {
+    fn failed(&mut self, error: &std::io::Error) -> Duration {
+        if !error.get_ref().is_some_and(|cause| cause.is::<AuthenticationFailure>()) { return Duration::from_millis(500); }
+        let delay = Duration::from_millis(500 * (1u64 << self.failures.min(6))).min(Duration::from_secs(30));
+        self.failures = self.failures.saturating_add(1);
+        delay
+    }
+    fn reset(&mut self) { self.failures = 0; }
 }
 
 fn validate_server_info(bytes: &[u8]) -> std::io::Result<()> {
@@ -230,7 +249,7 @@ pub(crate) async fn dial_relay(t: &RelayTarget, own_priv: &StaticSecret) -> std:
                     tls: None,
                 }, Some(auth.clone()))
                 .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                .map_err(transport_error)?;
             connect_relay_bonded(sender, receiver, own_pub).await
         } else if t.bond {
             if let Some(n) = t.bond_links {
@@ -247,7 +266,7 @@ pub(crate) async fn dial_relay(t: &RelayTarget, own_priv: &StaticSecret) -> std:
                     tls: None,
                 }, Some(auth.clone()))
                 .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                .map_err(transport_error)?;
             connect_relay_bonded(sender, receiver, own_pub).await
         } else {
             // Protect-before-connect (mobile): the relay egress socket must leave
@@ -274,6 +293,7 @@ pub(crate) async fn relay_supervisor(
     carriers: Option<std::sync::Arc<crate::carriers::Cache>>,
 ) {
     let mut idx = 0usize;
+    let mut auth_backoff = AuthBackoff::default();
     let mut retry_delay = Duration::from_millis(500);
     loop {
         let target = {
@@ -291,6 +311,7 @@ pub(crate) async fn relay_supervisor(
         idx = idx.wrapping_add(1);
         let (mut conn_in, conn_out) = match dial_relay(&t, &own_priv).await {
             Ok(c) => {
+                auth_backoff.reset();
                 retry_delay = Duration::from_millis(500);
                 if let Some(cache) = &carriers { cache.connected(targets.borrow().iter().map(|target| target.addr.ip())); }
                 let transport = if t.anytls {
@@ -309,7 +330,11 @@ pub(crate) async fn relay_supervisor(
                     cache.failed_addresses([t.addr.ip()]);
                     if cache.cache_only() && cache.diagnostic().is_some() { retry_delay = (retry_delay * 2).min(Duration::from_secs(30)); }
                 }
-                tokio::time::sleep(retry_delay).await;
+                let delay = auth_backoff.failed(&e).max(retry_delay);
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {},
+                    _ = app_in_tx.closed() => return,
+                }
                 continue;
             }
         };
@@ -380,6 +405,49 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), supervisor).await.unwrap().unwrap();
         fixture.abort();
     }
+    #[tokio::test]
+    async fn wrong_pin_supervisor_reconnects_with_increasing_delay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let server = fluxpeer_relay_server::auth::ServerAuth::new(StaticSecret::from([123; 32]));
+            let mut attempts = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                attempts.push(tokio::time::Instant::now());
+                assert!(server.plain(&mut stream).await.is_err());
+            }
+            attempts
+        });
+        let (_targets, updates) = tokio::sync::watch::channel(vec![RelayTarget {
+            addr, anytls: false, bond: false, bond_links: None, node_id: "fixture".into(),
+            public_key: Some(PublicKey::from(&StaticSecret::from([124;32])).to_bytes()),
+        }]);
+        let (_app_out, outgoing) = mpsc::channel(8);
+        let (incoming, app_in) = mpsc::channel(8);
+        let supervisor = tokio::spawn(relay_supervisor(updates, StaticSecret::from([1;32]), outgoing, incoming, None));
+        let attempts = tokio::time::timeout(Duration::from_secs(5), fixture).await.unwrap().unwrap();
+        assert!(attempts[1] - attempts[0] >= Duration::from_millis(500));
+        assert!(attempts[2] - attempts[1] >= Duration::from_millis(1000));
+        drop(app_in);
+        tokio::time::timeout(Duration::from_millis(200), supervisor).await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn authentication_backoff_caps_resets_and_preserves_network_delay() {
+        let mut backoff = AuthBackoff::default();
+        let auth = transport_error(fp_transport::Error::IO(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+            AuthenticationFailure(fp_transport::link::denied("invalid relay key confirmation")))));
+        for millis in [500, 1000, 2000, 4000, 8000, 16000, 30000, 30000] {
+            assert_eq!(backoff.failed(&auth), Duration::from_millis(millis));
+            for kind in [std::io::ErrorKind::ConnectionRefused, std::io::ErrorKind::PermissionDenied, std::io::ErrorKind::TimedOut] {
+                assert_eq!(backoff.failed(&std::io::Error::from(kind)), Duration::from_millis(500));
+            }
+        }
+        backoff.reset();
+        assert_eq!(backoff.failed(&auth), Duration::from_millis(500));
+    }
+
     #[test]
     fn rejects_wrong_server_info_version_and_frame_kind() {
         assert!(validate_server_info(&RelayFrame::ServerInfo { protocol_version: 1 }.encode()).is_err());

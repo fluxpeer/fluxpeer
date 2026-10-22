@@ -156,3 +156,17 @@ async fn failed_spawn_releases_reservation_and_retains_error_for_retry() {
     assert_eq!(daemon.set_iface(&iface, false).await["ok"], true);
     assert!(!daemon.processes.needs_cleanup(&iface));
 }
+
+#[tokio::test]
+async fn vanished_tun_allows_stop_and_token_authorized_shutdown() {
+    let (_dir, mut daemon, iface) = fixture();
+    daemon.remove_link = Some(|iface| Err(crate::apply::test_support::error(
+        Some(1), &format!("Cannot find device \"{iface}\""),
+    )));
+    daemon.processes.spawn(&iface, Command::new("/bin/sh").args(["-c", "exit 0"])).unwrap();
+    until(|| !daemon.processes.contains(&iface)).await;
+    daemon.stop_iface(&iface).await.unwrap();
+    assert_eq!(request(&daemon, json!({"cmd":"shutdown","auth":"test-token"})).await,
+        json!({"ok":true,"shutdown":true}));
+    timeout(Duration::from_millis(100), daemon.exit.notified()).await.unwrap();
+}

@@ -26,6 +26,7 @@ impl ApplyError {
     pub fn missing(&self) -> bool {
         self.stderr.contains("No such process") || self.stderr.contains("No such file or directory")
             || self.stderr.contains("not in table") || self.stderr.contains("does not exist")
+            || self.stderr.contains("Cannot find device")
     }
 }
 
@@ -383,6 +384,26 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn missing_targets_match_tool_diagnostics_without_hiding_other_failures() {
+        for stderr in [
+            "Cannot find device \"fpauthz\"", // ip link del / ip route del
+            "Device does not exist", // iproute2
+            "Device \"fp0\" does not exist.", // ip link show
+            "RTNETLINK answers: No such process", // ip route del
+            "Error: Could not process rule: No such file or directory", // nft delete
+            "iptables: No chain/target/match by that name.", // handled by firewall, not missing()
+            "route: not in table", // BSD route delete
+        ] {
+            let error = test_support::error(Some(1), stderr);
+            let expected = !stderr.starts_with("iptables:");
+            assert_eq!(error.missing(), expected, "{stderr}");
+        }
+        for stderr in ["Operation not permitted", "Permission denied", "RTNETLINK answers: Device or resource busy", "syntax error", "Invalid argument"] {
+            assert!(!test_support::error(Some(1), stderr).missing(), "{stderr}");
+        }
+    }
 
     #[test]
     fn identical_errors_log_once_and_changes_and_recovery_log_again() {

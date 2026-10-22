@@ -81,7 +81,7 @@ impl Auth {
         // changes also invalidate sessions issued concurrently on another instance.
         let current = match self.store.admin_hash(&session.username).await {
             Ok(current) => current,
-            Err(error) => { tracing::warn!(%error, "admin session account lookup failed"); return Err(StatusCode::INTERNAL_SERVER_ERROR); }
+            Err(error) => return Err(crate::internal_error(error)),
         };
         if session.expiry > Instant::now() && current.as_deref() == Some(&session.password_hash) {
             Ok(Some(session.username))
@@ -278,7 +278,7 @@ pub async fn admin_change_password(
         .await
     {
         Ok(()) => { auth.revoke_sessions(&user); StatusCode::NO_CONTENT },
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(error) => crate::internal_error(error),
     }
 }
 
@@ -288,7 +288,7 @@ pub async fn list_admins(Extension(auth): Extension<Arc<Auth>>) -> Result<Json<V
         .list_admins()
         .await
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(crate::internal_error)
 }
 
 #[derive(Deserialize)]
@@ -311,7 +311,7 @@ pub async fn create_admin(Extension(auth): Extension<Arc<Auth>>, Json(req): Json
         .await
     {
         Ok(()) => StatusCode::CREATED,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(error) => crate::internal_error(error),
     }
 }
 
@@ -327,12 +327,12 @@ pub async fn delete_admin(
     }
     match auth.store.count_admins().await {
         Ok(n) if n <= 1 => return StatusCode::BAD_REQUEST, // keep at least one
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        Err(error) => return crate::internal_error(error),
         _ => {}
     }
     match auth.store.delete_admin(&username).await {
         Ok(()) => { auth.revoke_sessions(&username); StatusCode::NO_CONTENT },
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(error) => crate::internal_error(error),
     }
 }
 
@@ -344,7 +344,7 @@ pub async fn audit_log(
         .recent_audit(200)
         .await
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(crate::internal_error)
 }
 
 /// Middleware: require a valid bearer on the management routes. Records an audit

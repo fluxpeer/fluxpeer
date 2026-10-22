@@ -128,6 +128,12 @@ impl LinkAuthenticator for ServerAuth {
     }
 }
 
+/// Marks a failed relay identity exchange while retaining its underlying cause.
+/// Socket/TLS dialing errors carry no such marker and keep network retry policy.
+#[derive(Debug, thiserror::Error)]
+#[error("relay authentication failed: {0}")]
+pub struct AuthenticationFailure(#[source] pub io::Error);
+
 pub struct ClientAuth {
     secret: StaticSecret,
     relay: [u8; 32],
@@ -141,22 +147,31 @@ impl ClientAuth {
 impl LinkAuthenticator for ClientAuth {
     async fn server(&self, _: &mut dyn LinkIo, _: [u8; 16], _: u32) -> io::Result<LinkSessionRef> { Err(denied("client authenticator used as server")) }
     async fn client(&self, io: &mut dyn LinkIo, bond: [u8; 16], index: u32) -> io::Result<LinkSessionRef> {
-        let (session, nonce) = if index == 0 {
-            let shared = shared(&self.secret, self.relay)?;
-            let peer = self.public_key();
-            io.write_u32(2).await?; io.write_all(&peer).await?; io.flush().await?;
-            let mut challenge = [0; 32]; io.read_exact(&mut challenge).await?;
-            io.write_all(&tag(shared.as_bytes(), &[AUTH, &challenge, &peer])?).await?; io.flush().await?;
-            (Session::new(peer, tag(shared.as_bytes(), &[LINK, &bond, &challenge])?), [0; 32])
-        } else {
-            let session = self.group.lock().as_ref().filter(|(id, s)| *id == bond && s.active()).map(|(_, s)| s.clone()).ok_or_else(|| denied("client bond is not authenticated"))?;
-            let mut challenge = [0; 32]; io.read_exact(&mut challenge).await?;
-            io.write_all(&session.proof(&challenge, &bond, index)?).await?; io.flush().await?; (session, challenge)
+        let exchange = async {
+            let (session, nonce) = if index == 0 {
+                let shared = shared(&self.secret, self.relay)?;
+                let peer = self.public_key();
+                io.write_u32(2).await?; io.write_all(&peer).await?; io.flush().await?;
+                let mut challenge = [0; 32]; io.read_exact(&mut challenge).await?;
+                io.write_all(&tag(shared.as_bytes(), &[AUTH, &challenge, &peer])?).await?; io.flush().await?;
+                (Session::new(peer, tag(shared.as_bytes(), &[LINK, &bond, &challenge])?), [0; 32])
+            } else {
+                let session = self.group.lock().as_ref().filter(|(id, s)| *id == bond && s.active()).map(|(_, s)| s.clone()).ok_or_else(|| denied("client bond is not authenticated"))?;
+                let mut challenge = [0; 32]; io.read_exact(&mut challenge).await?;
+                io.write_all(&session.proof(&challenge, &bond, index)?).await?; io.flush().await?; (session, challenge)
+            };
+            let mut confirmation = [0; 32]; io.read_exact(&mut confirmation).await?;
+            session.verify_confirmation(&bond, index, &nonce, &confirmation)?;
+            if index == 0 { *self.group.lock() = Some((bond, session.clone())); }
+            Ok(session as LinkSessionRef)
         };
-        let mut confirmation = [0; 32]; io.read_exact(&mut confirmation).await?;
-        session.verify_confirmation(&bond, index, &nonce, &confirmation)?;
-        if index == 0 { *self.group.lock() = Some((bond, session.clone())); }
-        Ok(session)
+        exchange.await.map_err(|error: io::Error| {
+            let closed = matches!(error.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe);
+            if closed || (error.kind() == io::ErrorKind::PermissionDenied && error.raw_os_error().is_none()) {
+                io::Error::new(io::ErrorKind::PermissionDenied, AuthenticationFailure(error))
+            } else { error }
+        })
     }
 }
 

@@ -142,3 +142,71 @@ async fn hot_device_writes_reject_missing_revoked_and_networkless_devices() {
         assert!(db::get_device_endpoints(&s.pool, id).await.unwrap().is_empty());
     }
 }
+
+#[tokio::test]
+async fn file_sqlite_pool_settings_and_writer_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}?mode=rwc", dir.path().join("busy.db").display());
+    let store = SqlStore::connect(&url).await.unwrap();
+    let other = SqlStore::connect(&url).await.unwrap();
+    // Hold all connections at once, including newly created pool connections.
+    let mut connections = Vec::new();
+    for _ in 0..5 { connections.push(store.pool.acquire().await.unwrap()); }
+    for conn in &mut connections {
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode").fetch_one(&mut **conn).await.unwrap();
+        let busy: i64 = sqlx::query_scalar("PRAGMA busy_timeout").fetch_one(&mut **conn).await.unwrap();
+        let sync: i64 = sqlx::query_scalar("PRAGMA synchronous").fetch_one(&mut **conn).await.unwrap();
+        assert_eq!(mode, "wal"); assert_eq!(busy, 5000); assert_eq!(sync, 1);
+    }
+    drop(connections);
+    let mut first = crate::integrity::begin(&store.pool).await.unwrap();
+    sqlx::query("UPDATE control_sequence SET value = 700 WHERE name = 'entity'").execute(&mut *first).await.unwrap();
+    let waiter = tokio::spawn(async move {
+        let mut second = crate::integrity::begin(&other.pool).await.unwrap();
+        let value: i64 = sqlx::query_scalar("SELECT value FROM control_sequence WHERE name = 'entity'")
+            .fetch_one(&mut *second).await.unwrap();
+        assert_eq!(value, 700, "writer must read after obtaining the reservation");
+        second.commit().await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!waiter.is_finished(), "writer must wait instead of failing an upgrade");
+    // WAL allows a pooled reader to proceed while the write reservation is held.
+    let value: i64 = sqlx::query_scalar("SELECT value FROM control_sequence WHERE name = 'entity'")
+        .fetch_one(&store.pool).await.unwrap();
+    assert_ne!(value, 700);
+    first.commit().await.unwrap();
+    waiter.await.unwrap();
+    store.pool.close().await;
+}
+
+#[tokio::test]
+async fn http_500_logs_database_root_cause_without_changing_response_body() {
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use std::io::{Read, Seek};
+    let store = std::sync::Arc::new(SqlStore::connect("sqlite::memory:").await.unwrap());
+    let net = store.create_network("error-log").await.unwrap();
+    let invite = store.create_invite(&net.id, None, None).await.unwrap();
+    let (device, token) = store.enroll(&invite.code, "fixture", &hex::encode([54;32]), 0).await.unwrap();
+    let app = crate::sql_router(store.clone());
+    let capture = tempfile::tempfile().unwrap();
+    let mut reader = capture.try_clone().unwrap();
+    let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+        .with_max_level(tracing::Level::ERROR).with_writer(move || capture.try_clone().unwrap()).finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    // The first failure passes sql_status; the second fails in device auth.
+    for table in ["route", "device"] {
+        sqlx::query(&format!("DROP TABLE {table}")).execute(&store.pool).await.unwrap();
+        let response = app.clone().oneshot(Request::builder().uri(format!("/api/v1/devices/{}/config", device.id))
+            .header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.into_body().collect().await.unwrap().to_bytes().is_empty());
+    }
+    reader.rewind().unwrap();
+    let mut output = String::new(); reader.read_to_string(&mut output).unwrap();
+    assert_eq!(output.matches("ERROR").count(), 2, "{output}");
+    assert!(output.contains("no such table: route"), "{output}");
+    assert!(output.contains("no such table: device"), "{output}");
+    assert!(!output.contains(&token), "bearer credentials must not be logged");
+}

@@ -8,6 +8,10 @@ use sqlx::{Any, AnyConnection, AnyPool, Row, Transaction};
 /// row lock on PostgreSQL and a writer reservation on SQLite. It also serializes
 /// imports and ID allocation across distinct stores/processes, not just tasks.
 pub(crate) async fn begin(pool: &AnyPool) -> Result<Transaction<'_, Any>, sqlx::Error> {
+    // The first statement is a write, with no preceding SELECT/snapshot:
+    // SQLite reserves the writer here just as BEGIN IMMEDIATE would, so it
+    // waits via busy_timeout instead of attempting a read-to-write upgrade.
+    // PostgreSQL retains its existing row-level lock semantics.
     let mut tx = pool.begin().await?;
     let locked = sqlx::query("UPDATE control_sequence SET value = value WHERE name = 'entity'")
         .execute(&mut *tx).await?.rows_affected();

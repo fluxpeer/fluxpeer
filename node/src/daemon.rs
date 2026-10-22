@@ -34,6 +34,8 @@ struct Daemon {
     pf_base: PathBuf,
     protected_members: parking_lot::Mutex<std::collections::HashSet<String>>,
     exit: tokio::sync::Notify,
+    #[cfg(test)]
+    remove_link: Option<fn(String) -> crate::apply::Result>,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -413,7 +415,7 @@ impl Daemon {
     fn new(dir: PathBuf, token: String) -> Self {
         #[cfg(target_os = "macos")]
         let pf_base = if cfg!(test) { dir.join("pf") } else { PathBuf::from(crate::firewall::pf::BASE) };
-        Self { #[cfg(target_os = "macos")] pf_base, dir, token, processes: Processes::default(), admission: tokio::sync::Mutex::new(()), guard_root: PathBuf::from(crate::carriers::ROOT), protected_members: parking_lot::Mutex::default(), exit: tokio::sync::Notify::new() }
+        Self { #[cfg(test)] remove_link: None, #[cfg(target_os = "macos")] pf_base, dir, token, processes: Processes::default(), admission: tokio::sync::Mutex::new(()), guard_root: PathBuf::from(crate::carriers::ROOT), protected_members: parking_lot::Mutex::default(), exit: tokio::sync::Notify::new() }
     }
 
     // Cover validation, config writes, stop/restart and spawn registration with
@@ -491,10 +493,17 @@ impl Daemon {
         }
         if let Err(error) = std::fs::remove_file(crate::statusd::socket_path(iface))
             && error.kind() != std::io::ErrorKind::NotFound { return Err(error); }
+        #[cfg(all(test, not(target_os = "linux")))]
+        if let Some(remove) = self.remove_link {
+            cleanup_link_with(iface.to_string(), remove).await.map_err(std::io::Error::other)?;
+        }
         #[cfg(target_os = "linux")]
-        cleanup_link_with(iface.to_string(), |iface| {
-            crate::apply::run(&["ip", "link", "del", "dev", &iface])
-        }).await.map_err(std::io::Error::other)?;
+        {
+            let remove: fn(String) -> crate::apply::Result = |iface| crate::apply::run(&["ip", "link", "del", "dev", &iface]);
+            #[cfg(test)]
+            let remove = self.remove_link.unwrap_or(remove);
+            cleanup_link_with(iface.to_string(), remove).await.map_err(std::io::Error::other)?;
+        }
         stopped?;
         self.processes.cleaned(iface);
         Ok(())

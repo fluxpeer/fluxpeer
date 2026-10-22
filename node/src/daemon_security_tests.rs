@@ -285,5 +285,5 @@ async fn daemon_link_cleanup_runs_off_async_worker_and_preserves_errors() {
     let denied = crate::apply::test_support::error(Some(1), "Operation not permitted");
     let expected = denied.clone();
     assert_eq!(cleanup_link_with("fp-test".into(), |_| Err(denied)).await, Err(expected));
-    cleanup_link_with("fp-test".into(), |_| Err(crate::apply::test_support::error(Some(1), "Cannot find device: does not exist"))).await.unwrap();
+    cleanup_link_with("fp-test".into(), |_| Err(crate::apply::test_support::error(Some(1), "Cannot find device \"fp-test\""))).await.unwrap();
 }

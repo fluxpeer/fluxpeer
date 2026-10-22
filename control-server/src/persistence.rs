@@ -12,7 +12,18 @@ use sqlx::{AnyPool, Row};
 /// Connect to a database by URL (e.g. `postgres://…` or `sqlite::memory:`).
 pub async fn connect(url: &str) -> Result<AnyPool, sqlx::Error> {
     sqlx::any::install_default_drivers();
-    AnyPoolOptions::new().max_connections(if url == "sqlite::memory:" { 1 } else { 5 }).connect(url).await
+    let sqlite = url.starts_with("sqlite:");
+    AnyPoolOptions::new().max_connections(if url == "sqlite::memory:" { 1 } else { 5 })
+        .after_connect(move |conn, _| Box::pin(async move {
+            if sqlite {
+                // Connection-local settings must also apply to replacement pool
+                // connections. In-memory SQLite keeps its memory journal mode.
+                sqlx::query("PRAGMA busy_timeout = 5000").execute(&mut *conn).await?;
+                sqlx::query("PRAGMA journal_mode = WAL").execute(&mut *conn).await?;
+                sqlx::query("PRAGMA synchronous = NORMAL").execute(&mut *conn).await?;
+            }
+            Ok(())
+        })).connect(url).await
 }
 
 /// Create the schema if absent (portable across SQLite + PostgreSQL).

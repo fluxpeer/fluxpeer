@@ -448,6 +448,11 @@ async fn send_config(socket: &mut WebSocket, store: &Arc<Store>, device_id: &str
 
 // ---- Persistent (SqlStore-backed) variant of the REST API ----
 
+pub(crate) fn internal_error(error: impl std::fmt::Debug) -> StatusCode {
+    tracing::error!(error = ?error, "control request failed");
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
 fn sql_status(e: SqlStoreError) -> StatusCode {
     match e {
         SqlStoreError::NetworkNotFound | SqlStoreError::DeviceNotFound | SqlStoreError::RouteNotFound | SqlStoreError::RelayNotFound => {
@@ -457,7 +462,7 @@ fn sql_status(e: SqlStoreError) -> StatusCode {
         SqlStoreError::InvalidInvite => StatusCode::FORBIDDEN,
         SqlStoreError::PoolExhausted => StatusCode::CONFLICT,
         SqlStoreError::Db(ref error) if error.as_database_error().is_some_and(|e| e.is_unique_violation()) => StatusCode::CONFLICT,
-        SqlStoreError::BadPool(_) | SqlStoreError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        SqlStoreError::BadPool(_) | SqlStoreError::Db(_) => internal_error(e),
     }
 }
 
@@ -621,7 +626,7 @@ async fn require_device(s: &SqlStore, headers: &axum::http::HeaderMap, device_id
     match s.device_token(device_id).await {
         Ok(Some(stored)) if ct_eq(stored.as_bytes(), tok.as_bytes()) => Ok(()),
         Ok(_) => Err(StatusCode::UNAUTHORIZED),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => Err(internal_error(error)),
     }
 }
 
@@ -631,9 +636,9 @@ async fn require_device(s: &SqlStore, headers: &axum::http::HeaderMap, device_id
 async fn require_device_read(s: &SqlStore, auth: &auth::Auth, headers: &axum::http::HeaderMap, device_id: &str) -> Result<(), StatusCode> {
     let token = bearer_token(headers).filter(|token| !token.is_empty()).ok_or(StatusCode::UNAUTHORIZED)?;
     if auth.valid_bearer(token).await? { return Ok(()); }
-    let stored = s.device_token(device_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let stored = s.device_token(device_id).await.map_err(internal_error)?;
     if stored.is_some_and(|stored| ct_eq(stored.as_bytes(), token.as_bytes())) { return Ok(()); }
-    if s.has_device_token(token).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+    if s.has_device_token(token).await.map_err(internal_error)? {
         return Err(StatusCode::FORBIDDEN);
     }
     Err(StatusCode::UNAUTHORIZED)

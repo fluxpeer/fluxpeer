@@ -217,3 +217,24 @@ fn identity_path_precedence_and_system_default() {
     assert_eq!(resolve_identity_path(None, Some("env.key".into()), Some("state".into())), PathBuf::from("env.key"));
     assert_eq!(resolve_identity_path(Some("cli.key".into()), Some("env.key".into()), Some("state".into())), PathBuf::from("cli.key"));
 }
+
+#[tokio::test]
+async fn closure_before_confirmation_and_bad_mac_are_auth_failures() {
+    for bad_mac in [false, true] {
+        let (_server, client) = pair();
+        let (mut local, mut remote) = tokio::io::duplex(256);
+        let fixture = async move {
+            let mut hello = [0; 36]; remote.read_exact(&mut hello).await.unwrap();
+            remote.write_all(&[19; 32]).await.unwrap();
+            let mut proof = [0; 32]; remote.read_exact(&mut proof).await.unwrap();
+            if bad_mac { remote.write_all(&[0; 32]).await.unwrap(); }
+            // Wrong pin makes the real relay close here, without confirmation.
+        };
+        let (result, ()) = tokio::join!(client.client(&mut local, [0; 16], 0), fixture);
+        let error = result.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.get_ref().unwrap().is::<AuthenticationFailure>());
+        let cause = &error.get_ref().unwrap().downcast_ref::<AuthenticationFailure>().unwrap().0;
+        assert_eq!(cause.kind(), if bad_mac { io::ErrorKind::PermissionDenied } else { io::ErrorKind::UnexpectedEof });
+    }
+}
