@@ -86,6 +86,11 @@ impl SqlStore {
             .subscribe()
     }
 
+    #[cfg(test)]
+    pub(crate) fn watcher_count(&self, id: &str) -> usize {
+        self.epoch_tx.lock().get(id).map_or(0, watch::Sender::receiver_count)
+    }
+
     /// The network a device belongs to (if any).
     pub async fn network_of(&self, device_id: &str) -> Result<Option<String>> {
         Ok(db::get_device(&self.pool, device_id).await?.map(|d| d.network_id))
@@ -150,7 +155,8 @@ impl SqlStore {
         expires_at: Option<i64>,
         max_uses: Option<u32>,
     ) -> Result<Invite> {
-        if db::get_network(&self.pool, network_id).await?.is_none() {
+        let mut tx = crate::integrity::begin(&self.pool).await?;
+        if db::get_network(&mut *tx, network_id).await?.is_none() {
             return Err(SqlStoreError::NetworkNotFound);
         }
         let invite = Invite {
@@ -162,8 +168,51 @@ impl SqlStore {
             max_uses,
             uses: 0,
         };
-        db::insert_invite(&self.pool, &invite).await?;
+        db::insert_invite(&mut *tx, &invite).await?;
+        tx.commit().await?;
         Ok(invite)
+    }
+
+    /// Serialize lifecycle changes with enrollment and import across processes.
+    pub async fn delete_network(&self, network_id: &str) -> Result<()> {
+        let mut tx = crate::integrity::begin(&self.pool).await?;
+        let net = db::get_network(&mut *tx, network_id).await?.ok_or(SqlStoreError::NetworkNotFound)?;
+        sqlx::query("UPDATE device SET status = 'revoked', auth_token = NULL, address_v4 = NULL, address_v6 = NULL WHERE network_id = $1")
+            .bind(network_id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM device_stats WHERE device_id IN (SELECT id FROM device WHERE network_id = $1)")
+            .bind(network_id).execute(&mut *tx).await?;
+        for query in ["DELETE FROM invite WHERE network_id = $1", "DELETE FROM route WHERE network_id = $1", "DELETE FROM relay WHERE network_id = $1"] {
+            sqlx::query(query).bind(network_id).execute(&mut *tx).await?;
+        }
+        db::bump_network_epoch(&mut *tx, network_id).await?;
+        sqlx::query("DELETE FROM network WHERE id = $1").bind(network_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        // Publish only after commit, then close the deleted network's broadcaster.
+        if let Some(sender) = self.epoch_tx.lock().remove(network_id) {
+            sender.send_replace(net.config_epoch.saturating_add(1));
+        }
+        Ok(())
+    }
+
+    pub async fn revoke_invite(&self, network_id: &str, code: &str) -> Result<()> {
+        let mut tx = crate::integrity::begin(&self.pool).await?;
+        if db::get_network(&mut *tx, network_id).await?.is_none() { return Err(SqlStoreError::NetworkNotFound); }
+        let affected = sqlx::query("DELETE FROM invite WHERE network_id = $1 AND code = $2")
+            .bind(network_id).bind(code).execute(&mut *tx).await?.rows_affected();
+        if affected == 0 { return Err(SqlStoreError::InvalidInvite); }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn token_network(&self, token: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT network_id FROM device WHERE auth_token = $1 AND status = 'active' AND EXISTS (SELECT 1 FROM network WHERE network.id = device.network_id) LIMIT 1")
+            .bind(token).fetch_optional(&self.pool).await?)
+    }
+
+    pub(crate) async fn resolve(&self, network_id: &str, name: &str) -> Result<Device> {
+        self.list_devices(network_id).await?.into_iter()
+            .find(|device| device.name == name && device.status == DeviceStatus::Active)
+            .ok_or(SqlStoreError::DeviceNotFound)
     }
 
     /// Redeem an invite and enroll a device. Returns the device AND a freshly-issued
@@ -416,17 +465,20 @@ impl SqlStore {
     /// Advertise a subnet route from a device (created UNAPPROVED — no config effect
     /// until approved, so no epoch bump yet).
     pub async fn advertise_route(&self, device_id: &str, prefix: &str) -> Result<Route> {
-        let dev = db::get_device(&self.pool, device_id)
+        let mut tx = crate::integrity::begin(&self.pool).await?;
+        let dev = db::get_device(&mut *tx, device_id)
             .await?
             .ok_or(SqlStoreError::DeviceNotFound)?;
+        if dev.status != DeviceStatus::Active || db::get_network(&mut *tx, &dev.network_id).await?.is_none() { return Err(SqlStoreError::DeviceNotFound); }
         let route = Route {
-            id: format!("route-{}", self.next_seq().await?),
+            id: format!("route-{}", crate::integrity::next(&mut tx).await?),
             network_id: dev.network_id,
             device_id: device_id.to_string(),
             prefix: normalize_prefix(prefix).ok_or(SqlStoreError::InvalidPrefix)?,
             approved: false,
         };
-        db::insert_route(&self.pool, &route).await?;
+        db::insert_route(&mut *tx, &route).await?;
+        tx.commit().await?;
         Ok(route)
     }
 
@@ -457,9 +509,22 @@ impl SqlStore {
         Ok(())
     }
 
+    /// Lock only the active device row, also conflicting with revoke/cascade.
+    /// A no-op UPDATE is portable to PostgreSQL and SQLite and obtains the write
+    /// lock before any read, without touching the global entity sequence.
+    async fn lock_active_device(conn: &mut sqlx::AnyConnection, device_id: &str) -> Result<()> {
+        let locked = sqlx::query("UPDATE device SET status = status WHERE id = $1 AND status = 'active' AND EXISTS (SELECT 1 FROM network WHERE network.id = device.network_id)")
+            .bind(device_id).execute(conn).await?.rows_affected();
+        if locked != 1 { return Err(SqlStoreError::DeviceNotFound); }
+        Ok(())
+    }
+
     /// Record a node-reported traffic stats sample (cumulative rx/tx + per-peer blob).
     pub async fn report_stats(&self, device_id: &str, rx: i64, tx: i64, peers_json: &str, at: i64) -> Result<()> {
-        db::upsert_device_stats(&self.pool, device_id, rx, tx, peers_json, at).await?;
+        let mut transaction = self.pool.begin().await?;
+        Self::lock_active_device(&mut transaction, device_id).await?;
+        db::upsert_device_stats(&mut *transaction, device_id, rx, tx, peers_json, at).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -562,8 +627,10 @@ impl SqlStore {
         stun_url: Option<String>,
         node_id: Option<String>,
     ) -> Result<RelayNode> {
+        let mut tx = crate::integrity::begin(&self.pool).await?;
+        if let Some(id) = &network_id && db::get_network(&mut *tx, id).await?.is_none() { return Err(SqlStoreError::NetworkNotFound); }
         let relay = RelayNode {
-            id: format!("relay-{}", self.next_seq().await?),
+            id: format!("relay-{}", crate::integrity::next(&mut tx).await?),
             region: region.to_string(),
             url: url.to_string(),
             network_id,
@@ -571,7 +638,8 @@ impl SqlStore {
             stun_url: stun_url.or_else(|| Some(url.to_string())),
             node_id,
         };
-        db::insert_relay(&self.pool, &relay).await?;
+        db::insert_relay(&mut *tx, &relay).await?;
+        tx.commit().await?;
         Ok(relay)
     }
 
@@ -583,11 +651,15 @@ impl SqlStore {
     /// A device reports its current candidate endpoints; peers pick them up on
     /// their next config-pull/push (epoch bumped to notify watchers).
     pub async fn set_endpoints(&self, device_id: &str, endpoints: &[String]) -> Result<()> {
-        let device = db::get_device(&self.pool, device_id)
+        let mut tx = self.pool.begin().await?;
+        Self::lock_active_device(&mut tx, device_id).await?;
+        let device = db::get_device(&mut *tx, device_id)
             .await?
             .ok_or(SqlStoreError::DeviceNotFound)?;
-        db::set_device_endpoints(&self.pool, device_id, endpoints).await?;
-        self.bump_and_notify(&device.network_id).await?;
+        db::set_device_endpoints(&mut *tx, device_id, endpoints).await?;
+        db::bump_network_epoch(&mut *tx, &device.network_id).await?;
+        tx.commit().await?;
+        self.notify(&device.network_id).await;
         Ok(())
     }
 }
@@ -833,3 +905,7 @@ mod test {
 #[cfg(test)]
 #[path = "integrity_tests.rs"]
 mod integrity_tests;
+
+#[cfg(test)]
+#[path = "sql_lifecycle_tests.rs"]
+mod lifecycle_tests;

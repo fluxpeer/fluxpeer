@@ -254,8 +254,8 @@ async fn revoked_address_migration_recycles_without_losing_tombstone_or_routes()
     let (_dir, _url, store) = fixture().await;
     let net = store.create_network("recycled").await.unwrap();
     legacy_rows(&store, &net.id, &[key(1), key(2)], &[Some("100.72.16.100"), Some("100.72.16.100")]).await;
-    sqlx::query("UPDATE device SET status = 'revoked', auth_token = 'old-token' WHERE id = 'dev-100'").execute(&store.pool).await.unwrap();
     let route = store.advertise_route("dev-100", "10.0.0.0/24").await.unwrap();
+    sqlx::query("UPDATE device SET status = 'revoked', auth_token = 'old-token' WHERE id = 'dev-100'").execute(&store.pool).await.unwrap();
     db::migrate(&store.pool).await.unwrap();
     let revoked = db::get_device(&store.pool, "dev-100").await.unwrap().unwrap();
     assert_eq!(revoked.status, DeviceStatus::Revoked);

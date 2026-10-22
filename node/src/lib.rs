@@ -624,12 +624,15 @@ impl Reconciler {
     async fn run(mut self) -> std::io::Result<()> {
         let mut iv = tokio::time::interval(Duration::from_secs(2));
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut retry_delay = Duration::from_secs(2);
         loop {
             iv.tick().await;
             match self.host.shutdown.try_lock().map(|stopped| *stopped) {
                 Some(true) => return Ok(()), None => continue, Some(false) => {}
             }
             let result = self.reconcile_tick().await;
+            retry_delay = if result.is_err() { (retry_delay * 2).min(Duration::from_secs(30)) } else { Duration::from_secs(2) };
+            iv.reset_after(retry_delay);
             self.apply_status.lock().complete(self.desired_epoch, result);
             if let Some(error) = self.terminal_control.take() {
                 return Err(error);
@@ -644,16 +647,20 @@ impl Reconciler {
         let changed = self.directory.as_ref().is_some_and(|d| d.pending.is_some());
         let applied_epoch = if changed { None } else { self.apply_status.lock().applied_epoch };
         let mut publish_directory = !changed;
+        let mut control_result = Ok(());
         match control::poll_peers_if_changed(&self.client, &self.device_id, applied_epoch).await {
             Ok(Some(snap)) => { self.pending = Some(snap); publish_directory = true; },
             Ok(None) => {}
             Err(error) => {
                 let failure = ApplyError::new(&["control", "device-config"], error.to_string());
-                self.terminal_control = Some(error);
-                return Err(failure);
+                if control::terminal_control_error(&error) {
+                    self.terminal_control = Some(error);
+                    return Err(failure);
+                }
+                control_result = Err(failure);
             }
         }
-        self.reconcile_effects().await?;
+        apply::all([self.reconcile_effects().await, control_result])?;
         if publish_directory && let Some(directory) = self.directory.as_mut() && let Some(targets) = directory.pending.take() {
             directory.targets.send_replace(targets);
             self.directory = None;
@@ -879,7 +886,21 @@ fn bind_reuse_udp(port: u16) -> std::io::Result<UdpSocket> {
 /// Bring up the tunnels from a config FILE (desktop/server: we create the device).
 pub async fn run(cfg_path: &str) -> std::io::Result<()> {
     let cfg: Config = serde_json::from_slice(&std::fs::read(cfg_path)?)?;
-    run_with(cfg, None, None).await
+    if !daemon::valid_iface(&cfg.tun_name) { return Err(std::io::Error::other("invalid interface name")); }
+    let iface = cfg.tun_name.clone();
+    let result = run_with(cfg, None, None).await;
+    if let Err(error) = &result
+        && let Err(write_error) = statusd::record_failure(&iface, error)
+    { tracing::error!(%write_error, "failed to persist stopped member status"); }
+    result
+}
+
+async fn stop_tasks_and_cleanup(
+    tasks: &mut tokio::task::JoinSet<()>,
+    cleanup: impl FnOnce() -> ApplyResult + Send + 'static,
+) -> ApplyResult {
+    tasks.shutdown().await;
+    apply::blocking(cleanup).await
 }
 
 /// EMBEDDED entry (mobile): run the SAME node engine from an inline config JSON,
@@ -902,6 +923,7 @@ pub async fn run_embedded_with_routes(cfg_json: &str, tun_fd: i32, protect: Opti
 }
 
 async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile::RoutesFn>) -> std::io::Result<()> {
+    let mut tasks = tokio::task::JoinSet::new();
     // Own the injected fd before parsing keys so early errors also close it.
     #[cfg(unix)]
     let mut fd_guard = cfg.tun_fd.map(|fd| InjectedFdGuard(Some(fd)));
@@ -963,7 +985,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
         a
     };
 
-    let (r, init_epoch) = mobile::retry_control(cfg.tun_fd.is_some(), || resolve_from_control(&cfg, &advertise)).await?;
+    let (r, init_epoch) = mobile::retry_control(true, || resolve_from_control(&cfg, &advertise)).await?;
     let mut platform = mobile::Reporter::new(r.platform.clone(), routes);
 
     // AD-2 (consumer exit contract): split-tunnel BY DEFAULT — strip every
@@ -1056,7 +1078,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
         use tokio::signal::unix::{SignalKind, signal};
         let mut term = signal(SignalKind::terminate())?;
         let mut intr = signal(SignalKind::interrupt())?;
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             tokio::select! { _ = term.recv() => {}, _ = intr.recv() => {} }
             if let Err(error) = apply::blocking(move || stopping.cleanup()).await { tracing::error!(%error, "host shutdown failed"); }
             std::process::exit(0);
@@ -1067,7 +1089,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     #[cfg(windows)]
     {
         let stopping = host.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             if let Err(error) = apply::blocking(move || stopping.cleanup()).await { tracing::error!(%error, "host shutdown failed"); }
             std::process::exit(0);
@@ -1081,7 +1103,11 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     apply_status.lock().complete(init_epoch, result);
 
 
-    let (mut tun_tx, mut tun_rx) = dev.into_framed().split();
+    let (tun_tx, tun_rx) = dev.into_framed().split();
+    // Keep the interface alive while stopped data tasks release their guards;
+    // route/DNS cleanup still needs its name. Drop both halves on function exit.
+    let tun_tx = Arc::new(tokio::sync::Mutex::new(tun_tx));
+    let tun_rx = Arc::new(tokio::sync::Mutex::new(tun_rx));
 
     // --- Relay: a supervisor keeps ONE connection alive across the candidate
     // list, failing over on dial-failure or drop. It bridges to these stable
@@ -1098,7 +1124,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     let (app_in_tx, app_in_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
     let (app_out_tx, app_out_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
     let relay_sender = RelayOut::new(app_out_tx, targets_rx.clone());
-    tokio::spawn(relay_supervisor(targets_rx, *own_pub.as_bytes(), app_out_rx, app_in_tx));
+    tasks.spawn(relay_supervisor(targets_rx, *own_pub.as_bytes(), app_out_rx, app_in_tx));
     let (relay_in, relay_out): (Option<RelayIn>, Option<RelayOut>) = (Some(app_in_rx), Some(relay_sender));
 
     // --- Build per-peer state, partition across N workers, send first probe ---
@@ -1128,7 +1154,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
             .filter(|p| own_pub.as_bytes() < &p.pubkey)
             .map(|p| (p.pubkey, p.candidates.clone()))
             .collect();
-        tokio::spawn(tcp_direct_manager(
+        tasks.spawn(tcp_direct_manager(
             cfg.listen_port,
             *own_pub.as_bytes(),
             targets,
@@ -1215,8 +1241,10 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
         wrxs.push(rx);
     }
 
-    // TUN writer: sole owner of the framed sink (one fd → writes are serial).
-    tokio::spawn(async move {
+    // TUN writer: sole writer of the framed sink (one fd → writes are serial).
+    let tun_writer = tun_tx.clone();
+    tasks.spawn(async move {
+        let mut tun_tx = tun_writer.lock().await;
         let mut written: u64 = 0;
         while let Some(pkt) = tun_out_rx.recv().await {
             let pkt_len = pkt.len();
@@ -1241,7 +1269,9 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     {
         let wtxs = wtxs.clone();
         let allowed = allowed.clone();
-        tokio::spawn(async move {
+        let tun_reader = tun_rx.clone();
+        tasks.spawn(async move {
+            let mut tun_rx = tun_reader.lock().await;
             while let Some(Ok(pkt)) = tun_rx.next().await {
                 let bytes = pkt.get_bytes();
                 let route = {
@@ -1271,7 +1301,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
         let cand_to_wid = cand_to_wid.clone();
         let index_owner = index_owner.clone();
         let own_priv = own_priv.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             // Batched receive (recvmmsg): read up to RECV_BATCH datagrams per
             // syscall — the receive-side complement to send GSO.
             let mut batch = gso::RecvBatch::new();
@@ -1307,7 +1337,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
         let wtxs = wtxs.clone();
         let peer_to_wid = peer_to_wid.clone();
         let own_priv = own_priv.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Some((src, bytes)) = relay_in.recv().await {
                 let wid = {
                     let pw = peer_to_wid.read();
@@ -1326,7 +1356,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
         let wtxs = wtxs.clone();
         let peer_to_wid = peer_to_wid.clone();
         let own_priv = own_priv.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Some((src, bytes)) = tcp_in.recv().await {
                 let wid = {
                     let pw = peer_to_wid.read();
@@ -1344,7 +1374,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     if let Some(mut tcp_conn_rx) = tcp_conn_rx {
         let wtxs = wtxs.clone();
         let peer_to_wid = peer_to_wid.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             while let Some((pk, g, out)) = tcp_conn_rx.recv().await {
                 let wid = peer_to_wid.read().get(&pk).copied();
                 if let Some(wid) = wid
@@ -1373,11 +1403,11 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
             status: status_reg.clone(),
             allowed: allowed.clone(),
         };
-        tokio::spawn(state.run(wrx));
+        tasks.spawn(state.run(wrx));
     }
 
     // --- Local status socket: `fluxpeer show` + wg-UAPI (`wg show`). ---
-    tokio::spawn(statusd::serve(
+    tasks.spawn(statusd::serve(
         statusd::socket_path(&cfg.tun_name),
         status_reg.clone(),
         apply_status.clone(),
@@ -1396,7 +1426,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
         let control_server = cfg.control_server.clone();
         let device_id = cfg.device_id.clone();
         let auth_token = cfg.auth_token.clone().unwrap_or_default();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let client = fluxpeer_sdk::Client::with_password(control_server, &auth_token);
             // 3 s cadence so the web's realtime rate (Δbytes/Δt) feels live without
             // hammering the control-server.
@@ -1471,8 +1501,12 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
             _ = retry.tick() => {},
             result = &mut reconciler => {
                 let stopping = host.clone();
-                if let Err(error) = apply::blocking(move || stopping.cleanup()).await { tracing::error!(%error, "host cleanup failed"); }
-                return result.map_err(std::io::Error::other)?;
+                let outcome = result.map_err(std::io::Error::other).and_then(|result| result);
+                if let Err(cleanup) = stop_tasks_and_cleanup(&mut tasks, move || stopping.cleanup()).await {
+                    let error = outcome.err().unwrap_or_else(|| std::io::Error::other("engine stopped"));
+                    return Err(std::io::Error::new(error.kind(), format!("{error}; cleanup failed: {cleanup}")));
+                }
+                return outcome;
             }
         }
         for tx in &wtxs {
@@ -1775,6 +1809,29 @@ mod exit_contract_tests {
             known: KnownPeers::from([(old.pubkey, (0, old.candidates.clone(), old.allowed_ips.clone()))]),
             desired_epoch: 1, apply_status: Arc::default(), host: Arc::new(host), use_exit: None, relay_available: false, directory: None,
             desired: vec![old], pending: Some(control::Snapshot { platform: serde_json::Value::Null, epoch: 2, peers: vec![new], self_exit: false }), self_exit: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_control_stops_effects_but_transient_errors_keep_pending_reconciliation() {
+        for status in [400, 401, 403, 404, 410, 408, 425, 429, 500] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = axum::Router::new().fallback(move || async move { axum::http::StatusCode::from_u16(status).unwrap() });
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = effects.clone();
+            let mut host = test_host();
+            host.probe = Some(Arc::new(move |_| { observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst); Ok(()) }));
+            let (tx, _rx) = mpsc::channel(8);
+            let peer = peer(1, "192.0.2.1:1", &["100.72.16.2/32"]);
+            let mut reconciler = test_reconciler(host, peer.clone(), peer, tx);
+            reconciler.client = fluxpeer_sdk::Client::with_password(format!("http://{address}"), "test-token");
+            assert!(reconciler.reconcile_tick().await.is_err());
+            let terminal = !matches!(status, 408 | 425 | 429 | 500);
+            assert_eq!(reconciler.terminal_control.is_some(), terminal, "HTTP {status}");
+            assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst) == 0, terminal, "HTTP {status}");
+            server.abort();
         }
     }
 
@@ -2197,4 +2254,25 @@ mod exit_contract_tests {
         refresh.refresh_stun(&entries).await.unwrap(); // Explicit advertisements skip query/report.
     }
 
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[tokio::test]
+    async fn terminal_shutdown_stops_data_tasks_before_cleanup_and_preserves_cleanup_error() {
+        struct DropMark(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropMark { fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::SeqCst); } }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = DropMark(dropped.clone());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move { let _marker = marker; std::future::pending::<()>().await; });
+        tokio::task::yield_now().await;
+        let error = stop_tasks_and_cleanup(&mut tasks, move || {
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            Err(ApplyError::new(&["cleanup"], "injected DNS cleanup failure"))
+        }).await.unwrap_err();
+        assert!(tasks.is_empty());
+        assert!(error.stderr.contains("DNS cleanup failure"));
+    }
 }

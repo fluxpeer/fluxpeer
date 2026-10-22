@@ -107,7 +107,7 @@ fn row_to_route(r: &sqlx::any::AnyRow) -> Route {
     }
 }
 
-pub async fn insert_route(pool: &AnyPool, r: &Route) -> Result<(), sqlx::Error> {
+pub async fn insert_route(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, r: &Route) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO route (id, network_id, device_id, prefix, approved) VALUES ($1,$2,$3,$4,$5)")
         .bind(&r.id)
         .bind(&r.network_id)
@@ -163,7 +163,7 @@ pub async fn delete_route(pool: &AnyPool, id: &str) -> Result<(), sqlx::Error> {
 
 /// Upsert a device's latest cumulative traffic stats.
 pub async fn upsert_device_stats(
-    pool: &AnyPool,
+    pool: impl sqlx::Executor<'_, Database = sqlx::Any>,
     device_id: &str,
     rx: i64,
     tx: i64,
@@ -224,7 +224,7 @@ pub async fn list_network_stats(pool: &AnyPool, network_id: &str) -> Result<Vec<
 }
 
 /// Insert a relay into the directory.
-pub async fn insert_relay(pool: &AnyPool, r: &RelayNode) -> Result<(), sqlx::Error> {
+pub async fn insert_relay(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, r: &RelayNode) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO relay (id, region, url, network_id, anytls, stun_url, node_id) VALUES ($1,$2,$3,$4,$5,$6,$7)")
         .bind(&r.id)
         .bind(&r.region)
@@ -318,7 +318,7 @@ pub async fn bump_network_epoch(pool: impl sqlx::Executor<'_, Database = sqlx::A
     Ok(())
 }
 
-pub async fn insert_invite(pool: &AnyPool, inv: &Invite) -> Result<(), sqlx::Error> {
+pub async fn insert_invite(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, inv: &Invite) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO invite (code, network_id, expires_at, max_uses, uses) VALUES ($1,$2,$3,$4,$5)")
         .bind(&inv.code)
         .bind(&inv.network_id)
@@ -396,7 +396,7 @@ pub async fn set_device_token(pool: impl sqlx::Executor<'_, Database = sqlx::Any
 
 /// Fetch a device's auth token (None if the device is unknown or pre-token).
 pub async fn get_device_token(pool: &AnyPool, device_id: &str) -> Result<Option<String>, sqlx::Error> {
-    let row = sqlx::query("SELECT auth_token FROM device WHERE id = $1")
+    let row = sqlx::query("SELECT auth_token FROM device WHERE id = $1 AND status = 'active' AND EXISTS (SELECT 1 FROM network WHERE network.id = device.network_id)")
         .bind(device_id)
         .fetch_optional(pool)
         .await?;

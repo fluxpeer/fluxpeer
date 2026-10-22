@@ -71,6 +71,8 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum NetworkCmd {
+    /// Permanently delete a network and revoke every member. Repeat its ID to confirm.
+    Delete { network_id: String, #[arg(long)] confirm: String },
     /// Create a network.
     Create { name: String },
     /// List networks.
@@ -79,6 +81,8 @@ pub enum NetworkCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum InviteCmd {
+    /// Revoke an invite immediately.
+    Revoke { network_id: String, code: String },
     /// Create an invite for a network.
     Create {
         network_id: String,
@@ -139,9 +143,11 @@ pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Network { command } => match command {
             NetworkCmd::Create { name } => print_json(&client.create_network(&name).await?),
+            NetworkCmd::Delete { network_id, confirm } => client.delete_network(&network_id, &confirm).await?,
             NetworkCmd::List => print_json(&client.list_networks().await?),
         },
         Command::Invite { command } => match command {
+            InviteCmd::Revoke { network_id, code } => client.revoke_invite(&network_id, &code).await?,
             InviteCmd::Create {
                 network_id,
                 max_uses,
@@ -418,5 +424,18 @@ mod test {
     #[test]
     fn import_requires_at_least_one_file() {
         assert!(Cli::try_parse_from(["fp", "import", "--network", "net-1"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[test]
+    fn network_delete_requires_confirmation_and_invite_revoke_parses() {
+        assert!(Cli::try_parse_from(["fp", "network", "delete", "net-1"]).is_err());
+        let cli = Cli::try_parse_from(["fp", "network", "delete", "net-1", "--confirm", "net-1"]).unwrap();
+        assert!(matches!(cli.command, Command::Network { command: NetworkCmd::Delete { network_id, confirm } } if network_id == confirm));
+        let cli = Cli::try_parse_from(["fp", "invite", "revoke", "net-1", "code"]).unwrap();
+        assert!(matches!(cli.command, Command::Invite { command: InviteCmd::Revoke { network_id, code } } if network_id == "net-1" && code == "code"));
     }
 }

@@ -32,12 +32,7 @@ pub async fn show(iface: Option<String>, json: bool) -> std::io::Result<()> {
 }
 
 async fn show_one(path: &std::path::Path, json: bool) -> std::io::Result<()> {
-    let mut stream = connect_status(path)
-        .await
-        .map_err(|e| std::io::Error::other(format!("{} ({e})", path.display())))?;
-    stream.write_all(b"get-json\n").await?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).await?;
+    let body = read_status(path).await?;
     if json {
         println!("{body}");
         return Ok(());
@@ -52,17 +47,23 @@ async fn show_one(path: &std::path::Path, json: bool) -> std::io::Result<()> {
 pub(crate) async fn aggregate_status() -> serde_json::Value {
     let mut arr = Vec::new();
     for path in all_sockets() {
-        if let Ok(mut s) = connect_status(&path).await {
-            let _ = s.write_all(b"get-json\n").await;
-            let mut body = String::new();
-            if s.read_to_string(&mut body).await.is_ok()
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
-            {
-                arr.push(v);
-            }
-        }
+        if let Ok(body) = read_status(&path).await
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body)
+        { arr.push(value); }
     }
     serde_json::Value::Array(arr)
+}
+
+async fn read_status(path: &std::path::Path) -> std::io::Result<String> {
+    match connect_status(path).await {
+        Ok(mut stream) => {
+            stream.write_all(b"get-json\n").await?;
+            let mut body = String::new();
+            stream.read_to_string(&mut body).await?;
+            Ok(body)
+        }
+        Err(error) => crate::statusd::read_failure(path).map(|value| value.to_string()).ok_or(error),
+    }
 }
 
 /// Connect to a per-iface status endpoint. Unix dials the unix socket directly;
@@ -97,11 +98,14 @@ fn all_sockets() -> Vec<PathBuf> {
             for e in rd.flatten() {
                 if e.path().extension().is_some_and(|x| x == ext) {
                     out.push(e.path());
+                } else if e.path().extension().is_some_and(|x| x == "error") {
+                    out.push(e.path().with_extension(ext));
                 }
             }
         }
     }
     out.sort();
+    out.dedup();
     out
 }
 
@@ -226,4 +230,20 @@ fn ago(unix: u64) -> String {
 
 fn plural(n: u64) -> &'static str {
     if n == 1 { "" } else { "s" }
+}
+
+#[cfg(test)]
+mod stopped_tests {
+    use super::*;
+    #[tokio::test]
+    async fn show_and_daemon_status_read_failure_after_the_socket_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fp0.sock");
+        let value = serde_json::json!({"interface":{"name":"fp0","up":false,"last_error":"HTTP 403"},"peers":[]});
+        std::fs::write(path.with_extension("error"), value.to_string()).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&read_status(&path).await.unwrap()).unwrap();
+        assert_eq!(actual, value);
+        std::fs::remove_file(path.with_extension("error")).unwrap();
+        assert!(read_status(&path).await.is_err());
+    }
 }

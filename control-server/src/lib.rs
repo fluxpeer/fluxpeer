@@ -617,13 +617,38 @@ async fn require_device(s: &SqlStore, headers: &axum::http::HeaderMap, device_id
 /// and watch on their existing device-only guard.
 async fn require_device_read(s: &SqlStore, auth: &auth::Auth, headers: &axum::http::HeaderMap, device_id: &str) -> Result<(), StatusCode> {
     let token = bearer_token(headers).filter(|token| !token.is_empty()).ok_or(StatusCode::UNAUTHORIZED)?;
-    if auth.valid_bearer(token) { return Ok(()); }
+    if auth.valid_bearer(token).await? { return Ok(()); }
     let stored = s.device_token(device_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if stored.is_some_and(|stored| ct_eq(stored.as_bytes(), token.as_bytes())) { return Ok(()); }
     if s.has_device_token(token).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
         return Err(StatusCode::FORBIDDEN);
     }
     Err(StatusCode::UNAUTHORIZED)
+}
+
+async fn sql_delete_network(State(s): State<Arc<SqlStore>>, Path(id): Path<String>) -> Result<StatusCode, StatusCode> {
+    s.delete_network(&id).await.map(|()| StatusCode::NO_CONTENT).map_err(sql_status)
+}
+
+async fn sql_revoke_invite(State(s): State<Arc<SqlStore>>, Path((id, code)): Path<(String, String)>) -> Result<StatusCode, StatusCode> {
+    s.revoke_invite(&id, &code).await.map(|()| StatusCode::NO_CONTENT).map_err(sql_status)
+}
+
+async fn sql_resolve_name(
+    State(s): State<Arc<SqlStore>>, Extension(auth): Extension<Arc<auth::Auth>>,
+    Path((id, name)): Path<(String, String)>, headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let token = bearer_token(&headers).filter(|token| !token.is_empty()).ok_or(StatusCode::UNAUTHORIZED)?;
+    if !auth.valid_bearer(token).await? {
+        match s.token_network(token).await.map_err(sql_status)? {
+            Some(network) if network == id => {},
+            Some(_) => return Err(StatusCode::FORBIDDEN),
+            None => return Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+    let device = s.resolve(&id, &name).await.map_err(sql_status)?;
+    Ok(Json(serde_json::json!({"name":name, "address":device.address_v4,
+        "address_v4":device.address_v4, "address_v6":device.address_v6})))
 }
 
 async fn sql_import_devices(
@@ -786,23 +811,54 @@ async fn sql_watch_device(
 }
 
 async fn sql_watch_loop(
+    socket: WebSocket,
+    store: Arc<SqlStore>,
+    device_id: String,
+    credential: WatchCredential,
+    rx: tokio::sync::watch::Receiver<u64>,
+) {
+    sql_watch_loop_with_idle(socket, store, device_id, credential, rx, std::time::Duration::from_secs(90)).await;
+}
+
+async fn sql_watch_loop_with_idle(
     mut socket: WebSocket,
     store: Arc<SqlStore>,
     device_id: String,
     credential: WatchCredential,
     mut rx: tokio::sync::watch::Receiver<u64>,
+    idle: std::time::Duration,
 ) {
     if !sql_send_config(&mut socket, &store, &device_id, &credential).await {
         return;
     }
-    while rx.changed().await.is_ok() {
-        if !sql_send_config(&mut socket, &store, &device_id, &credential).await {
-            break;
+    // Revalidate even without a local epoch (multi-instance deployments), while
+    // consuming closes/errors immediately. A silent peer gets at most 90 seconds.
+    let mut heartbeat = tokio::time::interval(idle / 3);
+    heartbeat.tick().await;
+    let mut last_received = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => { last_received = tokio::time::Instant::now(); }
+            },
+            changed = rx.changed() => {
+                if changed.is_err() || !sql_send_config(&mut socket, &store, &device_id, &credential).await { break; }
+            },
+            _ = heartbeat.tick() => {
+                if last_received.elapsed() >= idle { break; }
+                if !sql_send_config(&mut socket, &store, &device_id, &credential).await { break; }
+                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(10), socket.send(Message::Ping(Vec::new()))).await, Ok(Ok(()))) { break; }
+            },
         }
     }
 }
 
 async fn sql_send_config(socket: &mut WebSocket, store: &Arc<SqlStore>, device_id: &str, credential: &WatchCredential) -> bool {
+    tokio::time::timeout(std::time::Duration::from_secs(10), sql_send_config_inner(socket, store, device_id, credential)).await.unwrap_or(false)
+}
+
+async fn sql_send_config_inner(socket: &mut WebSocket, store: &Arc<SqlStore>, device_id: &str, credential: &WatchCredential) -> bool {
     let Ok(cfg) = store.device_config(device_id).await else { return false; };
     // Revalidate after reading the snapshot and immediately before each push.
     // This also covers rotation on a different control-server instance.
@@ -839,6 +895,7 @@ pub fn sql_router(store: Arc<SqlStore>) -> Router {
         .route("/devices/:id/routes", get(sql_list_device_routes))
         .route("/devices/:id/watch", get(sql_watch_device))
         .route("/networks/:id/relays", get(sql_list_relays))
+        .route("/networks/:id/resolve/:name", get(sql_resolve_name))
         .with_state(store.clone());
     // Admin: management routes behind the bearer middleware.
     let admin = Router::new()
@@ -848,6 +905,8 @@ pub fn sql_router(store: Arc<SqlStore>) -> Router {
         // fleet-wide. Admin-only (audit finding 4).
         .route("/relays", post(sql_register_relay))
         .route("/networks", post(sql_create_network).get(sql_list_networks))
+        .route("/networks/:id", delete(sql_delete_network))
+        .route("/networks/:id/invites/:code", delete(sql_revoke_invite))
         .route("/networks/:id/invites", post(sql_create_invite).get(sql_list_invites))
         .route("/networks/:id/devices", get(sql_list_devices))
         .route("/networks/:id/devices/import", post(sql_import_devices))
@@ -1159,3 +1218,6 @@ fn storage_kind(url: &str) -> &'static str {
         "SQL (custom DATABASE_URL)"
     }
 }
+
+#[cfg(test)]
+mod lifecycle_tests;

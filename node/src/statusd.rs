@@ -48,6 +48,28 @@ pub(crate) fn socket_path(iface: &str) -> PathBuf {
     status_dir().join(name)
 }
 
+/// A private atomic snapshot survives process exit without keeping a listener alive.
+pub(crate) fn record_failure(iface: &str, error: &std::io::Error) -> std::io::Result<()> {
+    write_failure(&socket_path(iface), iface, error)
+}
+
+fn write_failure(socket: &std::path::Path, iface: &str, error: &std::io::Error) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = socket.with_extension("error");
+    let dir = path.parent().ok_or_else(|| std::io::Error::other("missing status directory"))?;
+    std::fs::create_dir_all(dir)?;
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    let value = serde_json::json!({"interface":{"name":iface, "up":false, "last_error":error.to_string(),
+        "terminal_control":crate::control::terminal_control_error(error)}, "peers":[]});
+    file.write_all(value.to_string().as_bytes())?;
+    file.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+pub(crate) fn read_failure(socket: &std::path::Path) -> Option<serde_json::Value> {
+    serde_json::from_slice(&std::fs::read(socket.with_extension("error")).ok()?).ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
     sock_path: PathBuf,
@@ -60,6 +82,7 @@ pub(crate) async fn serve(
     address: Ipv4Addr,
     control_server: String,
 ) {
+    let _ = std::fs::remove_file(sock_path.with_extension("error"));
     if let Some(dir) = sock_path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -249,5 +272,24 @@ mod tests {
         state.lock().complete(8, Ok(()));
         assert!(render()["interface"]["last_error"].is_null());
         assert_eq!(render()["interface"]["applied_epoch"], 8);
+    }
+}
+
+#[cfg(test)]
+mod stopped_tests {
+    use super::*;
+    #[test]
+    fn stopped_member_error_survives_exit_in_private_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fp0.sock");
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "control HTTP 401");
+        write_failure(&socket, "fp0", &error).unwrap();
+        let snapshot = read_failure(&socket).unwrap();
+        assert_eq!(snapshot["interface"]["up"], false);
+        assert_eq!(snapshot["interface"]["terminal_control"], true);
+        assert_eq!(snapshot["interface"]["last_error"], "control HTTP 401");
+        assert_eq!(snapshot["peers"], serde_json::json!([]));
+        #[cfg(unix)]
+        assert_eq!(std::fs::metadata(socket.with_extension("error")).unwrap().permissions().mode() & 0o777, 0o600);
     }
 }

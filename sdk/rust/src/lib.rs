@@ -144,6 +144,12 @@ impl Client {
         format!("{}/api/v1{}", self.base, path)
     }
 
+    fn segment_url(&self, segments: &[&str]) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&self.url("/"))?;
+        url.path_segments_mut().map_err(|()| anyhow::anyhow!("control URL has no path"))?.pop_if_empty().extend(segments);
+        Ok(url)
+    }
+
     pub async fn create_network(&self, name: &str) -> Result<Value> {
         self.http
             .post(self.url("/networks"))
@@ -484,9 +490,21 @@ impl Client {
             .map_err(Into::into)
     }
 
+    /// Permanently delete a network after the caller confirms its identity.
+    pub async fn delete_network(&self, network_id: &str, confirmation: &str) -> Result<()> {
+        anyhow::ensure!(confirmation == network_id, "network deletion requires confirmation of the network ID");
+        self.http.delete(self.segment_url(&["networks", network_id])?).send().await?.error_for_status()?;
+        Ok(())
+    }
+
+    pub async fn revoke_invite(&self, network_id: &str, code: &str) -> Result<()> {
+        self.http.delete(self.segment_url(&["networks", network_id, "invites", code])?).send().await?.error_for_status()?;
+        Ok(())
+    }
+
     pub async fn resolve(&self, network_id: &str, name: &str) -> Result<Value> {
         self.http
-            .get(self.url(&format!("/networks/{network_id}/resolve/{name}")))
+            .get(self.segment_url(&["networks", network_id, "resolve", name])?)
             .send()
             .await?
             .error_for_status()?

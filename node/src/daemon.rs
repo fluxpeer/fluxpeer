@@ -68,6 +68,8 @@ pub async fn daemon(dir: String, addr: Option<String>) -> std::io::Result<()> {
         nets: Mutex::new(HashMap::new()),
     });
     for cfg in configs(&dir) {
+        if read_iface(&cfg).and_then(|iface| crate::statusd::read_failure(&crate::statusd::socket_path(&iface)))
+            .is_some_and(|status| status["interface"]["terminal_control"] == true) { continue; }
         if let Err(error) = d.spawn_net(&cfg) { tracing::error!(%error, "failed to start network"); }
     }
     let addr = addr.unwrap_or_else(|| DAEMON_ADDR.to_string());
@@ -203,7 +205,7 @@ fn edit_configs(
 }
 
 /// Interface names are identifiers, never caller-supplied paths.
-fn valid_iface(iface: &str) -> bool {
+pub(crate) fn valid_iface(iface: &str) -> bool {
     (1..=15).contains(&iface.len()) && !iface.starts_with('-')
         && iface.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
@@ -508,7 +510,7 @@ impl Daemon {
 
     fn networks(&self) -> serde_json::Value {
         let duplicates = self.duplicate_ifaces();
-        let running = self.nets.lock();
+        let mut running = self.nets.lock();
         let mut arr = Vec::new();
         for cfg in configs(&self.dir) {
             if let Ok(s) = std::fs::read_to_string(&cfg)
@@ -519,7 +521,8 @@ impl Daemon {
                     "iface": iface,
                     "membership_error": if duplicates.contains(&iface) { Some("multiple membership configs") } else { None },
                     "control_server": v["control_server"].as_str().unwrap_or(""),
-                    "up": running.contains_key(&iface),
+                    "up": running.get_mut(&iface).is_some_and(|child| matches!(child.try_wait(), Ok(None))),
+                    "last_error": crate::statusd::read_failure(&crate::statusd::socket_path(&iface)).and_then(|v| v["interface"]["last_error"].as_str().map(String::from)),
                     "exit_node": v["exit_node"].as_bool().unwrap_or(false),
                     "exit_veto": v["exit_veto"].as_bool().unwrap_or(false),
                     "firewall_trust_external": v["firewall_trust_external"].as_bool().unwrap_or(false),

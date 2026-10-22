@@ -31,7 +31,7 @@ pub(crate) fn request_error(error: anyhow::Error) -> std::io::Error {
         Some(status) if status.is_client_error() && !matches!(status.as_u16(), 408 | 425 | 429) => ErrorKind::InvalidInput,
         _ => ErrorKind::Other,
     };
-    std::io::Error::new(kind, error)
+    std::io::Error::new(kind, format!("{error:#}"))
 }
 
 pub(crate) fn terminal_control_error(error: &std::io::Error) -> bool {
@@ -401,23 +401,13 @@ pub(crate) struct Snapshot {
 /// Steady-state membership reconcile (REVOKE-1): poll `device_config` and, when the
 /// `config_epoch` advances, return the fresh snapshot so the caller can diff it
 /// against the live set and add/remove/re-route peers WITHOUT a restart. Returns
-/// `None` when nothing changed (or on a transient error — we just retry next tick).
+/// `None` when nothing changed. Errors preserve classification for retry backoff.
 pub(crate) async fn poll_peers_if_changed(
     client: &Client,
     device_id: &str,
     applied_epoch: Option<u64>,
 ) -> std::io::Result<Option<Snapshot>> {
-    let conf = match client.device_config(device_id).await {
-        Ok(conf) => conf,
-        Err(error) => {
-            let error = request_error(error);
-            if terminal_control_error(&error) {
-                return Err(error);
-            }
-            tracing::warn!(%error, "control refresh unavailable; retrying next tick");
-            return Ok(None);
-        }
-    };
+    let conf = client.device_config(device_id).await.map_err(request_error)?;
     let epoch = config_epoch(&conf);
     if Some(epoch) == applied_epoch {
         return Ok(None);
@@ -714,11 +704,11 @@ mod tests {
 
     #[tokio::test]
     async fn steady_state_revocation_propagates_but_server_failure_keeps_session() {
-        for status in [401, 403, 404, 500] {
+        for status in [400, 401, 403, 404, 410, 422, 408, 425, 429, 500, 503] {
             let (cfg, server) = http_responses(vec![(status, "{}".into())]).await;
             let result = poll_peers_if_changed(&mk_client(&cfg), &cfg.device_id, Some(1)).await;
-            if status == 500 {
-                assert!(result.unwrap().is_none());
+            if matches!(status, 408 | 425 | 429 | 500 | 503) {
+                assert!(!terminal_control_error(&result.err().unwrap()));
             } else {
                 assert!(terminal_control_error(&result.err().unwrap()));
             }

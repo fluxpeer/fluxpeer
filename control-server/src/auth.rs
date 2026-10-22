@@ -34,9 +34,11 @@ use crate::sql_store::SqlStore;
 
 const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 
+#[derive(Clone)]
 struct Session {
     username: String,
     expiry: Instant,
+    password_hash: String,
 }
 
 pub struct Auth {
@@ -66,22 +68,31 @@ impl Auth {
             Session {
                 username: username.to_string(),
                 expiry: Instant::now() + SESSION_TTL,
+                password_hash: hash,
             },
         );
         Some(token)
     }
 
     /// The admin a token belongs to, if live.
-    fn session_user(&self, token: &str) -> Option<String> {
-        let mut sessions = self.sessions.write();
-        match sessions.get(token) {
-            Some(s) if s.expiry > Instant::now() => Some(s.username.clone()),
-            Some(_) => {
-                sessions.remove(token);
-                None
-            }
-            None => None,
+    async fn session_user(&self, token: &str) -> Result<Option<String>, StatusCode> {
+        let Some(session) = self.sessions.read().get(token).cloned() else { return Ok(None); };
+        // The hash is the account version: deletion/recreation and password
+        // changes also invalidate sessions issued concurrently on another instance.
+        let current = match self.store.admin_hash(&session.username).await {
+            Ok(current) => current,
+            Err(error) => { tracing::warn!(%error, "admin session account lookup failed"); return Err(StatusCode::INTERNAL_SERVER_ERROR); }
+        };
+        if session.expiry > Instant::now() && current.as_deref() == Some(&session.password_hash) {
+            Ok(Some(session.username))
+        } else {
+            self.sessions.write().remove(token);
+            Ok(None)
         }
+    }
+
+    fn revoke_sessions(&self, username: &str) {
+        self.sessions.write().retain(|_, session| session.username != username);
     }
 
     fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -92,19 +103,20 @@ impl Auth {
     }
 
     /// A bearer authorizes if it's the master key or a live session token.
-    pub(crate) fn valid_bearer(&self, bearer: &str) -> bool {
+    pub(crate) async fn valid_bearer(&self, bearer: &str) -> Result<bool, StatusCode> {
         if let Some(m) = &self.master
             && constant_eq(bearer.as_bytes(), m.as_bytes())
         {
-            return true;
+            return Ok(true);
         }
-        self.session_user(bearer).is_some()
+        Ok(self.session_user(bearer).await?.is_some())
     }
 
     /// The acting admin username for a request (None for the master key —
     /// account-scoped actions like change-password require a real session).
-    fn acting_user(&self, headers: &HeaderMap) -> Option<String> {
-        Self::bearer(headers).and_then(|t| self.session_user(t))
+    async fn acting_user(&self, headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
+        let Some(token) = Self::bearer(headers) else { return Ok(None); };
+        self.session_user(token).await
     }
 }
 
@@ -228,10 +240,10 @@ pub struct MeResp {
 }
 
 /// `GET /admin/me` — the acting admin's username ("" for the master key).
-pub async fn admin_me(Extension(auth): Extension<Arc<Auth>>, headers: HeaderMap) -> Json<MeResp> {
-    Json(MeResp {
-        username: auth.acting_user(&headers).unwrap_or_default(),
-    })
+pub async fn admin_me(Extension(auth): Extension<Arc<Auth>>, headers: HeaderMap) -> Result<Json<MeResp>, StatusCode> {
+    Ok(Json(MeResp {
+        username: auth.acting_user(&headers).await?.unwrap_or_default(),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -246,7 +258,8 @@ pub async fn admin_change_password(
     headers: HeaderMap,
     Json(req): Json<ChangePwReq>,
 ) -> StatusCode {
-    let Some(user) = auth.acting_user(&headers) else {
+    let acting = match auth.acting_user(&headers).await { Ok(user) => user, Err(status) => return status };
+    let Some(user) = acting else {
         // master-key bearer has no account to change
         return StatusCode::BAD_REQUEST;
     };
@@ -264,7 +277,7 @@ pub async fn admin_change_password(
         .update_admin_password(&user, &hash_password(&req.new_password))
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT,
+        Ok(()) => { auth.revoke_sessions(&user); StatusCode::NO_CONTENT },
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -308,7 +321,8 @@ pub async fn delete_admin(
     headers: HeaderMap,
     Path(username): Path<String>,
 ) -> StatusCode {
-    if auth.acting_user(&headers).as_deref() == Some(username.as_str()) {
+    let acting = match auth.acting_user(&headers).await { Ok(user) => user, Err(status) => return status };
+    if acting.as_deref() == Some(username.as_str()) {
         return StatusCode::BAD_REQUEST; // don't lock yourself out
     }
     match auth.store.count_admins().await {
@@ -317,7 +331,7 @@ pub async fn delete_admin(
         _ => {}
     }
     match auth.store.delete_admin(&username).await {
-        Ok(()) => StatusCode::NO_CONTENT,
+        Ok(()) => { auth.revoke_sessions(&username); StatusCode::NO_CONTENT },
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -340,7 +354,8 @@ pub async fn require_admin(
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if !Auth::bearer(req.headers()).is_some_and(|t| auth.valid_bearer(t)) {
+    let bearer = Auth::bearer(req.headers()).ok_or(StatusCode::UNAUTHORIZED)?;
+    if !auth.valid_bearer(bearer).await? {
         return Err(StatusCode::UNAUTHORIZED);
     }
     let method = req.method().clone();
@@ -349,7 +364,7 @@ pub async fn require_admin(
         axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::PATCH | axum::http::Method::DELETE
     );
     let actor = auth
-        .acting_user(req.headers())
+        .acting_user(req.headers()).await?
         .unwrap_or_else(|| "(master)".to_string());
     let path = req.uri().path().to_string();
     let resp = next.run(req).await;

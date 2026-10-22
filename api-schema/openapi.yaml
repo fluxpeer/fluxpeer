@@ -50,6 +50,31 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Network" }
+  /networks/{id}:
+    delete:
+      summary: Delete a network and revoke all members
+      description: >
+        Requires an admin session or master bearer. Clients must confirm the
+        network ID before calling. Atomically revokes device tokens, removes
+        invites/routes/scoped relays/stats, advances the final epoch, and deletes
+        the network. Device tombstones remain; their credentials no longer work.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "204": { description: deleted }
+        "401": { description: admin authentication required }
+        "404": { description: network not found }
+  /networks/{id}/invites/{code}:
+    delete:
+      summary: Revoke an enrollment invite immediately
+      description: Requires an admin session or master bearer. Existing members are unaffected.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: code, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: revoked }
+        "401": { description: admin authentication required }
+        "403": { description: invite absent or belongs to another network }
+        "404": { description: network not found }
   /networks/{id}/invites:
     post:
       summary: Create an enrollment invite
@@ -86,12 +111,18 @@ paths:
           content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/RelayNode" } } } }
   /networks/{id}/resolve/{name}:
     get:
-      summary: MagicDNS — resolve a device name to its overlay IP
+      summary: MagicDNS — resolve an active device name to its overlay addresses
+      description: >
+        Requires an admin session/master bearer or an active device token in this
+        network. Returns name, address (IPv4 compatibility alias), address_v4 and
+        address_v6. Revoked devices are excluded.
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
         - { name: name, in: path, required: true, schema: { type: string } }
       responses:
         "200": { description: resolved }
+        "401": { description: missing or invalid credential }
+        "403": { description: device credential belongs to another network }
         "404": { description: name not found }
   /enroll/challenge:
     post:
