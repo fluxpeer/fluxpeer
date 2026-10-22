@@ -3,7 +3,8 @@
 //! to a dial/listener; no process-global client key or public-name-derived secret.
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
-use std::sync::{Arc, Weak, atomic::{AtomicU64, Ordering}};
+use std::sync::{Arc, Weak, atomic::Ordering};
+use portable_atomic::AtomicU64;
 use fp_crypto::x25519::{PublicKey, StaticSecret};
 use fp_transport::link::{LinkAuthenticator, LinkIo, LinkSession, Session as LinkSessionRef, denied};
 use hmac::{Mac, SimpleHmac};

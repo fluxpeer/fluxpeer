@@ -998,6 +998,7 @@ dependencies = [
  "hmac",
  "libc",
  "parking_lot",
+ "portable-atomic",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

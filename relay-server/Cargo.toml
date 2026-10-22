@@ -8,6 +8,7 @@ name = "relay-server"
 path = "src/main.rs"
 
 [dependencies]
+portable-atomic = { workspace = true }
 fp-crypto = { path = "../engine/crypto/fp-crypto" }
 blake2 = { workspace = true }
 hmac = { workspace = true }
