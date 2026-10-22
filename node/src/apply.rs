@@ -209,6 +209,7 @@ pub(crate) fn all(results: impl IntoIterator<Item = Result>) -> Result {
 pub(crate) struct Status {
     pub last_error: Option<ApplyError>,
     pub applied_epoch: Option<u64>,
+    pub restart_required: bool,
 }
 pub(crate) type SharedStatus = std::sync::Arc<parking_lot::Mutex<Status>>;
 enum ApplyEvent<'a> { Failed(&'a ApplyError), Recovered }
@@ -243,6 +244,7 @@ pub(crate) struct Retry {
     delay: u64,
 }
 impl Retry {
+    #[cfg(test)]
     pub fn waiting(&self, epoch: u64, now: Instant) -> bool {
         self.epoch == Some(epoch) && self.next.is_some_and(|deadline| now < deadline) && self.error.is_some()
     }

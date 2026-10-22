@@ -148,12 +148,13 @@ pub(crate) fn local_ipv4_toward(host: &str) -> Option<Ipv4Addr> {
     }
 }
 
-pub(crate) fn url_host(url: &str) -> String {
-    let authority = url.trim_start_matches("http://").trim_start_matches("https://").split('/').next().unwrap_or("");
-    if let Some(v6) = authority.strip_prefix('[') {
-        v6.split(']').next().unwrap_or("").to_string()
-    } else {
-        authority.split(':').next().unwrap_or("").to_string()
+pub(crate) fn url_host(value: &str) -> std::io::Result<String> {
+    let url = url::Url::parse(value).map_err(std::io::Error::other)?;
+    match url.host() {
+        Some(url::Host::Domain(name)) => Ok(name.to_string()),
+        Some(url::Host::Ipv4(ip)) => Ok(ip.to_string()),
+        Some(url::Host::Ipv6(ip)) => Ok(ip.to_string()),
+        None => Err(std::io::Error::other("control URL has no host")),
     }
 }
 

@@ -243,6 +243,7 @@ fn json_status(
             "peers": peers.len(),
             "last_error": applied.last_error,
             "applied_epoch": applied.applied_epoch,
+            "restart_required": applied.restart_required,
         },
         "peers": peers,
     });
@@ -264,7 +265,9 @@ mod tests {
         };
         state.lock().complete(8, Err(error));
         let render = || serde_json::from_str::<serde_json::Value>(&json_status(&reg, &state, "test", "fp0", 1234, Ipv4Addr::LOCALHOST, "")).unwrap();
+        state.lock().restart_required = true;
         let doc = render();
+        assert_eq!(doc["interface"]["restart_required"], true);
         assert_eq!(doc["interface"]["applied_epoch"], 7);
         assert_eq!(doc["interface"]["last_error"]["exit_code"], 2);
         assert_eq!(doc["interface"]["last_error"]["stderr"], "Operation not permitted");

@@ -155,6 +155,7 @@ fn print_human(v: &serde_json::Value) {
     if let Some(error) = i.get("last_error").filter(|e| !e.is_null()) {
         println!("  apply error: {error}");
     }
+    if i["restart_required"].as_bool() == Some(true) { println!("  restart required: MTU changed"); }
     for p in v["peers"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
         println!();
         println!("peer: {}", p["public_key"].as_str().unwrap_or("?"));

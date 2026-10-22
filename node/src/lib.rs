@@ -31,6 +31,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 mod apply;
+mod bypass;
 mod config;
 mod control;
 pub mod mobile;
@@ -94,14 +95,14 @@ where F: FnMut() -> Fut, Fut: std::future::Future<Output = std::io::Result<Vec<c
 struct DirectoryRefresh {
     config: Config,
     targets: tokio::sync::watch::Sender<Vec<RelayTarget>>,
-    next: Instant,
-    delay: u64,
+    entries: Vec<control::RelayDir>,
+    stun_pending: bool,
     pending: Option<Vec<RelayTarget>>,
     stun: Option<(Arc<UdpSocket>, Arc<control::StunRefresh>, Vec<String>)>,
 }
 impl DirectoryRefresh {
     fn new(config: Config, targets: tokio::sync::watch::Sender<Vec<RelayTarget>>) -> Self {
-        Self { config, targets, next: Instant::now() + Duration::from_secs(2), delay: 2, pending: None, stun: None }
+        Self { config, targets, entries: Vec::new(), stun_pending: false, pending: None, stun: None }
     }
     async fn refresh_stun(&self, entries: &[control::RelayDir]) -> std::io::Result<()> {
         if !self.config.advertise.is_empty() { return Ok(()); }
@@ -116,15 +117,12 @@ impl DirectoryRefresh {
         if !endpoints.contains(&observed) { endpoints.push(observed); }
         control::mk_client(&self.config).set_endpoints(&self.config.device_id, &endpoints).await.map_err(control::request_error)
     }
-    fn failed(&mut self) {
-        self.delay = (self.delay * 2).min(60);
-        self.next = Instant::now() + Duration::from_secs(self.delay);
-    }
+
 }
 
-/// Steady-state membership reconcile (REVOKE-1). Polls the control-server's
-/// `device_config`; when its `config_epoch` advances (a device was revoked or a new
-/// one enrolled), diffs the peer set against `known` and adds/removes peers LIVE —
+/// Steady-state configuration reconcile. Polls the complete `device_config`
+/// even at an unchanged epoch (legacy servers and DNS rotation), diffs the
+/// settings and peer set, and adds/removes peers LIVE —
 /// routing tables + worker sessions + TUN routes — with no node restart. A revoked
 /// peer's session is dropped within one poll (~2s) so it can no longer send or
 /// receive (fail-closed). Endpoint-only roaming is left to wg/disco; the tcp-direct
@@ -162,7 +160,10 @@ struct HostEffects {
     control_host: String,
     relay_ips: parking_lot::Mutex<Vec<String>>,
     exclude_routes: Vec<String>,
-    dns_override: Vec<String>,
+    dns_override: parking_lot::Mutex<Vec<String>>,
+    local_dns: Vec<String>,
+    local_mtu: Option<i32>,
+    initial_mtu: Option<i32>,
     exit_state: ExitState,
     exit_progress: Arc<parking_lot::Mutex<route::ExitProgress>>,
     nat_state: NatState,
@@ -174,11 +175,12 @@ struct HostEffects {
     probe: Option<Arc<dyn Fn(HostStage) -> ApplyResult + Send + Sync>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HostStage { Routes, Exit, Dns, Nat, Retire }
+enum HostStage { Routes, Exit, Dns, Nat, Retire, Bypass }
 
 #[derive(Default)]
 struct HostRuntime {
     routes: apply::Routes,
+    bypass: bypass::State,
     dns: DnsInstall,
     dns_startup_checked: bool,
     dns_full_tunnel: bool,
@@ -235,7 +237,7 @@ impl HostEffects {
         runtime.retire_retry.run(epoch, Instant::now(), || self.effect(HostStage::Retire, || retire_exit(&self.exit_state, &self.shutdown, selected)))
     }
 
-    fn sync_exit(&self, peers: &[control::PeerInfo], bypass: &[String]) -> ApplyResult {
+    fn sync_exit(&self, peers: &[control::PeerInfo]) -> ApplyResult {
         if !self.manage_host_routes { return Ok(()); }
         static WINDOWS_WARNING: std::sync::Once = std::sync::Once::new();
         if skip_windows_exit(route::current_os(), &WINDOWS_WARNING, || {
@@ -247,32 +249,39 @@ impl HostEffects {
             route::cleanup_exit(&self.tun_name, &mut self.exit_progress.lock())?;
         }
         sync_exit_with(&self.exit_state, &self.shutdown, selected_exit(peers), |s| s.exit_peer,
-            || apply_exit(peers, &self.tun_name, bypass, &mut self.exit_progress.lock()), remove_exit)
+            || apply_exit(peers, &self.tun_name, &[], &mut self.exit_progress.lock()), remove_exit)
     }
 
-    async fn apply(self: &Arc<Self>, epoch: u64, peers: Vec<control::PeerInfo>, self_exit: bool) -> ApplyResult {
+    async fn apply(self: &Arc<Self>, epoch: u64, peers: Vec<control::PeerInfo>, self_exit: bool, retain: bool) -> ApplyResult {
         let bypass = self.prepare_bypass(epoch, &peers, |host| async move {
             tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host.as_str(), 0))).await
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "bypass DNS timeout"))?
                 .map(|addresses| addresses.map(|a| a.ip()).collect())
-        }).await;
+        }).await.map_err(|e| ApplyError::new(&["bypass", "resolve"], e.to_string()));
         let host = self.clone();
-        apply::blocking(move || host.tick(epoch, &peers, self_exit, &bypass)).await
+        apply::blocking(move || host.tick(epoch, &peers, self_exit, bypass, retain)).await
     }
 
-    async fn prepare_bypass<F, Fut>(&self, epoch: u64, peers: &[control::PeerInfo], resolve: F) -> Vec<String>
+    async fn prepare_bypass<F, Fut>(&self, _epoch: u64, peers: &[control::PeerInfo], resolve: F) -> std::io::Result<Vec<String>>
     where F: Fn(String) -> Fut, Fut: std::future::Future<Output = std::io::Result<Vec<std::net::IpAddr>>> {
-        if !self.manage_host_routes || *self.shutdown.lock() { return Vec::new(); }
-        if self.runtime.lock().retries.get(1).is_some_and(|retry| retry.waiting(epoch, Instant::now())) { return Vec::new(); }
-        let Some(exit) = selected_exit(peers).and_then(|pk| peers.iter().find(|p| p.pubkey == pk)) else { return Vec::new(); };
-        if self.exit_state.lock().as_ref().is_some_and(|s| s.exit_peer == exit.pubkey && !s.teardown_started.load(std::sync::atomic::Ordering::Relaxed)) { return Vec::new(); }
-        // No runtime, shutdown, exit-state or progress guard crosses DNS awaits.
-        let candidates = exit_bypass_candidates(&self.control_host, &self.relay_ips.lock(), exit, &self.exclude_routes);
+        if !self.manage_host_routes || *self.shutdown.lock() || (selected_exit(peers).is_none() && self.exit_state.lock().is_none()) { return Ok(Vec::new()); }
+        // Re-resolve every cycle, even when the selected exit and epoch are unchanged.
+        let candidates = exit_bypass_candidates(&self.control_host, &self.relay_ips.lock(), peers, &self.exclude_routes);
         resolve_bypass_candidates(candidates, resolve).await
     }
 
-    fn tick(&self, epoch: u64, peers: &[control::PeerInfo], self_exit: bool, bypass: &[String]) -> ApplyResult {
+    fn sync_bypass(&self, bypass: &[String], retain: bool) -> ApplyResult {
+        self.effect(HostStage::Bypass, || {
+            let mut runtime = self.runtime.lock();
+            let stopped = self.shutdown.lock();
+            if *stopped || !self.manage_host_routes || route::current_os() == route::RouteOs::Windows { return Ok(()); }
+            runtime.bypass.sync(bypass, retain)
+        })
+    }
+
+    fn tick(&self, epoch: u64, peers: &[control::PeerInfo], self_exit: bool, bypass: ApplyResult<Vec<String>>, retain: bool) -> ApplyResult {
         let retirement = self.retire(epoch, selected_exit(peers));
+        let carriers = bypass.and_then(|bypass| self.sync_bypass(&bypass, retain || retirement.is_err()));
         let mut runtime = self.runtime.lock();
         let HostRuntime { routes, dns, dns_startup_checked, dns_full_tunnel, retries, .. } = &mut *runtime;
         let now = Instant::now();
@@ -284,7 +293,7 @@ impl HostEffects {
         }));
         // A failed retirement retains its own delay and cannot reset or consume
         // the installation budget. Other host effects still run independently.
-        let exit = retirement.and_then(|()| exit_retry.run(epoch, now, || self.effect(HostStage::Exit, || self.sync_exit(peers, bypass))));
+        let exit = apply::all([retirement, carriers]).and_then(|()| exit_retry.run(epoch, now, || self.effect(HostStage::Exit, || self.sync_exit(peers))));
         let resolver = dns_retry.run(epoch, now, || self.effect(HostStage::Dns, || {
             let stopped = self.shutdown.lock();
             if *stopped || !self.manage_host_routes { return Ok(()); }
@@ -296,7 +305,7 @@ impl HostEffects {
                 Some(state.exit_peer) == selected_exit(peers) && !state.teardown_started.load(std::sync::atomic::Ordering::Relaxed)
             });
             let manage = std::env::var("FLUXPEER_MANAGE_DNS").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-            let desired = desired_dns(peers, &self.dns_override, ready, manage);
+            let desired = desired_dns(peers, &self.dns_override.lock(), ready, manage);
             sync_dns_mode_with(dns, dns_full_tunnel, desired.as_deref(), ready,
                 |dns, full| route::set_dns(&self.tun_name, dns, full), || route::reset_dns(&self.tun_name),
                 || route::verify_dns_file(&self.tun_name))
@@ -313,7 +322,8 @@ impl HostEffects {
             let pending = route::cleanup_exit(&self.tun_name, &mut self.exit_progress.lock());
             let dns = sync_dns_with(&mut runtime.dns, None, |_| Ok(()), || route::reset_dns(&self.tun_name));
             let nat = remove_nat(&self.nat_state, &self.tun_name);
-            result = apply::all([exit, pending, dns, nat]);
+            let carriers = if exit.is_ok() && pending.is_ok() { runtime.bypass.sync(&[], false) } else { Ok(()) };
+            result = apply::all([exit, pending, dns, nat, carriers]);
         });
         result
     }
@@ -592,28 +602,29 @@ fn apply_exit(
     }))
 }
 
-async fn resolve_bypass_candidates<F, Fut>(candidates: Vec<String>, resolve: F) -> Vec<String>
+async fn resolve_bypass_candidates<F, Fut>(candidates: Vec<String>, resolve: F) -> std::io::Result<Vec<String>>
 where F: Fn(String) -> Fut, Fut: std::future::Future<Output = std::io::Result<Vec<std::net::IpAddr>>> {
     use futures::StreamExt;
     let groups: Vec<_> = futures::stream::iter(candidates.into_iter().map(|candidate| {
         let resolve = &resolve;
         async move {
-            if candidate.parse::<fluxpeer_sdk::prefix::IpPrefix>().is_ok() { return vec![candidate]; }
+            if candidate.parse::<fluxpeer_sdk::prefix::IpPrefix>().is_ok() { return Ok(vec![candidate]); }
             match resolve(candidate.clone()).await {
-                Ok(addresses) => addresses.into_iter().map(|a| a.to_string()).collect(),
-                Err(error) => { tracing::warn!(%candidate, %error, "bypass resolution failed; skipping candidate"); Vec::new() }
+                Ok(addresses) if !addresses.is_empty() => Ok(addresses.into_iter().map(|a| a.to_string()).collect::<Vec<_>>()),
+                Ok(_) => Err(std::io::Error::other(format!("no bypass addresses for {candidate}"))),
+                Err(error) => Err(std::io::Error::other(format!("bypass resolution for {candidate}: {error}"))),
             }
         }
     })).buffered(8).collect().await;
-    let mut resolved: Vec<_> = groups.into_iter().flatten().collect();
-    resolved.sort(); resolved.dedup(); resolved
+    let mut resolved: Vec<_> = groups.into_iter().collect::<std::io::Result<Vec<_>>>()?.into_iter().flatten().collect();
+    resolved.sort(); resolved.dedup(); Ok(resolved)
 }
 
 /// Physical carrier addresses must escape both IPv4 and IPv6 split defaults.
-fn exit_bypass_candidates(control_host: &str, relays: &[String], exit: &control::PeerInfo, excludes: &[String]) -> Vec<String> {
-    let mut candidates = vec![control_host.to_string()];
+fn exit_bypass_candidates(control_host: &str, relays: &[String], peers: &[control::PeerInfo], excludes: &[String]) -> Vec<String> {
+    let mut candidates: Vec<_> = (!control_host.is_empty()).then(|| control_host.to_string()).into_iter().collect();
     candidates.extend(relays.iter().cloned());
-    candidates.extend(exit.candidates.iter().map(|c| c.ip().to_string()));
+    candidates.extend(peers.iter().flat_map(|peer| &peer.candidates).map(|c| c.ip().to_string()));
     candidates.extend(excludes.iter().cloned());
     candidates.sort();
     candidates.dedup();
@@ -641,16 +652,14 @@ impl Reconciler {
     }
 
     async fn reconcile_tick(&mut self) -> ApplyResult {
-        self.refresh_directory().await?;
-        // A newly usable relay may select an endpointless auto-exit at the same
-        // control epoch. Poll a full snapshot before publishing the candidates.
-        let changed = self.directory.as_ref().is_some_and(|d| d.pending.is_some());
-        let applied_epoch = if changed { None } else { self.apply_status.lock().applied_epoch };
-        let mut publish_directory = !changed;
         let mut control_result = Ok(());
+        let applied_epoch = self.apply_status.lock().applied_epoch;
         match control::poll_peers_if_changed(&self.client, &self.device_id, applied_epoch).await {
-            Ok(Some(snap)) => { self.pending = Some(snap); publish_directory = true; },
-            Ok(None) => {}
+            Ok(Some(snap)) => {
+                control_result = self.refresh_directory(&snap.platform).await;
+                self.pending = Some(snap);
+            }
+            Ok(None) => {},
             Err(error) => {
                 let failure = ApplyError::new(&["control", "device-config"], error.to_string());
                 if control::terminal_control_error(&error) {
@@ -660,51 +669,47 @@ impl Reconciler {
                 control_result = Err(failure);
             }
         }
-        apply::all([self.reconcile_effects().await, control_result])?;
-        if publish_directory && let Some(directory) = self.directory.as_mut() && let Some(targets) = directory.pending.take() {
-            directory.targets.send_replace(targets);
-            self.directory = None;
+        let effects = self.reconcile_effects().await;
+        if effects.is_ok() && control_result.is_ok()
+            && let Some(directory) = self.directory.as_mut()
+            && let Some(targets) = directory.pending.take()
+        { directory.targets.send_replace(targets); }
+        if effects.is_ok() && control_result.is_ok() && let Some(directory) = self.directory.as_mut() && directory.stun_pending {
+            match directory.refresh_stun(&directory.entries).await {
+                Ok(()) => directory.stun_pending = false,
+                Err(error) => {
+                    control_result = Err(ApplyError::new(&["control", "STUN endpoints"], error.to_string()));
+                    if control::terminal_control_error(&error) { self.terminal_control = Some(error); }
+                }
+            }
         }
-        Ok(())
+        let (mtu, _) = control::parse_settings(&self.platform.config);
+        let desired_mtu = self.host.local_mtu.or(mtu);
+        let mut status = self.apply_status.lock();
+        let changed = desired_mtu != self.host.initial_mtu;
+        if changed && !status.restart_required { tracing::warn!(?desired_mtu, "MTU changed; interface restart required"); }
+        status.restart_required = changed;
+        let mtu_result = if changed { Err(ApplyError::new(&["MTU", "restart-required"], "MTU changed; restart the interface to apply it")) } else { Ok(()) };
+        apply::all([effects, control_result, mtu_result])
     }
 
-    async fn refresh_directory(&mut self) -> ApplyResult {
+    async fn refresh_directory(&mut self, snapshot: &serde_json::Value) -> ApplyResult {
         let Some(directory) = self.directory.as_mut() else { return Ok(()); };
-        if directory.pending.is_none() {
-            if Instant::now() < directory.next { return Ok(()); }
-            match fetch_relays(&directory.config).await {
-                Ok(entries) if !entries.is_empty() => {
-                    if let Err(error) = directory.refresh_stun(&entries).await {
-                        if control::terminal_control_error(&error) {
-                            let failure = ApplyError::new(&["control", "STUN endpoints"], error.to_string());
-                            self.terminal_control = Some(error); return Err(failure);
-                        }
-                        tracing::warn!(%error, "refreshed STUN endpoint report failed");
-                    }
-                    let targets = relay_candidates(&directory.config, &entries);
-                    if targets == *directory.targets.borrow() { self.directory = None; return Ok(()); }
-                    directory.pending = Some(targets);
-                }
-                Ok(_) => { directory.failed(); return Ok(()); }
-                Err(error) if control::terminal_control_error(&error) => {
-                    let failure = ApplyError::new(&["control", "relay-directory"], error.to_string());
-                    self.terminal_control = Some(error); return Err(failure);
-                }
-                Err(error) => { tracing::warn!(%error, "relay directory refresh deferred"); directory.failed(); return Ok(()); }
-            }
+        let entries = control::snapshot_relays(snapshot).await
+            .map_err(|error| ApplyError::new(&["control", "relay-directory"], error.to_string()))?;
+        if entries != directory.entries {
+            directory.entries = entries.clone();
+            directory.stun_pending = true;
         }
-        if let Some(targets) = &directory.pending {
-            let ips: Vec<String> = targets.iter().map(|target| target.addr.ip().to_string()).collect();
-            if *self.host.relay_ips.lock() != ips {
-                // Remove the old exit before changing its physical relay bypasses.
-                // Publish to the dialer only after the new host effects succeed.
-                let host = self.host.clone();
-                let epoch = self.desired_epoch;
-                apply::blocking(move || host.retire(epoch, None)).await?;
-                *self.host.relay_ips.lock() = ips;
-            }
-            self.relay_available = !targets.is_empty();
-        }
+        let targets = relay_candidates(&directory.config, &entries);
+        // Retain published dialer addresses until the new targets are applied.
+        let mut ips: Vec<_> = entries.iter().flat_map(|r| &r.addresses).map(|a| a.ip().to_string()).collect();
+        ips.extend(entries.iter().filter_map(|entry| entry.stun).map(|a| a.ip().to_string()));
+        ips.extend(targets.iter().chain(directory.targets.borrow().iter()).map(|t| t.addr.ip().to_string()));
+        ips.sort(); ips.dedup();
+        *self.host.relay_ips.lock() = ips;
+        self.relay_available = !targets.is_empty();
+        directory.pending = (targets != *directory.targets.borrow()).then_some(targets);
         Ok(())
     }
 
@@ -714,7 +719,7 @@ impl Reconciler {
         let peers = self.desired.clone();
         let epoch = self.desired_epoch;
         let self_exit = self.self_exit;
-        let effects = host.apply(epoch, peers, self_exit).await;
+        let effects = host.apply(epoch, peers, self_exit, membership.is_err()).await;
         apply::all([membership, effects])?;
         self.platform.applied(&self.desired).map_err(|e| ApplyError::new(&["mobile", "onRoutes"], e.to_string()))
     }
@@ -724,15 +729,31 @@ impl Reconciler {
             self.desired_epoch = snap.epoch;
             self.self_exit = snap.self_exit;
             self.platform.config = snap.platform.clone();
+            let (_, dns) = control::parse_settings(&snap.platform);
+            *self.host.dns_override.lock() = if self.host.local_dns.is_empty() { dns } else { self.host.local_dns.clone() };
             let (_, desired) = control::apply_use_exit(&snap.peers, self.use_exit.as_deref(), self.relay_available);
             let host = self.host.clone();
             let epoch = snap.epoch;
             let selected = selected_exit(&desired);
             let retirement = apply::blocking(move || host.retire(epoch, selected)).await;
-            let mut errors = vec![retirement];
+            let carriers = {
+                let prepared = self.host.prepare_bypass(epoch, &desired, |host| async move {
+                    tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host.as_str(), 0))).await
+                        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "bypass DNS timeout"))?
+                        .map(|addresses| addresses.map(|a| a.ip()).collect())
+                }).await;
+                match prepared {
+                    Ok(bypass) => { let host = self.host.clone(); apply::blocking(move || host.sync_bypass(&bypass, true)).await },
+                    Err(error) => Err(ApplyError::new(&["bypass", "resolve"], error.to_string())),
+                }
+            };
+            let ready = carriers.is_ok();
+            let mut errors = vec![retirement, carriers];
             let mut changes = Vec::new();
             peer_changes(&self.known, &desired, |change| changes.push(change));
             for change in changes {
+                // Revocations and route removals remain fail-closed during DNS failures.
+                if !ready && matches!(change, PeerChange::Add(_) | PeerChange::Endpoints(_)) { continue; }
                 let result = match change {
                     PeerChange::Remove(pk) => self.remove_peer(pk).await,
                     PeerChange::Add(peer) => self.add_peer(peer).await,
@@ -742,7 +763,7 @@ impl Reconciler {
                 errors.push(result);
             }
             self.desired = desired;
-            if errors.iter().skip(1).all(Result::is_ok) { self.pending = None; }
+            if ready && errors.iter().skip(2).all(Result::is_ok) { self.pending = None; }
             return apply::all(errors);
         }
         Ok(())
@@ -955,7 +976,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
 
     // Pull the relay directory from coordination. Local cfg fields, if set, still
     // override it — so a node needs zero relay/STUN config in the common case.
-    let (relays_dir, relay_targets, refresh_directory) = bootstrap_directory_with(&cfg, || fetch_relays(&cfg)).await?;
+    let (relays_dir, relay_targets, _refresh_directory) = bootstrap_directory_with(&cfg, || fetch_relays(&cfg)).await?;
     let eff_stun: Option<SocketAddr> = cfg
         .stun_server
         .as_deref()
@@ -978,7 +999,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
             a.push(reflexive.to_string());
         }
         // The OS resolver may block; keep it off the cancellable engine future.
-        let control_host = url_host(&cfg.control_server);
+        let control_host = url_host(&cfg.control_server)?;
         if let Some(ip) = tokio::task::spawn_blocking(move || local_ipv4_toward(&control_host)).await.map_err(std::io::Error::other)? {
             a.push(format!("{ip}:{}", cfg.listen_port));
         }
@@ -1049,8 +1070,11 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     let dev_name = dev.get_ref().name().to_string();
     tracing::info!(tun = %cfg.tun_name, dev = %dev_name, addr = %r.own_addr, peers = peers.len(), fd = ?injected_fd, "TUN up");
 
-    let control_host = url_host(&cfg.control_server);
-    let relay_ips: Vec<String> = relay_targets.iter().map(|rt| rt.addr.ip().to_string()).collect();
+    let control_host = url_host(&cfg.control_server)?;
+    let mut relay_ips: Vec<String> = relay_targets.iter().map(|rt| rt.addr.ip().to_string()).collect();
+    relay_ips.extend(relays_dir.iter().flat_map(|entry| &entry.addresses).map(|addr| addr.ip().to_string()));
+    relay_ips.extend(relays_dir.iter().filter_map(|entry| entry.stun).map(|addr| addr.ip().to_string()));
+    relay_ips.sort(); relay_ips.dedup();
 
     // Host route/DNS/exit setup — ONLY when we own the device. With an injected fd
     // (mobile VpnService) the OS already installed the address, routes (incl. any
@@ -1064,7 +1088,8 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     let apply_status = Arc::new(parking_lot::Mutex::new(apply::Status::default()));
     let host = Arc::new(HostEffects {
         tun_name: dev_name.clone(), own_cidr, control_host, relay_ips: parking_lot::Mutex::new(relay_ips),
-        exclude_routes: cfg.exclude_routes.clone(), dns_override: eff_dns.clone(),
+        exclude_routes: cfg.exclude_routes.clone(), dns_override: parking_lot::Mutex::new(eff_dns.clone()),
+        local_dns: cfg.dns.clone(), local_mtu: cfg.mtu, initial_mtu: cfg.mtu.or(r.mtu),
         exit_state, exit_progress, nat_state: Arc::default(), provider: ProviderPolicy::from_config(&cfg, embedded),
         manage_host_routes: !embedded, shutdown, runtime: parking_lot::Mutex::new(HostRuntime::default()),
         #[cfg(test)] probe: None,
@@ -1099,7 +1124,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     let initial_host = host.clone();
     let initial_peers = peers.clone();
     let self_exit = r.self_exit;
-    let result = initial_host.apply(init_epoch, initial_peers, self_exit).await;
+    let result = initial_host.apply(init_epoch, initial_peers, self_exit, false).await;
     apply_status.lock().complete(init_epoch, result);
 
 
@@ -1116,8 +1141,9 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     // A recovered directory feeds the same supervisor without restarting TUN.
     let (targets_tx, targets_rx) = tokio::sync::watch::channel(relay_targets);
     let stun_replies = Arc::new(control::StunRefresh::default());
-    let directory = refresh_directory.then(|| {
+    let directory = Some({
         let mut refresh = DirectoryRefresh::new(cfg.clone(), targets_tx.clone());
+        refresh.entries = relays_dir;
         refresh.stun = Some((udp.clone(), stun_replies.clone(), advertise.clone()));
         refresh
     });
@@ -1590,7 +1616,7 @@ fn sync_host(
 fn desired_dns(peers: &[control::PeerInfo], overrides: &[String], exit_ready: bool, manage_admin: bool) -> Option<String> {
     if let Some(pk) = selected_exit(peers) {
         if !exit_ready { return None; }
-        overrides.first().cloned().or_else(|| peers.iter().find(|p| p.pubkey == pk)?.overlay.map(|a| a.to_string()))
+        (!overrides.is_empty()).then(|| overrides.join(" ")).or_else(|| peers.iter().find(|p| p.pubkey == pk)?.overlay.map(|a| a.to_string()))
     } else if manage_admin && !overrides.is_empty() {
         Some(overrides.join(" "))
     } else { None }
@@ -1618,7 +1644,7 @@ mod exit_contract_tests {
 
     fn test_host() -> HostEffects {
         HostEffects { tun_name: "fp-test".into(), own_cidr: "100.72.16.0/24".into(), control_host: String::new(), relay_ips: parking_lot::Mutex::new(vec![]),
-            exclude_routes: vec![], dns_override: vec![], exit_state: Arc::default(), exit_progress: Arc::default(), nat_state: Arc::default(),
+            exclude_routes: vec![], dns_override: parking_lot::Mutex::new(vec![]), local_dns: vec![], local_mtu: None, initial_mtu: None, exit_state: Arc::default(), exit_progress: Arc::default(), nat_state: Arc::default(),
             provider: ProviderPolicy { enabled: false, force: None, veto: false, trust_external: false }, manage_host_routes: false,
             shutdown: Arc::default(), runtime: parking_lot::Mutex::default(), probe: None }
     }
@@ -1651,7 +1677,7 @@ mod exit_contract_tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
         let mut cfg = directory_config(None, false); cfg.control_server = format!("http://{addr}");
         let (targets, mut updates) = tokio::sync::watch::channel(vec![]);
-        let mut directory = DirectoryRefresh::new(cfg.clone(), targets.clone()); directory.next = Instant::now();
+        let directory = DirectoryRefresh::new(cfg.clone(), targets.clone());
         let (tx, _rx) = mpsc::channel(16);
         let mut old = peer(1, "192.0.2.1:1", &["100.72.16.2/32"]); old.candidates.clear();
         let mut r = test_reconciler(test_host(), old.clone(), old, tx);
@@ -1659,12 +1685,110 @@ mod exit_contract_tests {
         r.apply_status.lock().complete(1, Ok(()));
         r.directory = Some(directory);
         r.reconcile_tick().await.unwrap();
-        assert!(r.directory.is_none()); assert!(r.relay_available);
+        assert!(r.directory.is_some()); assert!(r.relay_available);
         assert_eq!(selected_exit(&r.desired), Some([1; 32]));
         assert_eq!(*r.host.relay_ips.lock(), ["127.0.0.1"]);
         assert!(updates.has_changed().unwrap());
         assert_eq!(updates.borrow_and_update().first().unwrap().node_id, "edge");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn complete_snapshots_apply_same_epoch_settings_and_relays_and_hold_failed_epochs() {
+        use axum::{routing::get, Json, Router};
+        let snapshot = Arc::new(parking_lot::Mutex::new(serde_json::json!({
+            "config_epoch":2,"mtu":1400,"dns":["192.0.2.53"],
+            "peers":[{"wg_public_key":hex::encode([1;32]),"endpoints":["192.0.2.1:1"],"allowed_ips":["100.72.16.2/32"]}],
+            "relays":[{"id":"relay-1","node_id":"edge-a","url":"192.0.2.10:443","anytls":true}]
+        })));
+        let capture = snapshot.clone();
+        let app = Router::new().route("/api/v1/devices/test/config", get(move || {
+            let response = capture.lock().clone(); async move { Json(response) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let mut cfg = directory_config(None, false); cfg.control_server = format!("http://{address}");
+        let (targets, updates) = tokio::sync::watch::channel(vec![]);
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let capture = failed.clone();
+        let mut host = test_host(); host.initial_mtu = Some(1400);
+        host.probe = Some(Arc::new(move |stage| {
+            if stage == HostStage::Bypass && capture.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(ApplyError::new(&["route", "add"], "injected bypass failure"))
+            } else { Ok(()) }
+        }));
+        let old = peer(1, "192.0.2.1:1", &["100.72.16.2/32"]);
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut r = test_reconciler(host, old.clone(), old, tx);
+        r.client = control::mk_client(&cfg); r.directory = Some(DirectoryRefresh::new(cfg, targets));
+        r.apply_status.lock().complete(1, Ok(()));
+        let outcome = r.reconcile_tick().await; outcome.as_ref().unwrap();
+        r.apply_status.lock().complete(r.desired_epoch, outcome);
+        assert_eq!(r.apply_status.lock().applied_epoch, Some(2));
+        assert_eq!(*r.host.dns_override.lock(), ["192.0.2.53"]);
+        assert_eq!(updates.borrow()[0].node_id, "edge-a");
+        // Legacy control may retain its epoch. DNS, routes, endpoints and directory still change.
+        {
+            let mut conf = snapshot.lock();
+            conf["dns"] = serde_json::json!(["192.0.2.54", "2001:db8::53"]);
+            conf["relays"][0]["url"] = "192.0.2.11:443".into();
+            conf["relays"][0]["node_id"] = "edge-b".into();
+            conf["peers"][0]["endpoints"] = serde_json::json!(["192.0.2.2:2"]);
+            conf["peers"][0]["allowed_ips"] = serde_json::json!(["100.72.16.2/32", "10.0.0.0/8"]);
+        }
+        r.reconcile_tick().await.unwrap();
+        assert_eq!(*r.host.dns_override.lock(), ["192.0.2.54", "2001:db8::53"]);
+        assert_eq!(updates.borrow()[0].node_id, "edge-b");
+        assert!(r.host.relay_ips.lock().contains(&"192.0.2.10".into())); // still-published carrier retained until switch
+        assert!(r.host.relay_ips.lock().contains(&"192.0.2.11".into()));
+        assert_eq!(r.known[&[1;32]].2, ["100.72.16.2/32", "10.0.0.0/8"]);
+        assert!(matches!(rx.try_recv(), Ok(worker::WorkerMsg::UpdateCandidates { .. })));
+        r.reconcile_tick().await.unwrap();
+        assert_eq!(*r.host.relay_ips.lock(), ["192.0.2.11"]);
+        {
+            let mut conf = snapshot.lock(); conf["config_epoch"] = 3.into(); conf["mtu"] = 1300.into();
+        }
+        let outcome = r.reconcile_tick().await;
+        assert!(outcome.as_ref().unwrap_err().stderr.contains("restart"));
+        r.apply_status.lock().complete(r.desired_epoch, outcome);
+        assert!(r.apply_status.lock().restart_required);
+        assert_eq!(r.apply_status.lock().applied_epoch, Some(2));
+        snapshot.lock()["mtu"] = 1400.into();
+        let outcome = r.reconcile_tick().await; outcome.as_ref().unwrap();
+        r.apply_status.lock().complete(r.desired_epoch, outcome);
+        assert!(!r.apply_status.lock().restart_required);
+        assert_eq!(r.apply_status.lock().applied_epoch, Some(3));
+        {
+            let mut conf = snapshot.lock(); conf["config_epoch"] = 4.into(); conf["relays"] = serde_json::json!([]);
+        }
+        failed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = r.reconcile_tick().await; assert!(outcome.is_err());
+        r.apply_status.lock().complete(r.desired_epoch, outcome);
+        assert_eq!(r.apply_status.lock().applied_epoch, Some(3));
+        assert_eq!(updates.borrow()[0].node_id, "edge-b"); // never publish an unprotected dialer target set
+        failed.store(false, std::sync::atomic::Ordering::SeqCst);
+        let outcome = r.reconcile_tick().await; outcome.as_ref().unwrap();
+        r.apply_status.lock().complete(r.desired_epoch, outcome);
+        assert_eq!(r.apply_status.lock().applied_epoch, Some(4));
+        assert!(updates.borrow().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bypass_covers_all_peers_and_rotates_all_control_answers_at_same_epoch() {
+        let mut host = test_host(); host.manage_host_routes = true; host.control_host = "control.test".into();
+        *host.relay_ips.lock() = vec!["192.0.2.10".into(), "2001:db8::10".into()];
+        let peers = vec![peer(1, "192.0.2.1:1", &["0.0.0.0/0"]), peer(2, "192.0.2.2:2", &["100.72.16.3/32"]),
+            peer(3, "[2001:db8::3]:3", &["100.72.16.4/32"])];
+        let initial = host.prepare_bypass(1, &peers, |_| std::future::ready(Ok(vec!["192.0.2.8".parse().unwrap(), "2001:db8::8".parse().unwrap()]))).await.unwrap();
+        for address in ["192.0.2.1", "192.0.2.2", "2001:db8::3", "192.0.2.10", "2001:db8::10", "192.0.2.8", "2001:db8::8"] {
+            assert!(initial.contains(&address.into()), "missing {address}");
+        }
+        let rotated = host.prepare_bypass(1, &peers, |_| std::future::ready(Ok(vec!["192.0.2.9".parse().unwrap()]))).await.unwrap();
+        assert!(rotated.contains(&"192.0.2.9".into()));
+        assert!(!rotated.contains(&"192.0.2.8".into())); assert!(!rotated.contains(&"2001:db8::8".into()));
+        assert!(host.prepare_bypass(1, &peers, |_| std::future::ready(Err(std::io::Error::other("DNS unavailable")))).await.is_err());
     }
 
     #[tokio::test]
@@ -1694,7 +1818,7 @@ mod exit_contract_tests {
         host.retire(1, None).unwrap_err();
         // A successful exit stage cannot erase retirement's backoff.
         host.runtime.lock().retries[1].run(1, Instant::now(), || Ok(())).unwrap();
-        host.tick(1, &[], false, &[]).unwrap_err();
+        host.tick(1, &[], false, Ok(vec![]), false).unwrap_err();
         assert_eq!(calls.lock().iter().filter(|stage| **stage == HostStage::Retire).count(), 1);
         assert!(!calls.lock().contains(&HostStage::Exit));
         // Nor can a successful retirement erase a failed installation's delay.
@@ -1716,16 +1840,17 @@ mod exit_contract_tests {
     }
 
     #[tokio::test]
-    async fn exit_retry_backoff_skips_bypass_dns_until_new_epoch() {
+    async fn bypass_dns_refreshes_even_during_exit_retry_backoff() {
         let mut host = test_host(); host.manage_host_routes = true; host.control_host = "control.test".into();
         let peers = vec![peer(1, "192.0.2.1:1", &["0.0.0.0/0"])];
         host.runtime.lock().retries[1].run(1, Instant::now(), || Err(ApplyError::new(&["route"], "injected failure"))).unwrap_err();
-        assert!(host.prepare_bypass(1, &peers, |_| -> std::future::Ready<std::io::Result<Vec<std::net::IpAddr>>> { panic!("backoff must skip DNS") }).await.is_empty());
+        let initial = host.prepare_bypass(1, &peers, |_| std::future::ready(Ok(vec!["192.0.2.8".parse().unwrap()]))).await.unwrap();
+        assert!(initial.contains(&"192.0.2.8".into()));
         let calls = std::cell::Cell::new(0);
         let resolved = host.prepare_bypass(2, &peers, |_| {
             calls.set(calls.get() + 1);
             std::future::ready(Ok(vec!["192.0.2.9".parse().unwrap()]))
-        }).await;
+        }).await.unwrap();
         assert_eq!(calls.get(), 1); assert!(!resolved.is_empty());
     }
 
@@ -1854,7 +1979,7 @@ mod exit_contract_tests {
         r.apply_status.lock().complete(1, Ok(()));
         let result = r.reconcile_tick().await;
         r.apply_status.lock().complete(r.desired_epoch, result);
-        assert_eq!(*calls.lock(), [HostStage::Routes, HostStage::Exit, HostStage::Dns, HostStage::Nat]);
+        assert_eq!(*calls.lock(), [HostStage::Bypass, HostStage::Bypass, HostStage::Routes, HostStage::Exit, HostStage::Dns, HostStage::Nat]);
         assert_eq!(r.apply_status.lock().applied_epoch, Some(1));
         assert!(r.apply_status.lock().last_error.as_ref().unwrap().stderr.contains("Dns denied"));
         assert!(r.apply_status.lock().last_error.as_ref().unwrap().stderr.contains("Routes denied"));
@@ -1862,8 +1987,18 @@ mod exit_contract_tests {
         assert!(matches!(rx.recv().await, Some(worker::WorkerMsg::UpdateCandidates { .. })));
         calls.lock().clear();
         assert!(r.reconcile_tick().await.is_err());
-        assert_eq!(*calls.lock(), [HostStage::Exit, HostStage::Nat]); // failed effects respect independent backoff
+        assert_eq!(*calls.lock(), [HostStage::Bypass, HostStage::Exit, HostStage::Nat]); // failed effects respect independent backoff
         assert_eq!(reports.load(std::sync::atomic::Ordering::SeqCst), 0); // failed config is never exported
+    }
+
+    #[test]
+    fn bypass_resolution_failure_does_not_block_route_dns_or_nat_effects() {
+        let mut host = test_host();
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new())); let capture = calls.clone();
+        host.probe = Some(Arc::new(move |stage| { capture.lock().push(stage); Ok(()) }));
+        let failure = ApplyError::new(&["bypass", "resolve"], "DNS unavailable");
+        assert!(host.tick(2, &[], false, Err(failure), false).is_err());
+        assert_eq!(*calls.lock(), [HostStage::Routes, HostStage::Dns, HostStage::Nat]);
     }
 
     #[tokio::test]
@@ -2193,9 +2328,13 @@ mod exit_contract_tests {
     #[test]
     fn ipv6_carrier_literals_are_preserved_as_bypass_candidates() {
         let exit = peer(1, "[2001:db8::3]:1234", &["0.0.0.0/0"]);
-        let host = url_host("https://[2001:db8::1]:443/api");
+        let host = url_host("https://[2001:db8::1]:443/api").unwrap();
         assert_eq!(host, "2001:db8::1");
-        assert_eq!(exit_bypass_candidates(&host, &["2001:db8::2".into()], &exit, &[]),
+        assert_eq!(url_host("https://control.example:8443/path?redirect=wrong.example").unwrap(), "control.example");
+        assert_eq!(url_host("http://192.0.2.4:8080/").unwrap(), "192.0.2.4");
+        assert!(url_host("not a URL").is_err());
+        assert!(url_host("file:///tmp/config").is_err());
+        assert_eq!(exit_bypass_candidates(&host, &["2001:db8::2".into()], &[exit], &[]),
             ["2001:db8::1", "2001:db8::2", "2001:db8::3"]);
     }
 

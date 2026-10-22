@@ -24,6 +24,7 @@ pub enum StoreError {
     NetworkNotFound,
     DeviceNotFound,
     RouteNotFound,
+    RelayNotFound,
     InvalidPrefix,
     InvalidKey,
     InvalidInvite,
@@ -342,8 +343,23 @@ impl Store {
             stun_url: stun_url.or_else(|| Some(url.to_string())),
             node_id,
         };
-        self.inner.lock().relays.insert(relay.id.clone(), relay.clone());
+        let mut inner = self.inner.lock();
+        inner.relays.insert(relay.id.clone(), relay.clone());
+        let networks: Vec<_> = inner.networks.keys().filter(|id| relay.network_id.as_ref().is_none_or(|scope| scope == *id)).cloned().collect();
+        for id in networks { bump_epoch(&mut inner, &id); }
         relay
+    }
+
+    pub fn update_relay(&self, relay: RelayNode) -> Result<RelayNode, StoreError> {
+        let mut inner = self.inner.lock();
+        if let Some(scope) = &relay.network_id && !inner.networks.contains_key(scope) { return Err(StoreError::NetworkNotFound); }
+        let old = inner.relays.get(&relay.id).ok_or(StoreError::RelayNotFound)?;
+        let networks: Vec<_> = inner.networks.keys().filter(|id|
+            old.network_id.as_ref().is_none_or(|scope| scope == *id)
+            || relay.network_id.as_ref().is_none_or(|scope| scope == *id)).cloned().collect();
+        inner.relays.insert(relay.id.clone(), relay.clone());
+        for id in networks { bump_epoch(&mut inner, &id); }
+        Ok(relay)
     }
 
     /// Relays usable by a network: those scoped to it plus shared/official ones.
@@ -704,6 +720,20 @@ mod test {
         s.delete_route(&route.id).unwrap();
         assert!(!s.device_config(&exit_dev.id).unwrap().self_exit);
         assert!(!peer_exit(&s));
+    }
+
+    #[test]
+    fn relay_registration_and_updates_invalidate_old_and_new_scopes() {
+        let s = Store::new(); let a = s.create_network("a"); let b = s.create_network("b");
+        let epochs = || { let g = s.inner.lock(); (g.networks[&a.id].config_epoch, g.networks[&b.id].config_epoch) };
+        let mut relay = s.register_relay("eu", "192.0.2.1:443", Some(a.id.clone()), true, None, None);
+        assert_eq!(epochs(), (1, 0));
+        relay.network_id = Some(b.id.clone()); s.update_relay(relay.clone()).unwrap();
+        assert_eq!(epochs(), (2, 1)); assert!(s.list_relays(&a.id).is_empty());
+        relay.network_id = None; s.update_relay(relay.clone()).unwrap(); assert_eq!(epochs(), (3, 2));
+        relay.network_id = Some(a.id.clone()); s.update_relay(relay.clone()).unwrap(); assert_eq!(epochs(), (4, 3));
+        relay.network_id = Some("missing".into()); assert!(s.update_relay(relay).is_err()); assert_eq!(epochs(), (4, 3));
+        s.register_relay("shared", "192.0.2.2:443", None, false, None, None); assert_eq!(epochs(), (5, 4));
     }
 
     #[test]

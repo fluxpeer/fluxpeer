@@ -103,7 +103,7 @@ fn bypass_cmd(os: RouteOs, dst: &str, via: Option<(&str, &str)>) -> Option<Vec<S
 
 /// IPv6 carriers must bypass through the IPv6 physical gateway, never through
 /// the IPv4 gateway. Query before installing the guard's /1 routes.
-fn physical_v6_route() -> Result<Option<(String, String)>> {
+pub(crate) fn physical_v6_route() -> Result<Option<(String, String)>> {
     let command: &[&str] = match current_os() {
         RouteOs::Linux => &["ip", "-6", "route", "show", "default"],
         RouteOs::Macos => &["route", "-n", "get", "-inet6", "default"],
@@ -564,26 +564,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_hostname_bypasses_cover_all_ips_and_resolution_failure_keeps_exit_up() {
-        let queried = std::cell::RefCell::new(Vec::new());
-        let candidates = crate::resolve_bypass_candidates(vec!["control.example".into(), "relay.example".into(), "missing.example".into()], |host| {
-            queried.borrow_mut().push(host.to_string());
-            std::future::ready(if host == "missing.example" { Err(std::io::Error::other("resolver offline")) }
-                else { Ok(vec!["192.0.2.2".parse().unwrap(), "2001:db8::2".parse().unwrap()]) })
-        }).await;
-        assert_eq!(queried.borrow().len(), 3);
+    async fn resolved_hostname_bypasses_cover_all_ips_and_failure_is_not_partial_success() {
+        let candidates = crate::resolve_bypass_candidates(vec!["control.example".into(), "relay.example".into()], |_| {
+            std::future::ready(Ok(vec!["192.0.2.2".parse().unwrap(), "2001:db8::2".parse().unwrap()]))
+        }).await.unwrap();
         assert_eq!(candidates, ["192.0.2.2", "2001:db8::2"]);
-        let mut progress = ExitProgress::default();
-        let mut installed = Vec::new();
-        exit_up_with(&mut progress, &candidates, |effect| {
-            if let ExitEffect::BypassAdd(ip) = effect { installed.push(ip.to_string()); }
-            Ok(true)
-        }).unwrap();
-        assert_eq!(installed, candidates);
-        let empty = crate::resolve_bypass_candidates(vec!["missing.example".into()], |_| std::future::ready(Err(std::io::Error::other("unresolved")))).await;
-        let mut progress = ExitProgress::default();
-        exit_up_with(&mut progress, &empty, |_| Ok(false)).unwrap();
-        assert_eq!(progress.defaults.len(), 2);
+        assert!(crate::resolve_bypass_candidates(vec!["192.0.2.2".into(), "missing.example".into()], |_| {
+            std::future::ready(Err(std::io::Error::other("resolver offline")))
+        }).await.is_err());
     }
 
     #[test]

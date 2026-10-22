@@ -20,6 +20,7 @@ use crate::domain::{
 };
 use crate::ipam::{DEVICE_HOST_MAX, DEVICE_HOST_MIN};
 use crate::persistence as db;
+use sqlx::Row;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqlStoreError {
@@ -27,6 +28,8 @@ pub enum SqlStoreError {
     NetworkNotFound,
     #[error("device not found")]
     DeviceNotFound,
+    #[error("relay not found")]
+    RelayNotFound,
     #[error("route not found")]
     RouteNotFound,
     #[error("invalid route prefix")]
@@ -639,7 +642,28 @@ impl SqlStore {
             node_id,
         };
         db::insert_relay(&mut *tx, &relay).await?;
+        let networks: Vec<String> = sqlx::query_scalar("SELECT id FROM network WHERE CAST($1 AS TEXT) IS NULL OR id = $1")
+            .bind(&relay.network_id).fetch_all(&mut *tx).await?;
+        for id in &networks { db::bump_network_epoch(&mut *tx, id).await?; }
         tx.commit().await?;
+        for id in networks { self.notify(&id).await; }
+        Ok(relay)
+    }
+
+    pub async fn update_relay(&self, relay: RelayNode) -> Result<RelayNode> {
+        let mut tx = crate::integrity::begin(&self.pool).await?;
+        if let Some(scope) = &relay.network_id && db::get_network(&mut *tx, scope).await?.is_none() { return Err(SqlStoreError::NetworkNotFound); }
+        let old = sqlx::query("SELECT network_id FROM relay WHERE id = $1").bind(&relay.id)
+            .fetch_optional(&mut *tx).await?.ok_or(SqlStoreError::RelayNotFound)?;
+        let old_scope: Option<String> = old.try_get("network_id")?;
+        sqlx::query("UPDATE relay SET region = $2, url = $3, network_id = $4, anytls = $5, stun_url = $6, node_id = $7 WHERE id = $1")
+            .bind(&relay.id).bind(&relay.region).bind(&relay.url).bind(&relay.network_id)
+            .bind(i64::from(relay.anytls)).bind(&relay.stun_url).bind(&relay.node_id).execute(&mut *tx).await?;
+        let networks: Vec<String> = sqlx::query_scalar("SELECT id FROM network WHERE CAST($1 AS TEXT) IS NULL OR CAST($2 AS TEXT) IS NULL OR id = $1 OR id = $2")
+            .bind(&old_scope).bind(&relay.network_id).fetch_all(&mut *tx).await?;
+        for id in &networks { db::bump_network_epoch(&mut *tx, id).await?; }
+        tx.commit().await?;
+        for id in networks { self.notify(&id).await; }
         Ok(relay)
     }
 
@@ -794,6 +818,38 @@ mod test {
         let cfg = s.device_config(&a.id).await.unwrap();
         assert_eq!(cfg.peers[0].wg_public_key, "591e59cef10116c9a0d6ccf709d50c44a024ff5dbaa1e38841223c4027e9f584");
         assert_eq!(cfg.peers[0].endpoints, eps);
+    }
+
+    #[tokio::test]
+    async fn relay_mutations_bump_only_affected_epochs_notify_and_rollback_atomically() {
+        let url = "sqlite:file:relay_epoch_sync?mode=memory&cache=shared";
+        let s = SqlStore::connect(url).await.unwrap();
+        let a = s.create_network("a").await.unwrap(); let b = s.create_network("b").await.unwrap();
+        let c = s.create_network("c").await.unwrap();
+        let mut wa = s.subscribe(&a.id); let mut wb = s.subscribe(&b.id); let mut wc = s.subscribe(&c.id);
+        let mut relay = s.register_relay("eu", "192.0.2.1:443", Some(a.id.clone()), true, None, Some("edge".into())).await.unwrap();
+        assert_eq!(*wa.borrow_and_update(), 1); assert!(!wb.has_changed().unwrap()); assert!(!wc.has_changed().unwrap());
+        relay.network_id = Some(b.id.clone()); relay.url = "192.0.2.2:443".into();
+        s.update_relay(relay.clone()).await.unwrap();
+        assert_eq!(*wa.borrow_and_update(), 2); assert_eq!(*wb.borrow_and_update(), 1); assert!(!wc.has_changed().unwrap());
+        assert!(s.list_relays(&a.id).await.unwrap().is_empty());
+        let reopened = SqlStore::connect(url).await.unwrap();
+        assert_eq!(reopened.list_relays(&b.id).await.unwrap(), [relay.clone()]);
+        relay.network_id = None;
+        s.update_relay(relay.clone()).await.unwrap();
+        assert_eq!(*wa.borrow_and_update(), 3); assert_eq!(*wb.borrow_and_update(), 2); assert_eq!(*wc.borrow_and_update(), 1);
+        relay.network_id = Some(c.id.clone());
+        s.update_relay(relay.clone()).await.unwrap(); // shared -> scoped must also invalidate networks losing visibility
+        assert_eq!(*wa.borrow_and_update(), 4); assert_eq!(*wb.borrow_and_update(), 3); assert_eq!(*wc.borrow_and_update(), 2);
+        let saved = relay.clone();
+        sqlx::query("CREATE TRIGGER reject_relay_epoch BEFORE UPDATE OF config_epoch ON network BEGIN SELECT RAISE(ABORT, 'injected epoch failure'); END")
+            .execute(&s.pool).await.unwrap();
+        relay.url = "192.0.2.99:443".into();
+        assert!(s.update_relay(relay).await.is_err());
+        assert!(s.register_relay("bad", "192.0.2.99:443", None, false, None, None).await.is_err());
+        assert_eq!(reopened.list_relays(&c.id).await.unwrap(), [saved]);
+        assert_eq!(db::get_network(&s.pool, &c.id).await.unwrap().unwrap().config_epoch, 2);
+        assert!(!wa.has_changed().unwrap()); assert!(!wb.has_changed().unwrap()); assert!(!wc.has_changed().unwrap());
     }
 
     #[tokio::test]

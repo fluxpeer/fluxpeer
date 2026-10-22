@@ -89,6 +89,7 @@ pub(crate) fn parse_settings(conf: &serde_json::Value) -> (Option<i32>, Vec<Stri
 
 /// A relay learned from the control-server relay directory (A-finish: nodes pull
 /// relay/STUN endpoints from coordination instead of pinning them in config).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RelayDir {
     pub(crate) addresses: Vec<SocketAddr>,
     pub(crate) anytls: bool,
@@ -192,11 +193,20 @@ impl std::fmt::Display for DirectoryResolutionFailed {
 }
 impl std::error::Error for DirectoryResolutionFailed {}
 
-async fn resolve_relay_directory(conf: &serde_json::Value) -> std::io::Result<Vec<RelayDir>> {
+pub(crate) async fn resolve_relay_directory(conf: &serde_json::Value) -> std::io::Result<Vec<RelayDir>> {
     resolve_directory_with(conf, |endpoint| async move { resolve_directory_endpoint(&endpoint).await }).await
 }
 
 async fn resolve_directory_with<F, Fut>(conf: &serde_json::Value, resolve: F) -> std::io::Result<Vec<RelayDir>>
+where F: Fn(String) -> Fut + Sync, Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send {
+    resolve_directory_mode(conf, resolve, false).await
+}
+
+pub(crate) async fn snapshot_relays(conf: &serde_json::Value) -> std::io::Result<Vec<RelayDir>> {
+    resolve_directory_mode(conf, |endpoint| async move { resolve_directory_endpoint(&endpoint).await }, true).await
+}
+
+async fn resolve_directory_mode<F, Fut>(conf: &serde_json::Value, resolve: F, strict: bool) -> std::io::Result<Vec<RelayDir>>
 where F: Fn(String) -> Fut + Sync, Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send {
     use futures::{FutureExt, StreamExt};
     let Some(entries) = conf["relays"].as_array() else { return Ok(Vec::new()); };
@@ -212,7 +222,7 @@ where F: Fn(String) -> Fut + Sync, Fut: std::future::Future<Output = std::io::Re
             Err(error) => dns_failed |= error.kind() != std::io::ErrorKind::InvalidInput,
         }
     }
-    if relays.is_empty() && dns_failed { return Err(std::io::Error::other(DirectoryResolutionFailed)); }
+    if (strict || relays.is_empty()) && dns_failed { return Err(std::io::Error::other(DirectoryResolutionFailed)); }
     Ok(relays)
 }
 
@@ -398,20 +408,17 @@ pub(crate) struct Snapshot {
     pub(crate) self_exit: bool,
 }
 
-/// Steady-state membership reconcile (REVOKE-1): poll `device_config` and, when the
-/// `config_epoch` advances, return the fresh snapshot so the caller can diff it
-/// against the live set and add/remove/re-route peers WITHOUT a restart. Returns
-/// `None` when nothing changed. Errors preserve classification for retry backoff.
+/// Pull the entire device snapshot on every reconcile, including legacy servers
+/// whose epoch does not cover settings or directory updates. Callers diff fields
+/// and re-resolve carrier names independently of the epoch.
 pub(crate) async fn poll_peers_if_changed(
     client: &Client,
     device_id: &str,
-    applied_epoch: Option<u64>,
+    _applied_epoch: Option<u64>,
 ) -> std::io::Result<Option<Snapshot>> {
     let conf = client.device_config(device_id).await.map_err(request_error)?;
     let epoch = config_epoch(&conf);
-    if Some(epoch) == applied_epoch {
-        return Ok(None);
-    }
+    // Compare the full snapshot even at an unchanged/legacy epoch; DNS may rotate.
     Ok(Some(Snapshot {
         platform: conf.clone(),
         epoch,
@@ -546,6 +553,23 @@ mod tests {
             Ok(vec!["192.0.2.1:443".parse().unwrap()])
         } else { Err(std::io::Error::other("DNS unavailable")) })).await.unwrap();
         assert_eq!(relays.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_snapshot_requires_all_relay_addresses_and_re_resolves_names() {
+        let conf = serde_json::json!({"relays":[
+            {"id":"relay-1", "node_id":"edge-a", "url":"good.test:443"},
+            {"id":"relay-2", "node_id":"edge-b", "url":"bad.test:443"}
+        ]});
+        let failed = resolve_directory_mode(&conf, |endpoint| std::future::ready(if endpoint.starts_with("good") {
+            Ok(vec!["192.0.2.1:443".parse().unwrap()])
+        } else { Err(std::io::Error::other("DNS unavailable")) }), true).await;
+        assert!(failed.is_err()); // A partial directory must not replace an applied snapshot.
+        for address in ["192.0.2.2:443", "192.0.2.3:443"] {
+            let entries = resolve_directory_mode(&conf, |_| std::future::ready(Ok(vec![address.parse().unwrap()])), true).await.unwrap();
+            assert_eq!(entries.len(), 2);
+            assert!(entries.iter().all(|entry| entry.addresses == vec![address.parse::<SocketAddr>().unwrap()]));
+        }
     }
 
     #[tokio::test]

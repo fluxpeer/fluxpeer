@@ -8,7 +8,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -67,7 +67,7 @@ async fn version() -> Json<VersionInfo> {
 
 fn store_status(e: StoreError) -> StatusCode {
     match e {
-        StoreError::NetworkNotFound | StoreError::DeviceNotFound | StoreError::RouteNotFound => StatusCode::NOT_FOUND,
+        StoreError::NetworkNotFound | StoreError::DeviceNotFound | StoreError::RouteNotFound | StoreError::RelayNotFound => StatusCode::NOT_FOUND,
         StoreError::InvalidPrefix | StoreError::InvalidKey => StatusCode::BAD_REQUEST,
         StoreError::InvalidInvite => StatusCode::FORBIDDEN,
         StoreError::PoolExhausted => StatusCode::CONFLICT,
@@ -376,6 +376,16 @@ async fn register_relay(
     ))
 }
 
+async fn update_relay(State(store): State<Arc<Store>>, Path(id): Path<String>, Json(req): Json<RegisterRelayReq>) -> Result<Json<domain::RelayNode>, StatusCode> {
+    validate_relay_identity(&req)?;
+    store.update_relay(relay_update(id, req)).map(Json).map_err(store_status)
+}
+
+fn relay_update(id: String, req: RegisterRelayReq) -> domain::RelayNode {
+    domain::RelayNode { id, region: req.region, stun_url: req.stun_url.or_else(|| Some(req.url.clone())),
+        url: req.url, network_id: req.network_id, anytls: req.anytls, node_id: req.node_id }
+}
+
 async fn list_relays(State(store): State<Arc<Store>>, Path(network_id): Path<String>) -> Json<Vec<domain::RelayNode>> {
     Json(store.list_relays(&network_id))
 }
@@ -437,7 +447,7 @@ async fn send_config(socket: &mut WebSocket, store: &Arc<Store>, device_id: &str
 
 fn sql_status(e: SqlStoreError) -> StatusCode {
     match e {
-        SqlStoreError::NetworkNotFound | SqlStoreError::DeviceNotFound | SqlStoreError::RouteNotFound => {
+        SqlStoreError::NetworkNotFound | SqlStoreError::DeviceNotFound | SqlStoreError::RouteNotFound | SqlStoreError::RelayNotFound => {
             StatusCode::NOT_FOUND
         }
         SqlStoreError::InvalidPrefix | SqlStoreError::InvalidKey | SqlStoreError::InvalidAddress => StatusCode::BAD_REQUEST,
@@ -780,6 +790,11 @@ async fn sql_register_relay(
         .map_err(sql_status)
 }
 
+async fn sql_update_relay(State(store): State<Arc<SqlStore>>, Path(id): Path<String>, Json(req): Json<RegisterRelayReq>) -> Result<Json<domain::RelayNode>, StatusCode> {
+    validate_relay_identity(&req)?;
+    store.update_relay(relay_update(id, req)).await.map(Json).map_err(sql_status)
+}
+
 async fn sql_list_relays(
     State(s): State<Arc<SqlStore>>,
     Path(network_id): Path<String>,
@@ -904,6 +919,7 @@ pub fn sql_router(store: Arc<SqlStore>) -> Router {
         // unauthenticated caller could poison reflexive endpoints / observe metadata
         // fleet-wide. Admin-only (audit finding 4).
         .route("/relays", post(sql_register_relay))
+        .route("/relays/:id", put(sql_update_relay))
         .route("/networks", post(sql_create_network).get(sql_list_networks))
         .route("/networks/:id", delete(sql_delete_network))
         .route("/networks/:id/invites/:code", delete(sql_revoke_invite))
@@ -948,6 +964,7 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/routes/:id", delete(delete_route))
         .route("/networks/:id/resolve/:name", get(resolve_name))
         .route("/relays", post(register_relay))
+        .route("/relays/:id", put(update_relay))
         .route("/networks/:id/relays", get(list_relays))
         .with_state(store);
     Router::new().nest("/api/v1", api)

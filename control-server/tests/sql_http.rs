@@ -134,6 +134,26 @@ async fn persistent_http_enroll_loop_on_sqlite() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let net_id = body_json(resp).await["id"].as_str().unwrap().to_string();
 
+    // Relay updates are admin-gated, validated, and invalidate affected config epochs.
+    let relay_id = relays[0]["id"].as_str().unwrap();
+    let relay_path = format!("/api/v1/relays/{relay_id}");
+    let payload = json!({"region":"updated", "url":"192.0.2.9:443", "network_id":net_id, "anytls":true, "node_id":"edge-updated"});
+    let mut request = post(&relay_path, payload.clone());
+    *request.method_mut() = axum::http::Method::PUT;
+    request.headers_mut().remove("authorization");
+    assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let mut request = post(&relay_path, payload.clone()); *request.method_mut() = axum::http::Method::PUT;
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["node_id"], "edge-updated");
+    let nets = body_json(app.clone().oneshot(get("/api/v1/networks")).await.unwrap()).await;
+    assert_eq!(nets[0]["config_epoch"], 1);
+    let mut invalid = payload.clone(); invalid["node_id"] = "bad identity".into();
+    let mut request = post(&relay_path, invalid); *request.method_mut() = axum::http::Method::PUT;
+    assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    let mut request = post("/api/v1/relays/missing", payload); *request.method_mut() = axum::http::Method::PUT;
+    assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::NOT_FOUND);
+
     // list networks
     let resp = app.clone().oneshot(get("/api/v1/networks")).await.unwrap();
     assert_eq!(body_json(resp).await.as_array().unwrap().len(), 1);

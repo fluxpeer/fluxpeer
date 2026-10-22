@@ -29,6 +29,7 @@ serde_json = { workspace = true }
 hex = "0.4"
 base64 = "0.22"
 getrandom = "0.2"
+url = "2"
 libc = "0.2"
 socket2 = "0.6"
 portable-atomic = { workspace = true }
