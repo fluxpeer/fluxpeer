@@ -12,5 +12,8 @@
 #[cfg(target_os = "android")]
 mod android;
 
-#[cfg(any(target_os = "android", test))]
+#[cfg(any(target_os = "android", target_os = "ios", test))]
 mod runtime;
+
+#[cfg(any(target_os = "ios", all(test, unix)))]
+mod ios;

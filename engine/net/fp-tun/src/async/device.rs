@@ -53,7 +53,10 @@ impl AsyncDevice {
     pub fn into_framed(mut self) -> Framed<Self, TunPacketCodec> {
         let pi = self.get_mut().has_packet_information();
         let codec = TunPacketCodec::new(pi, self.inner.get_ref().mtu().unwrap_or(1504));
-        Framed::new(self, codec)
+        #[cfg(target_os = "ios")]
+        { Framed::with_capacity(self, codec, 65539) }
+        #[cfg(not(target_os = "ios"))]
+        { Framed::new(self, codec) }
     }
 }
 
@@ -141,7 +144,10 @@ impl AsyncQueue {
     pub fn into_framed(mut self) -> Framed<Self, TunPacketCodec> {
         let pi = self.get_mut().has_packet_information();
         let codec = TunPacketCodec::new(pi, 1504);
-        Framed::new(self, codec)
+        #[cfg(target_os = "ios")]
+        { Framed::with_capacity(self, codec, 65539) }
+        #[cfg(not(target_os = "ios"))]
+        { Framed::new(self, codec) }
     }
 }
 

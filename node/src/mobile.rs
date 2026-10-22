@@ -7,6 +7,15 @@ use fluxpeer_sdk::prefix::IpPrefix;
 use serde_json::{Value, json};
 use crate::control::PeerInfo;
 
+/// Native enrollment helpers share the node's credential and SDK policy.
+pub fn keypair() -> std::io::Result<Value> {
+    let (private, public) = crate::config::keypair()?;
+    Ok(json!({"private_key":private,"public_key":public}))
+}
+pub async fn enroll(token: &str, name: &str, private: &str) -> std::io::Result<Value> {
+    crate::join::enroll_device(token, name, private).await
+}
+
 pub type RoutesFn = Arc<dyn Fn(&str) -> std::io::Result<()> + Send + Sync>;
 
 #[derive(Default)]

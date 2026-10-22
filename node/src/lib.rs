@@ -1270,6 +1270,8 @@ async fn run_with(mut cfg: Config, protect: Option<ProtectFn>, routes: Option<mo
     let mut tun_cfg = fp_tun::configure();
     if let Some(fd) = injected_fd {
         tun_cfg.raw_fd(fd);
+        #[cfg(target_os = "ios")]
+        tun_cfg.mtu(cfg.mtu.or(r.mtu).unwrap_or(1380));
     } else {
         tun_cfg.address(r.own_addr).netmask(netmask_v4(cfg.prefix_len)).up();
         // Linux uses the configured name (fp0); macOS utun names are kernel-assigned

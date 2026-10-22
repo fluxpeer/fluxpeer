@@ -25,6 +25,7 @@ use crate::platform::posix::{self, Fd};
 
 /// A TUN device for iOS.
 pub struct Device {
+    mtu: i32,
     queue: Queue,
 }
 
@@ -36,7 +37,7 @@ impl Device {
             _ => return Err(Error::InvalidConfig),
         };
         let tun = Fd::new(fd).map_err(|_| io::Error::last_os_error())?;
-        let device = Device { queue: Queue { tun } };
+        let device = Device { mtu: config.mtu.unwrap_or(1500), queue: Queue { tun } };
         Ok(device)
     }
 
@@ -85,7 +86,7 @@ impl D for Device {
     type Queue = Queue;
 
     fn name(&self) -> &str {
-        return "";
+        ""
     }
 
     fn set_name(&mut self, value: &str) -> Result<()> {
@@ -129,10 +130,11 @@ impl D for Device {
     }
 
     fn mtu(&self) -> Result<i32> {
-        Err(Error::NotImplemented)
+        Ok(self.mtu)
     }
 
     fn set_mtu(&mut self, value: i32) -> Result<()> {
+        self.mtu = value;
         Ok(())
     }
 

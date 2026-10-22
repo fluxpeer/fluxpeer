@@ -43,6 +43,14 @@ fn decode_token(token: &str) -> std::io::Result<JoinToken> {
     Ok(JoinToken { ctrl, code })
 }
 
+pub(crate) async fn enroll_device(token: &str, name: &str, private: &str) -> std::io::Result<serde_json::Value> {
+    let JoinToken { ctrl, code } = decode_token(token)?;
+    let mut device = Client::new(ctrl.clone()).enroll(&code, name, private).await.map_err(Error::other)?;
+    let object = device.as_object_mut().ok_or_else(|| Error::other("invalid enrollment response"))?;
+    object.insert("control_server".into(), ctrl.into());
+    Ok(device)
+}
+
 /// This host's name, for a friendly device label (admin can rename later).
 fn default_name() -> String {
     #[cfg(unix)]
