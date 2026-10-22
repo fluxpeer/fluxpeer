@@ -122,11 +122,15 @@ pub enum RelayCmd {
         #[arg(long)]
         stun_url: Option<String>,
         /// Actual relay transport identity; must match the relay process environment.
-        #[arg(long, env = "FLUXPEER_RELAY_NODE_ID", default_value = "fluxpeer-relay")]
-        node_id: String,
+        #[arg(long, env = "FLUXPEER_RELAY_NODE_ID")]
+        node_id: Option<String>,
     },
     /// List relays usable by a network.
     List { network_id: String },
+}
+
+fn relay_identity_warning(anytls: bool, node_id: Option<&str>) -> Option<&'static str> {
+    (anytls && node_id.is_none()).then_some("--anytls without --node-id or FLUXPEER_RELAY_NODE_ID uses fluxpeer-relay; ensure it matches the relay process identity")
 }
 
 /// Execute a parsed CLI invocation, printing JSON results to stdout.
@@ -167,11 +171,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                 anytls,
                 stun_url,
                 node_id,
-            } => print_json(
-                &client
-                    .register_relay_with_identity(&region, &url, network_id.as_deref(), anytls, stun_url.as_deref(), Some(&node_id))
-                    .await?,
-            ),
+            } => {
+                if let Some(warning) = relay_identity_warning(anytls, node_id.as_deref()) { eprintln!("warning: {warning}"); }
+                print_json(&client.register_relay_with_identity(&region, &url, network_id.as_deref(), anytls,
+                    stun_url.as_deref(), Some(node_id.as_deref().unwrap_or("fluxpeer-relay"))).await?);
+            },
             RelayCmd::List { network_id } => print_json(&client.list_relays(&network_id).await?),
         },
         Command::Resolve { network_id, name } => print_json(&client.resolve(&network_id, &name).await?),
@@ -320,9 +324,19 @@ mod test {
         });
         let matches = cmd.try_get_matches_from(["fp", "relay", "add", "eu", "localhost:443", "--anytls"]).unwrap();
         let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
-        assert!(matches!(cli.command, Command::Relay { command: RelayCmd::Add { node_id, .. } } if node_id == "fluxpeer-relay"));
+        assert!(matches!(cli.command, Command::Relay { command: RelayCmd::Add { node_id, .. } } if node_id.is_none()));
         let cli = Cli::try_parse_from(["fp", "relay", "add", "eu", "localhost:443", "--anytls", "--node-id", "custom-edge"]).unwrap();
-        assert!(matches!(cli.command, Command::Relay { command: RelayCmd::Add { node_id, .. } } if node_id == "custom-edge"));
+        assert!(matches!(cli.command, Command::Relay { command: RelayCmd::Add { node_id, .. } } if node_id.as_deref() == Some("custom-edge")));
+    }
+
+    #[test]
+    fn anytls_registration_warns_only_without_explicit_identity() {
+        let warning = relay_identity_warning(true, None).unwrap();
+        assert!(warning.contains("--node-id"));
+        assert!(warning.contains("fluxpeer-relay"));
+        assert!(relay_identity_warning(false, None).is_none());
+        assert!(relay_identity_warning(true, Some("fluxpeer-relay")).is_none());
+        assert!(relay_identity_warning(true, Some("custom-edge")).is_none());
     }
 
     #[test]

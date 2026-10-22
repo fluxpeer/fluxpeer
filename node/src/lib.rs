@@ -183,6 +183,7 @@ struct HostRuntime {
     dns_startup_checked: bool,
     dns_full_tunnel: bool,
     retries: [apply::Retry; 4],
+    retire_retry: apply::Retry,
 }
 #[derive(Default)]
 struct DnsInstall { applied: Option<String>, dirty: bool }
@@ -215,6 +216,12 @@ fn sync_dns_mode_with(
     Ok(())
 }
 
+fn skip_windows_exit(os: route::RouteOs, warning: &std::sync::Once, notify: impl FnOnce()) -> bool {
+    if os != route::RouteOs::Windows { return false; }
+    warning.call_once(notify);
+    true
+}
+
 impl HostEffects {
     fn effect(&self, _stage: HostStage, operation: impl FnOnce() -> ApplyResult) -> ApplyResult {
         #[cfg(test)]
@@ -225,21 +232,20 @@ impl HostEffects {
     fn retire(&self, epoch: u64, selected: Option<[u8; 32]>) -> ApplyResult {
         if !self.manage_host_routes || self.exit_state.lock().as_ref().is_none_or(|s| Some(s.exit_peer) == selected && !s.teardown_started.load(std::sync::atomic::Ordering::Relaxed)) { return Ok(()); }
         let mut runtime = self.runtime.lock();
-        let [_, retry, _, _] = &mut runtime.retries;
-        retry.run(epoch, Instant::now(), || self.effect(HostStage::Retire, || retire_exit(&self.exit_state, &self.shutdown, selected)))
+        runtime.retire_retry.run(epoch, Instant::now(), || self.effect(HostStage::Retire, || retire_exit(&self.exit_state, &self.shutdown, selected)))
     }
 
     fn sync_exit(&self, peers: &[control::PeerInfo], bypass: &[String]) -> ApplyResult {
         if !self.manage_host_routes { return Ok(()); }
-        if route::current_os() == route::RouteOs::Windows {
-            tracing::warn!("Windows exit routes unsupported; deferred to F05"); return Ok(());
-        }
+        static WINDOWS_WARNING: std::sync::Once = std::sync::Once::new();
+        if skip_windows_exit(route::current_os(), &WINDOWS_WARNING, || {
+            tracing::warn!("Windows exit routes unsupported; deferred to F05");
+        }) { return Ok(()); }
         {
             let stopped = self.shutdown.lock();
             if *stopped { return Ok(()); }
             route::cleanup_exit(&self.tun_name, &mut self.exit_progress.lock())?;
         }
-        retire_exit(&self.exit_state, &self.shutdown, selected_exit(peers))?;
         sync_exit_with(&self.exit_state, &self.shutdown, selected_exit(peers), |s| s.exit_peer,
             || apply_exit(peers, &self.tun_name, bypass, &mut self.exit_progress.lock()), remove_exit)
     }
@@ -266,8 +272,9 @@ impl HostEffects {
     }
 
     fn tick(&self, epoch: u64, peers: &[control::PeerInfo], self_exit: bool, bypass: &[String]) -> ApplyResult {
+        let retirement = self.retire(epoch, selected_exit(peers));
         let mut runtime = self.runtime.lock();
-        let HostRuntime { routes, dns, dns_startup_checked, dns_full_tunnel, retries } = &mut *runtime;
+        let HostRuntime { routes, dns, dns_startup_checked, dns_full_tunnel, retries, .. } = &mut *runtime;
         let now = Instant::now();
         let [route_retry, exit_retry, dns_retry, nat_retry] = retries;
         let host = route_retry.run(epoch, now, || self.effect(HostStage::Routes, || {
@@ -275,7 +282,9 @@ impl HostEffects {
             if *stopped || !self.manage_host_routes { return Ok(()); }
             sync_host(peers, &self.own_cidr, &self.tun_name, routes, epoch)
         }));
-        let exit = exit_retry.run(epoch, now, || self.effect(HostStage::Exit, || self.sync_exit(peers, bypass)));
+        // A failed retirement retains its own delay and cannot reset or consume
+        // the installation budget. Other host effects still run independently.
+        let exit = retirement.and_then(|()| exit_retry.run(epoch, now, || self.effect(HostStage::Exit, || self.sync_exit(peers, bypass))));
         let resolver = dns_retry.run(epoch, now, || self.effect(HostStage::Dns, || {
             let stopped = self.shutdown.lock();
             if *stopped || !self.manage_host_routes { return Ok(()); }
@@ -1638,6 +1647,40 @@ mod exit_contract_tests {
         let error = bootstrap_directory_with(&cfg, || std::future::ready(Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "HTTP 403")))).await.err().unwrap();
         assert!(control::terminal_control_error(&error));
     }
+    #[test]
+    fn retire_and_exit_failures_have_independent_retry_budgets() {
+        let mut host = test_host(); host.manage_host_routes = true;
+        *host.exit_state.lock() = Some(ExitTunState { teardown_started: std::sync::atomic::AtomicBool::new(false), dev: "fp-test".into(), progress: parking_lot::Mutex::default(), exit_peer: [1; 32] });
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured = calls.clone();
+        host.probe = Some(Arc::new(move |stage| {
+            captured.lock().push(stage);
+            if stage == HostStage::Retire { Err(ApplyError::new(&["retire"], "injected")) } else { Ok(()) }
+        }));
+        host.retire(1, None).unwrap_err();
+        // A successful exit stage cannot erase retirement's backoff.
+        host.runtime.lock().retries[1].run(1, Instant::now(), || Ok(())).unwrap();
+        host.tick(1, &[], false, &[]).unwrap_err();
+        assert_eq!(calls.lock().iter().filter(|stage| **stage == HostStage::Retire).count(), 1);
+        assert!(!calls.lock().contains(&HostStage::Exit));
+        // Nor can a successful retirement erase a failed installation's delay.
+        host.probe = Some(Arc::new(|_| Ok(())));
+        host.runtime.lock().retries[1].run(2, Instant::now(), || Err(ApplyError::new(&["exit"], "injected"))).unwrap_err();
+        host.retire(2, None).unwrap();
+        assert!(host.runtime.lock().retries[1].waiting(2, Instant::now()));
+    }
+
+    #[test]
+    fn unsupported_windows_exit_warns_once_across_ticks() {
+        let warning = std::sync::Once::new();
+        let calls = std::cell::Cell::new(0);
+        assert!(!skip_windows_exit(route::RouteOs::Linux, &warning, || calls.set(calls.get() + 1)));
+        for _ in 0..20 {
+            assert!(skip_windows_exit(route::RouteOs::Windows, &warning, || calls.set(calls.get() + 1)));
+        }
+        assert_eq!(calls.get(), 1);
+    }
+
     #[tokio::test]
     async fn exit_retry_backoff_skips_bypass_dns_until_new_epoch() {
         let mut host = test_host(); host.manage_host_routes = true; host.control_host = "control.test".into();

@@ -121,12 +121,18 @@ async fn resolve_directory_endpoint(endpoint: &str) -> std::io::Result<Vec<Socke
     let mut addresses: Vec<_> = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(endpoint))
         .await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "relay directory DNS timeout"))??
         .collect();
-    addresses.sort_unstable_by_key(|addr| (!addr.is_ipv4(), *addr));
-    addresses.dedup();
+    order_directory_addresses(&mut addresses);
     if addresses.is_empty() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "relay directory DNS returned no addresses"));
     }
     Ok(addresses)
+}
+
+// Stable family preference preserves resolver priority and round-robin ordering.
+fn order_directory_addresses(addresses: &mut Vec<SocketAddr>) {
+    addresses.sort_by_key(|addr| !addr.is_ipv4());
+    let mut seen = std::collections::HashSet::new();
+    addresses.retain(|addr| seen.insert(*addr));
 }
 
 async fn resolve_relay_entry<F, Fut>(entry: &serde_json::Value, resolve: &F) -> std::io::Result<Option<RelayDir>>
@@ -167,13 +173,13 @@ where F: Fn(String) -> Fut + Sync, Fut: std::future::Future<Output = std::io::Re
                 stun
             }
             Err(error) => {
-                tracing::warn!(relay = id, %endpoint, %error, "directory STUN resolution failed; skipping entry");
-                return Err(error);
+                tracing::warn!(relay = id, %endpoint, %error, "directory STUN resolution failed; keeping relay without STUN");
+                None
             }
         },
         _ => {
-            tracing::warn!(relay = id, "relay directory has invalid STUN endpoint; skipping");
-            return Ok(None);
+            tracing::warn!(relay = id, "relay directory has invalid STUN endpoint; keeping relay without STUN");
+            None
         }
     };
     Ok(Some(RelayDir { addresses, anytls: entry["anytls"].as_bool().unwrap_or(false), node_id: node_id.to_owned(), stun }))
@@ -579,7 +585,7 @@ mod tests {
             let entry = directory.iter().find(|r| r.node_id == identity).unwrap();
             // The relay listener and node dialer both use with_node_id(). The
             // directory-generated relay-N id must never seed the client password.
-            assert_eq!(AnytlsConfig::with_node_id(&entry.node_id).password, AnytlsConfig::with_node_id(identity).password);
+            assert_eq!(AnytlsConfig::with_node_id(&entry.node_id).password, AnytlsConfig::derive_password(identity));
             assert!(entry.anytls);
             assert!(entry.addresses.iter().all(|a| a.ip().is_loopback() && a.port() == 443));
             assert!(entry.stun.is_some_and(|a| a.is_ipv4() && a.ip().is_loopback() && a.port() == 3478));
@@ -589,6 +595,29 @@ mod tests {
         }
         assert!(client.register_relay_with_identity("eu", "localhost:443", None, true, None, Some(&"x".repeat(128))).await.is_ok());
         server.abort();
+    }
+
+    #[test]
+    fn relay_addresses_preserve_resolver_order_within_each_family_and_deduplicate() {
+        let mut addresses = ["[2001:db8::9]:443", "192.0.2.9:443", "[2001:db8::1]:443", "192.0.2.1:443", "192.0.2.9:443", "[2001:db8::9]:443"]
+            .map(|addr| addr.parse::<SocketAddr>().unwrap()).to_vec();
+        order_directory_addresses(&mut addresses);
+        assert_eq!(addresses, ["192.0.2.9:443", "192.0.2.1:443", "[2001:db8::9]:443", "[2001:db8::1]:443"]
+            .map(|addr| addr.parse::<SocketAddr>().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn unusable_stun_never_discards_a_resolved_relay() {
+        for stun in [serde_json::json!("bad-stun:3478"), serde_json::json!(42)] {
+            let conf = serde_json::json!({"relays":[{"id":"relay-1", "node_id":"edge", "url":"relay:443", "stun_url":stun, "anytls":true}]});
+            let entries = resolve_directory_with(&conf, |endpoint| std::future::ready(if endpoint == "relay:443" {
+                Ok(vec!["192.0.2.9:443".parse().unwrap()])
+            } else { Err(std::io::Error::other("STUN DNS failed")) })).await.unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].addresses, ["192.0.2.9:443".parse::<SocketAddr>().unwrap()]);
+            assert_eq!(entries[0].stun, None);
+            assert!(entries[0].anytls);
+        }
     }
 
     #[tokio::test]
@@ -617,9 +646,9 @@ mod tests {
             {"id":"empty-id", "node_id":" ", "url":"localhost:443"},
             {"id":"good", "node_id":"edge", "url":"localhost:443", "stun_url":"localhost:3478"}
         ]})).await.unwrap();
-        assert_eq!(directory.len(), 1);
-        assert_eq!(directory[0].node_id, "edge");
-        assert!(directory[0].stun.is_some());
+        assert_eq!(directory.len(), 2);
+        assert!(directory.iter().all(|entry| entry.node_id == "edge"));
+        assert_eq!(directory.iter().filter(|entry| entry.stun.is_some()).count(), 1);
     }
 
     async fn http_responses(responses: Vec<(u16, String)>) -> (Config, tokio::task::JoinHandle<()>) {

@@ -31,6 +31,17 @@ struct Daemon {
     nets: Mutex<HashMap<String, Child>>,
 }
 
+#[cfg(any(target_os = "linux", test))]
+async fn cleanup_link_with(
+    iface: String, remove: impl FnOnce(String) -> crate::apply::Result + Send + 'static,
+) -> crate::apply::Result {
+    crate::apply::blocking(move || match remove(iface) {
+        // The TUN normally disappears when the member process closes its fd.
+        Err(error) if error.exit_code.is_some() && error.missing() => Ok(()),
+        result => result,
+    }).await
+}
+
 fn admin_api_allowed() -> bool {
     std::env::var("FLUXPEER_ALLOW_ADMIN_API").as_deref() == Ok("1")
 }
@@ -373,10 +384,9 @@ impl Daemon {
         }
         let _ = std::fs::remove_file(crate::statusd::socket_path(iface));
         #[cfg(target_os = "linux")]
-        let _ = std::process::Command::new("ip")
-            .args(["link", "del", "dev", iface])
-            .stderr(std::process::Stdio::null()) // device usually already gone with the process
-            .status();
+        if let Err(error) = cleanup_link_with(iface.to_string(), |iface| {
+            crate::apply::run(&["ip", "link", "del", "dev", &iface])
+        }).await { tracing::warn!(%error, "daemon interface cleanup failed"); }
     }
 
     /// Bring every running network down — each `stop_iface` SIGTERMs its node so a
@@ -572,21 +582,38 @@ impl Daemon {
     /// Overwrite a network's config from manually-edited JSON, then restart it.
     async fn set_config(&self, req: &serde_json::Value) -> serde_json::Value {
         let iface = req["iface"].as_str().unwrap_or("");
-        let cfg = &req["config"];
-        if !cfg.is_object() || cfg["private_key"].as_str().is_none() {
-            return serde_json::json!({ "error": "invalid config (need an object with private_key, …)" });
-        }
-        let path = match member_config(&self.dir, iface) {
+        let path = match self.store_config(req) {
             Ok(path) => path, Err(error) => return invalid_iface(error),
         };
-        if cfg["tun_name"].as_str() != Some(iface) {
-            return invalid_iface("config tun_name must match the registered iface");
-        }
-        if write_json(&path, cfg, false).is_err() {
-            return serde_json::json!({ "error": "write failed" });
-        }
         if let Err(error) = self.restart(iface, &path).await { return serde_json::json!({"error":error.to_string()}); }
         serde_json::json!({ "ok": true, "iface": iface })
+    }
+
+    fn store_config(&self, req: &serde_json::Value) -> std::io::Result<PathBuf> {
+        use std::io::{Error, ErrorKind};
+        let iface = req["iface"].as_str().unwrap_or("");
+        let path = member_config(&self.dir, iface)?;
+        let mut cfg = req["config"].clone();
+        let obj = cfg.as_object_mut().ok_or_else(|| Error::new(ErrorKind::InvalidInput, "config must be an object"))?;
+        if obj.get("tun_name").and_then(|v| v.as_str()) != Some(iface) {
+            return Err(Error::new(ErrorKind::InvalidInput, "config tun_name must match the registered iface"));
+        }
+        let preserve = match obj.get("private_key") {
+            None => true,
+            Some(serde_json::Value::String(key)) if key == "<redacted>" => true,
+            Some(serde_json::Value::String(key)) if !key.is_empty() => false,
+            _ => return Err(Error::new(ErrorKind::InvalidInput, "private_key must be a nonempty string or omitted")),
+        };
+        if preserve {
+            let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "cannot read existing config"))?;
+            let key = original.get("private_key").and_then(|v| v.as_str())
+                .filter(|key| !key.is_empty() && *key != "<redacted>")
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "existing private key is unavailable"))?;
+            obj.insert("private_key".into(), serde_json::Value::String(key.to_string()));
+        }
+        write_json(&path, &cfg, false)?;
+        Ok(path)
     }
 
     /// Import a network config (from a file the GUI read) as a new network + up it.
@@ -803,18 +830,11 @@ mod tests {
     use super::*;
 
     /// A fresh temp config dir with one minimal membership config per iface.
-    struct TempDir(std::path::PathBuf);
+    struct TempDir { path: PathBuf, _owner: tempfile::TempDir }
     impl TempDir {
         fn new(ifaces: &[&str]) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "fluxpeer-daemon-test-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ));
-            std::fs::create_dir_all(&dir).expect("mk tempdir");
+            let owner = tempfile::tempdir().expect("mk tempdir");
+            let dir = owner.path().to_path_buf();
             for (i, iface) in ifaces.iter().enumerate() {
                 let cfg = serde_json::json!({
                     "private_key": "00", "device_id": format!("d{i}"),
@@ -823,23 +843,31 @@ mod tests {
                 });
                 std::fs::write(dir.join(format!("{iface}.json")), cfg.to_string()).expect("write cfg");
             }
-            TempDir(dir)
+            TempDir { path: dir, _owner: owner }
         }
         fn read(&self, iface: &str) -> serde_json::Value {
-            let s = std::fs::read_to_string(self.0.join(format!("{iface}.json"))).expect("read cfg");
+            let s = std::fs::read_to_string(self.path.join(format!("{iface}.json"))).expect("read cfg");
             serde_json::from_str(&s).expect("cfg json")
         }
     }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+
+    #[test]
+    fn concurrent_daemon_fixtures_are_isolated_and_owned_until_drop() {
+        let fixtures: Vec<_> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..32).map(|_| scope.spawn(|| TempDir::new(&["fp0"]))).collect();
+            workers.into_iter().map(|worker| worker.join().unwrap()).collect()
+        });
+        let paths: std::collections::HashSet<_> = fixtures.iter().map(|fixture| fixture.path.clone()).collect();
+        assert_eq!(paths.len(), fixtures.len());
+        for fixture in &fixtures { assert_eq!(fixture.read("fp0")["device_id"], "d0"); }
+        drop(fixtures);
+        assert!(paths.iter().all(|path| !path.exists()));
     }
 
     #[tokio::test]
     async fn daemon_rejects_invalid_use_exit_without_writing_or_starting_a_node() {
         let temp = TempDir::new(&["fp0"]);
-        let daemon = Daemon { dir: temp.0.clone(), token: String::new(), nets: Mutex::new(HashMap::new()) };
+        let daemon = Daemon { dir: temp.path.clone(), token: String::new(), nets: Mutex::new(HashMap::new()) };
         let original = temp.read("fp0");
         for mode in [serde_json::json!(true), serde_json::json!("bad-key")] {
             let result = daemon.settings(&serde_json::json!({"iface": "fp0", "use_exit": mode})).await;
@@ -852,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn daemon_rejects_non_boolean_firewall_trust_without_writing_or_restart() {
         let temp = TempDir::new(&["fp0"]);
-        let daemon = Daemon { dir: temp.0.clone(), token: String::new(), nets: Mutex::new(HashMap::new()) };
+        let daemon = Daemon { dir: temp.path.clone(), token: String::new(), nets: Mutex::new(HashMap::new()) };
         let original = temp.read("fp0");
         for value in [serde_json::json!("true"), serde_json::json!(1), serde_json::Value::Null] {
             let result = daemon.settings(&serde_json::json!({"iface":"fp0", "firewall_trust_external":value})).await;
@@ -905,7 +933,7 @@ mod tests {
     #[test]
     fn set_exit_off_follows_control_and_explicit_veto_is_separate() {
         let t = TempDir::new(&["fp0"]);
-        let dir = t.0.to_string_lossy().to_string();
+        let dir = t.path.to_string_lossy().to_string();
         assert_eq!(set_exit(&dir, true).expect("on"), 1);
         let cfg = t.read("fp0");
         assert_eq!(cfg["exit_node"], true);
@@ -924,7 +952,7 @@ mod tests {
     #[test]
     fn set_use_exit_scopes_by_iface_and_off_removes_key() {
         let t = TempDir::new(&["fp0", "fp1"]);
-        let dir = t.0.to_string_lossy().to_string();
+        let dir = t.path.to_string_lossy().to_string();
         // One iface only.
         assert_eq!(set_use_exit(&dir, Some("fp0"), "auto").expect("auto"), 1);
         assert_eq!(t.read("fp0")["use_exit"], "auto");

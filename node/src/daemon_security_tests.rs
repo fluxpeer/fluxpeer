@@ -236,3 +236,55 @@ fn leading_hyphen_is_invalid_even_for_a_membership_file() {
     assert!(daemon.validate_operation("-bad", true).is_err());
     assert_eq!(daemon.get_config("-bad")["status"], 400);
 }
+
+#[test]
+fn set_config_preserves_disk_private_key_when_redacted_or_omitted() {
+    let (_root, daemon) = fixture();
+    let path = daemon.dir.join("fp0.json");
+    let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for omitted in [false, true] {
+        let mut cfg = daemon.get_config("fp0")["config"].clone();
+        if omitted { cfg.as_object_mut().unwrap().remove("private_key"); }
+        cfg["mtu"] = json!(1280);
+        assert_eq!(daemon.store_config(&json!({"iface":"fp0", "config":cfg})).unwrap(), path.canonicalize().unwrap());
+        let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["private_key"], original["private_key"]);
+        assert_eq!(stored["mtu"], 1280);
+    }
+    daemon.store_config(&json!({"iface":"fp0", "config":{"tun_name":"fp0", "private_key":"explicit-new-key"}})).unwrap();
+    let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(stored["private_key"], "explicit-new-key");
+    assert!(daemon.nets.lock().is_empty());
+}
+
+#[test]
+fn set_config_rejects_invalid_keys_or_missing_original_without_writing() {
+    let (_root, daemon) = fixture();
+    let path = daemon.dir.join("fp0.json");
+    let saved = std::fs::read(&path).unwrap();
+    for invalid in [json!(null), json!(42), json!(""), json!(false)] {
+        assert!(daemon.store_config(&json!({"iface":"fp0", "config":{"tun_name":"fp0", "private_key":invalid}})).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+    }
+    for original in [json!({"tun_name":"fp0"}), json!({"tun_name":"fp0", "private_key":"<redacted>"})] {
+        std::fs::write(&path, original.to_string()).unwrap();
+        for cfg in [json!({"tun_name":"fp0"}), json!({"tun_name":"fp0", "private_key":"<redacted>"})] {
+            assert!(daemon.store_config(&json!({"iface":"fp0", "config":cfg})).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original.to_string());
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_link_cleanup_runs_off_async_worker_and_preserves_errors() {
+    let async_thread = std::thread::current().id();
+    cleanup_link_with("fp-test".into(), move |iface| {
+        assert_eq!(iface, "fp-test");
+        assert_ne!(std::thread::current().id(), async_thread);
+        Ok(())
+    }).await.unwrap();
+    let denied = crate::apply::test_support::error(Some(1), "Operation not permitted");
+    let expected = denied.clone();
+    assert_eq!(cleanup_link_with("fp-test".into(), |_| Err(denied)).await, Err(expected));
+    cleanup_link_with("fp-test".into(), |_| Err(crate::apply::test_support::error(Some(1), "Cannot find device: does not exist"))).await.unwrap();
+}

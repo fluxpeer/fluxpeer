@@ -83,16 +83,21 @@ Here the relay process must use `FLUXPEER_RELAY_NODE_ID=edge-eu`. SDK callers us
 /api/v1/relays`. Existing rows are migrated with a null identity. Missing/null
 identities retain the legacy directory-id password derivation and produce a
 client warning; that fallback does not repair an already mismatched old AnyTLS
-registration. Explicit identities must contain 1-128 visible ASCII characters;
+registration. Re-register old rows with `fp relay add ... --node-id <actual-identity>`
+using the relay process identity. Existing `node_id = NULL` rows still use the
+legacy fallback; merely upgrading the node does not repair those rows. Explicit
+identities must contain 1-128 visible ASCII characters;
 whitespace, non-ASCII and oversized values are rejected.
 
 Directory relay and STUN endpoints accept `host:port`, including DNS names and
 bracketed IPv6 literals. Nodes resolve them asynchronously at bootstrap, with a
 five-second timeout per lookup and up to eight entries in flight. All resolved
-relay addresses enter failover; STUN selects IPv4 for the node's IPv4 UDP socket.
-An invalid or unresolved endpoint causes its directory entry to be skipped with a
-warning. When directory lookup fails, a configured relay or automatic direct
-mode can start immediately; a background retry uses bounded exponential backoff
+relay addresses enter failover, with IPv4 first and the resolver order preserved
+within each address family; STUN selects IPv4 for the node's IPv4 UDP socket.
+An invalid or unresolved relay endpoint causes its directory entry to be skipped
+with a warning. A failing or malformed STUN endpoint only disables STUN for that
+entry; its relay candidates remain usable. When directory lookup fails, a configured
+relay or automatic direct mode can start immediately; a background retry uses bounded exponential backoff
 (2–60 seconds). Once a usable directory is recovered, candidates enter the live
 relay supervisor and exit selection is refreshed even at the same control epoch.
 New relay bypass routes are applied before the candidates are published. Only

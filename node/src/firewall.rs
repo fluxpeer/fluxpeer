@@ -182,14 +182,14 @@ fn execute_with(runner: &mut impl apply::Runner, root: &std::path::Path, backend
     let state = forwarding::State::lock(root)?;
     if matches!(op, Operation::Up) {
         let preflight = if backend == "iptables" { iptables_check_nft(runner, tun, phys) }
-            else { nft_json(runner, &["nft", "-j", "list", "ruleset"]).and_then(|rules| nft_check_forward(&rules, tun, phys)) };
+            else { nft_json(runner, &["nft", "-j", "list", "ruleset"]).map_err(ForwardCheckError::Inspection).and_then(|rules| nft_check_forward(&rules, tun, phys)) };
         check_external(preflight, options.trust_external)?;
         // Reject an absent/invalid source prefix before mutating any host state.
         options.overlay_cidr.parse::<fluxpeer_sdk::prefix::IpPrefix>()
             .map_err(|e| ApplyError::new(&["firewall", "overlay_cidr"], e.to_string()))?;
         state.acquire(runner, &id)?;
     }
-    if backend == "nft" { nft_with(runner, op, phys, tun, &id)?; }
+    if backend == "nft" { nft_with(runner, op, phys, tun, &id, &options.overlay_cidr)?; }
     else { iptables_with(runner, op, phys, tun, &id, &options.overlay_cidr)?; }
     // A failed rule removal retains the forwarding lease for the cleanup retry.
     if matches!(op, Operation::Down) { state.release(runner, &id)?; }
@@ -207,15 +207,24 @@ fn nft_unavailable(error: &ApplyError) -> bool {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn check_external(result: Result, trust: bool) -> Result {
+#[derive(Clone, Debug)]
+enum ForwardCheckError { Policy(ApplyError), Inspection(ApplyError) }
+#[cfg(any(target_os = "linux", test))]
+impl From<ApplyError> for ForwardCheckError {
+    fn from(error: ApplyError) -> Self { Self::Inspection(error) }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn check_external(result: std::result::Result<(), ForwardCheckError>, trust: bool) -> Result {
     match result {
-        Err(error) if trust => {
+        Err(ForwardCheckError::Policy(error)) if trust => {
             tracing::warn!(%error, "firewall_trust_external=true: trusting external forwarding policy despite failed preflight"); Ok(())
         }
-        Err(mut error) => {
+        Err(ForwardCheckError::Policy(mut error)) => {
             error.stderr.push_str("; verify external forwarding policy, then explicitly set local firewall_trust_external=true to trust it"); Err(error)
         }
-        result => result,
+        Err(ForwardCheckError::Inspection(error)) => Err(error),
+        Ok(()) => Ok(()),
     }
 }
 
@@ -261,8 +270,15 @@ fn iptables_killswitch_on(runner: &mut impl apply::Runner, bin: &str, phys: &str
     let chain = killswitch_chain(id)?;
     match iptables_run(runner, &[bin, "-S", &chain]) {
         Ok(_) => {}
+        // A missing owned chain is normal on first use, including IPv6. Try
+        // creating it before deciding that the whole IPv6 table is unavailable.
+        Err(e) if !permission_denied(&e) && e.exit_code.is_some() && absent_table_or_chain(&e) => {
+            match iptables_run(runner, &[bin, "-N", &chain]) {
+                Err(e) if optional_iptables6(bin, &e) => return Ok(()),
+                result => { result?; }
+            }
+        }
         Err(e) if optional_iptables6(bin, &e) => return Ok(()),
-        Err(e) if !permission_denied(&e) && e.exit_code.is_some() && absent_table_or_chain(&e) => { iptables_run(runner, &[bin, "-N", &chain])?; }
         Err(e) => return Err(e),
     }
     let tag = format!("{id}:killswitch");
@@ -331,7 +347,7 @@ pub(crate) fn recover(tun: &str) -> Result {
 fn recover_with(runner: &mut impl apply::Runner, root: &std::path::Path, tun: &str) -> Result {
     let id = instance(tun)?;
     let state = forwarding::State::lock(root)?;
-    let nft = match nft_with(runner, Operation::Down, "", tun, &id) {
+    let nft = match nft_with(runner, Operation::Down, "", tun, &id, "") {
         Err(e) if nft_unavailable(&e) => Ok(()), result => result,
     };
     let iptables = iptables_cleanup(runner, &id, false);
@@ -342,19 +358,23 @@ fn recover_with(runner: &mut impl apply::Runner, root: &std::path::Path, tun: &s
 /// iptables-nft can edit its own FORWARD chain, but cannot override a native
 /// nft drop in another base chain. Legacy iptables cannot edit any nft chain.
 #[cfg(any(target_os = "linux", test))]
-fn iptables_check_nft(runner: &mut impl apply::Runner, tun: &str, phys: &str) -> Result {
+fn iptables_check_nft(runner: &mut impl apply::Runner, tun: &str, phys: &str) -> std::result::Result<(), ForwardCheckError> {
     let mut ruleset = match nft_json(runner, &["nft", "-j", "list", "ruleset"]) {
         Err(e) if nft_unavailable(&e) => return Ok(()),
         result => result?,
     };
-    if nft_check_forward(&ruleset, tun, phys).is_ok() { return Ok(()); }
+    match nft_check_forward(&ruleset, tun, phys) {
+        Ok(()) => return Ok(()),
+        Err(ForwardCheckError::Inspection(error)) => return Err(error.into()),
+        Err(ForwardCheckError::Policy(_)) => {},
+    }
     let mut managed = Vec::new();
     for (bin, family) in [("iptables", "ip"), ("ip6tables", "ip6")] {
         match iptables_run(runner, &[bin, "--version"]) {
             Ok(version) if version.contains("(nf_tables)") => managed.push(family),
             Ok(_) => {}
             Err(e) if optional_iptables6(bin, &e) => {}
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
     if let Some(items) = ruleset.get_mut("nftables").and_then(|v| v.as_array_mut()) {
@@ -376,6 +396,8 @@ fn iptables_with(runner: &mut impl apply::Runner, op: Operation, phys: &str, tun
     if matches!(op, Operation::Down | Operation::KillswitchOff) {
         return iptables_cleanup(runner, id, matches!(op, Operation::KillswitchOff));
     }
+    // Match nft inet's dual-family forward guards, including its WAN ingress
+    // protection. MASQUERADE below is restricted to the overlay family on both.
     for bin in ["iptables", "ip6tables"] {
         let tag = format!("{id}:forward");
         let nat_tag = format!("{id}:nat");
@@ -429,7 +451,7 @@ fn nft_json(runner: &mut impl apply::Runner, command: &[&str]) -> Result<serde_j
 /// base chain. Proven interface exclusions and invalid-only drops are harmless;
 /// other predicates and verdict maps remain conservative unless explicitly trusted.
 #[cfg(any(target_os = "linux", test))]
-fn nft_check_forward(ruleset: &serde_json::Value, tun: &str, phys: &str) -> Result {
+fn nft_check_forward(ruleset: &serde_json::Value, tun: &str, phys: &str) -> std::result::Result<(), ForwardCheckError> {
     let command = ["nft", "-j", "list", "ruleset"];
     let items = ruleset.get("nftables").and_then(|v| v.as_array())
         .ok_or_else(|| ApplyError::new(&command, "missing nftables ruleset array"))?;
@@ -440,7 +462,7 @@ fn nft_check_forward(ruleset: &serde_json::Value, tun: &str, phys: &str) -> Resu
             || base.get("hook").and_then(|v| v.as_str()) != Some("forward") { continue; }
         let name = base.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let fail = || ApplyError::new(&command, format!("external forward chain {family} {table} {name} can drop traffic; cannot override with an independent nft accept"));
-        if base.get("policy").and_then(|v| v.as_str()) == Some("drop") { return Err(fail()); }
+        if base.get("policy").and_then(|v| v.as_str()) == Some("drop") { return Err(ForwardCheckError::Policy(fail())); }
         let mut pending = vec![name.to_string()];
         let mut seen = std::collections::HashSet::new();
         while let Some(chain) = pending.pop() {
@@ -449,12 +471,12 @@ fn nft_check_forward(ruleset: &serde_json::Value, tun: &str, phys: &str) -> Resu
                 r.get("family").and_then(|v| v.as_str()) == Some(family)
                     && r.get("table").and_then(|v| v.as_str()) == Some(table)
                     && r.get("chain").and_then(|v| v.as_str()) == Some(chain.as_str())) {
-                let expressions = rule.get("expr").and_then(|v| v.as_array()).ok_or_else(fail)?;
+                let expressions = rule.get("expr").and_then(|v| v.as_array()).ok_or_else(|| ApplyError::new(&command, "malformed nft forward rule"))?;
                 if unrelated_rule(expressions, tun, phys) { continue; }
                 for expr in expressions {
-                    if expr.get("drop").is_some() || expr.get("reject").is_some() || expr.get("vmap").is_some() { return Err(fail()); }
+                    if expr.get("drop").is_some() || expr.get("reject").is_some() || expr.get("vmap").is_some() { return Err(ForwardCheckError::Policy(fail())); }
                     for target in ["jump", "goto"].iter().filter_map(|key| expr.get(key)) {
-                        pending.push(target.get("target").and_then(|v| v.as_str()).ok_or_else(fail)?.to_string());
+                        pending.push(target.get("target").and_then(|v| v.as_str()).ok_or_else(|| ApplyError::new(&command, "malformed nft forward rule"))?.to_string());
                     }
                 }
             }
@@ -464,14 +486,17 @@ fn nft_check_forward(ruleset: &serde_json::Value, tun: &str, phys: &str) -> Resu
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn nft_with(runner: &mut impl apply::Runner, op: Operation, phys: &str, tun: &str, id: &str) -> Result {
+fn nft_with(runner: &mut impl apply::Runner, op: Operation, phys: &str, tun: &str, id: &str, overlay_cidr: &str) -> Result {
     match op {
         Operation::Up => {
             // One nft transaction: replace only this instance's table. Quoted
             // interface strings are JSON escaped (also valid nft string syntax).
             let phys = serde_json::to_string(phys).map_err(|e| ApplyError::new(&["nft"], e.to_string()))?;
             let tun = serde_json::to_string(tun).map_err(|e| ApplyError::new(&["nft"], e.to_string()))?;
-            let script = format!("add table inet {id}\ndelete table inet {id}\ntable inet {id} {{\n chain postrouting {{ type nat hook postrouting priority srcnat; policy accept; iifname {tun} oifname {phys} masquerade; }}\n chain forward {{ type filter hook forward priority filter; policy accept; iifname {tun} oifname {phys} accept; iifname {phys} oifname {tun} ct state established,related accept; iifname {phys} oifname {tun} ct state != {{ established, related }} drop; }}\n}}\n");
+            // Both backends guard forwarding in both families (including new
+            // unsolicited WAN ingress), but NAT only the overlay address family.
+            let family = if overlay_cidr.contains(':') { "ipv6" } else { "ipv4" };
+            let script = format!("add table inet {id}\ndelete table inet {id}\ntable inet {id} {{\n chain postrouting {{ type nat hook postrouting priority srcnat; policy accept; meta nfproto {family} iifname {tun} oifname {phys} masquerade; }}\n chain forward {{ type filter hook forward priority filter; policy accept; iifname {tun} oifname {phys} accept; iifname {phys} oifname {tun} ct state established,related accept; iifname {phys} oifname {tun} ct state != {{ established, related }} drop; }}\n}}\n");
             runner.run(&["nft", "-f", "-"], Some(&script))?;
         }
         Operation::Down => {
@@ -569,7 +594,7 @@ mod tests {
             vec![base.clone(), rule("fwd", json!({"vmap":{"key":{},"data":"@verdicts"}}))],
         ] {
             let ruleset = json!({"nftables":items});
-            assert!(nft_check_forward(&ruleset, "fp0", "eth0").unwrap_err().stderr.contains("external forward chain"));
+            assert!(matches!(nft_check_forward(&ruleset, "fp0", "eth0"), Err(ForwardCheckError::Policy(error)) if error.stderr.contains("external forward chain")));
             let mut runner = Scripted::new(vec![Ok(ruleset.to_string())]);
             let dir = tempfile::tempdir().unwrap();
             assert!(execute_with(&mut runner, dir.path(), "nft", Operation::Up, ("eth0", "fp0"), &options()).is_err());
@@ -747,7 +772,7 @@ mod tests {
     fn nft_wan_ingress_guard_is_scoped_and_ordered_after_return_accept() {
         let id = instance("custom0").unwrap();
         let mut runner = Host::default();
-        nft_with(&mut runner, Operation::Up, "wan0", "custom0", &id).unwrap();
+        nft_with(&mut runner, Operation::Up, "wan0", "custom0", &id, "100.72.0.0/24").unwrap();
         assert_eq!(runner.commands, [vec!["nft", "-f", "-"]]);
         let script = &runner.scripts[0];
         assert!(script.contains("iifname \"wan0\" oifname \"custom0\" ct state established,related accept; iifname \"wan0\" oifname \"custom0\" ct state != { established, related } drop;"));
@@ -939,12 +964,75 @@ mod tests {
     }
 
     #[test]
+    fn trusted_external_policy_never_suppresses_inspection_errors_or_acquires_lease() {
+        for backend in ["nft", "iptables"] {
+            for reply in [Err(error(Some(1), "Permission denied")), Err(error(Some(2), "execution failed")),
+                Ok("invalid JSON".into()), Ok(r#"{"unexpected":[]}"#.into())] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut runner = Scripted::new(vec![reply]);
+                let trusted = Options { trust_external: true, ..options() };
+                assert!(execute_with(&mut runner, dir.path(), backend, Operation::Up, ("wan0", "fp0"), &trusted).is_err());
+                assert_eq!(runner.commands, [vec!["nft", "-j", "list", "ruleset"]]);
+                assert!(!has_lease_at(dir.path(), "fp0").unwrap());
+            }
+        }
+        let rules = serde_json::json!({"nftables":[{"chain":{"family":"ip","table":"filter","name":"FORWARD","hook":"forward","policy":"drop"}}]}).to_string();
+        let mut runner = Scripted::new(vec![Ok(rules), Err(error(Some(1), "Operation not permitted"))]);
+        assert!(check_external(iptables_check_nft(&mut runner, "fp0", "wan0"), true).is_err());
+        assert_eq!(runner.commands.len(), 2);
+    }
+
+    #[test]
+    fn both_firewalls_keep_dual_family_guards_but_nat_only_overlay_family() {
+        for (prefix, family, binary) in [("100.72.0.0/24", "ipv4", "iptables"), ("fd00::/64", "ipv6", "ip6tables")] {
+            let mut host = Host::default();
+            let id = instance("fp0").unwrap();
+            iptables_with(&mut host, Operation::Up, "wan0", "fp0", &id, prefix).unwrap();
+            let nat: Vec<_> = host.rules.iter().filter(|rule| rule.iter().any(|v| v == "MASQUERADE")).collect();
+            assert_eq!(nat.len(), 1); assert_eq!(nat[0][0], binary);
+            for bin in ["iptables", "ip6tables"] {
+                assert!(host.rules.iter().any(|rule| rule[0] == bin && rule.iter().any(|v| v == "ACCEPT")));
+                assert!(host.rules.iter().any(|rule| rule[0] == bin && rule.iter().any(|v| v == "DROP")));
+            }
+            nft_with(&mut host, Operation::Up, "wan0", "fp0", &id, prefix).unwrap();
+            let script = host.scripts.last().unwrap();
+            assert!(script.contains(&format!("meta nfproto {family} iifname \"fp0\" oifname \"wan0\" masquerade")));
+            assert_eq!(script.matches("meta nfproto").count(), 1);
+            assert!(script.contains("ct state established,related accept"));
+            assert!(script.contains("ct state != { established, related } drop"));
+        }
+    }
+
+    #[test]
+    fn iptables_killswitch_uses_owned_chain_exact_arguments_and_waits_for_lock() {
+        for bin in ["iptables", "ip6tables"] {
+            let id = instance("custom0").unwrap();
+            let tag = format!("{id}:killswitch");
+            let chain = "FPKS_custom0";
+            let mut replies = vec![Err(error(Some(1), "No chain/target/match by that name.")), Ok(String::new())];
+            let mut expected = vec![vec![bin, "-w", "10", "-S", chain], vec![bin, "-w", "10", "-N", chain]];
+            for rule in [
+                vec![chain, "-i", "fp+", "-m", "comment", "--comment", &tag, "-j", "RETURN"],
+                vec![chain, "-i", "custom0", "-m", "comment", "--comment", &tag, "-j", "RETURN"],
+                vec![chain, "-m", "comment", "--comment", &tag, "-j", "DROP"],
+                vec!["FORWARD", "-o", "wan0", "-m", "comment", "--comment", &tag, "-j", chain],
+            ] {
+                replies.extend([Err(error(Some(1), "Bad rule")), Ok(String::new())]);
+                for op in ["-C", "-A"] { expected.push([vec![bin, "-w", "10", op], rule.clone()].concat()); }
+            }
+            let mut runner = Scripted::new(replies);
+            iptables_killswitch_on(&mut runner, bin, "wan0", "custom0", &id).unwrap();
+            assert_eq!(runner.commands, expected);
+        }
+    }
+
+    #[test]
     fn nft_killswitch_exempts_fp_namespace_and_down_removes_its_table() {
         let id = instance("custom0").unwrap();
         let mut runner = Scripted::new(vec![Ok(String::new()), Ok(String::new()), Ok(r#"{"nftables":[]}"#.into()), Ok(String::new()), Ok(String::new())]);
-        nft_with(&mut runner, Operation::KillswitchOn, "wan0", "custom0", &id).unwrap();
+        nft_with(&mut runner, Operation::KillswitchOn, "wan0", "custom0", &id, "100.72.0.0/24").unwrap();
         assert_eq!(runner.commands[3], ["nft", "add", "rule", "inet", &id, "forward", "oifname", "\"wan0\"", "iifname", "!=", "\"fp*\"", "iifname", "!=", "\"custom0\"", "drop", "comment", &format!("\"{id}:killswitch\"")]);
-        nft_with(&mut runner, Operation::Down, "wan0", "custom0", &id).unwrap();
+        nft_with(&mut runner, Operation::Down, "wan0", "custom0", &id, "100.72.0.0/24").unwrap();
         assert_eq!(runner.commands[4], ["nft", "delete", "table", "inet", &id]);
     }
 
