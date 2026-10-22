@@ -93,12 +93,55 @@ fn cli_preflights_all_changes_rejects_other_live_members_and_allows_single_membe
 }
 
 #[test]
+fn cli_preserves_config_when_member_directory_scan_fails() {
+    let (dir, _daemon) = fixture();
+    let path = dir.path().join("fp0.json");
+    let before = std::fs::read(&path).unwrap();
+    let error = edit_configs_with(dir.path(), Some("fp0"),
+        |obj| { obj.insert("kill_switch".into(), json!(true)); },
+        || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
 fn live_member_detection_ignores_stale_sockets_and_finds_live_ones() {
+    use std::io::{ErrorKind, Read, Seek};
+    let kinds = [ErrorKind::NotFound, ErrorKind::ConnectionRefused, ErrorKind::ConnectionReset,
+        ErrorKind::TimedOut, ErrorKind::WouldBlock, ErrorKind::PermissionDenied, ErrorKind::InvalidInput, ErrorKind::Other];
+    let mut cases = vec![(PathBuf::from("fp0.sock"), None)];
+    cases.extend(kinds.into_iter().enumerate().map(|(i, kind)| (PathBuf::from(format!("stale-{i}.sock")), Some(kind))));
+    cases.push((PathBuf::from("fp2.sock"), None));
+    let paths: Vec<_> = cases.iter().map(|(path, _)| path.clone()).collect();
+    let mut seen = Vec::new();
+    let capture = tempfile::tempfile().unwrap(); let mut reader = capture.try_clone().unwrap();
+    let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG).with_writer(move || capture.try_clone().unwrap()).finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    // Inject each connect result: no listener shutdown timing or backlog state.
+    let live = live_member_paths_with(paths.clone(), |path| {
+        seen.push(path.to_owned());
+        match cases.iter().find(|(candidate, _)| candidate == path).unwrap().1 {
+            Some(kind) => Err(std::io::Error::from(kind)),
+            None => Ok(()),
+        }
+    });
+    assert_eq!(live, ["fp0", "fp2"]);
+    assert_eq!(seen, paths, "a failed probe must not stop later probes");
+    reader.rewind().unwrap(); let mut output = String::new(); reader.read_to_string(&mut output).unwrap();
+    assert_eq!(output.matches("DEBUG").count(), kinds.len(), "{output}");
+    for kind in kinds { assert!(output.contains(&format!("error_kind={kind:?}")), "{output}"); }
+}
+
+#[test]
+fn live_member_probe_accepts_stream_and_ignores_incompatible_socket() {
     let dir = tempfile::tempdir().unwrap();
-    let live = dir.path().join("fp0.sock"); let stale = dir.path().join("fp1.sock");
-    let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
-    drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
-    assert_eq!(live_member_paths(vec![live, stale, dir.path().join("missing.sock")]).unwrap(), ["fp0"]);
+    let live = dir.path().join("fp0.sock"); let incompatible = dir.path().join("fp1.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+    let _datagram = std::os::unix::net::UnixDatagram::bind(&incompatible).unwrap();
+    assert_eq!(live_member_paths(vec![live, incompatible, dir.path().join("missing.sock")]), ["fp0"]);
+    // Exactly one connection was queued; accept it without relying on timeouts.
+    listener.accept().unwrap();
 }
 
 #[test]

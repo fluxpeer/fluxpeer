@@ -45,7 +45,7 @@ group = 'setup'
 state = {}
 relay_public_key = None
 
-def run(args, data=None, timeout=40):
+def run(args, data=None, timeout=40, diagnose=True):
     try:
         p = sp.run(args, input=data, text=True, stdout=sp.PIPE,
                    stderr=sp.PIPE, timeout=timeout)
@@ -54,7 +54,12 @@ def run(args, data=None, timeout=40):
         def txt(v): return v.decode(errors='replace') if isinstance(v, bytes) else (v or '')
         # A synthetic 124 is an outer command deadline, not curl's exit status.
         # Keep partial output so API diagnostics can detect a completed response.
-        return 124, txt(e.stdout), txt(e.stderr) + '\nHARNESS_TIMEOUT\n'
+        out, err = txt(e.stdout), txt(e.stderr) + '\nHARNESS_TIMEOUT\n'
+        if diagnose and args[:len(P) + 1] == P + ['exec']:
+            container = next((arg for arg in args[len(P) + 1:] if arg in OWN_CONTAINERS), None)
+            fname = exec_timeout_evidence(container, out, timeout)
+            err += f'EXEC_TIMEOUT_EVIDENCE={fname}\n'
+        return 124, out, err
 
 def outer_timeout(rc, err):
     return rc == 124 and '\nHARNESS_TIMEOUT\n' in err
@@ -71,6 +76,10 @@ def record(label, args, data=None, timeout=40, secret=False):
 
 def need(args, data=None, timeout=40):
     rc, out, err = run(args, data, timeout)
+    if outer_timeout(rc, err) and args[:len(P) + 1] == P + ['exec']:
+        evidence = re.findall(r'^EXEC_TIMEOUT_EVIDENCE=(.+)$', err, re.MULTILINE)
+        # join arguments and cat output can contain invite/device private keys.
+        raise RuntimeError(f'podman exec outer timeout: rc={rc}; evidence={evidence}')
     if rc: raise RuntimeError(f'{shlex.join(args)}: rc={rc}\n{out}\n{err}')
     return out
 
@@ -158,17 +167,36 @@ def host_snapshot(tag):
         (OUT / f'host-{tag}-{label}.txt').write_text(out)
     return snap
 
-def api_timeout_snapshots():
+def timeout_snapshots(container='fpe-ctl', label='api-timeout'):
     # comm excludes argv: an in-flight curl command can carry a bearer header.
     files = []
-    for label, args in [
+    commands = [
         ('podman-ps', P + ['ps', '-a', '--format', '{{.ID}} {{.Names}} {{.Status}}']),
         ('host-processes', ['ps', '-eo', 'pid,ppid,stat,etime,comm']),
-        ('control-processes', P + ['top', 'fpe-ctl', 'pid,ppid,state,etime,comm']),
-    ]:
-        _, _, _, fname = record('api-timeout-' + label, args, timeout=3)
+    ]
+    if container is not None:
+        commands.append(('container-processes', P + ['top', container, 'pid,ppid,state,etime,comm']))
+    for name, args in commands:
+        # None of these commands is an exec: their own timeout cannot recurse.
+        _, _, _, fname = record(label + '-' + name, args, timeout=3)
         files.append(fname)
     return files
+
+def exec_timeout_evidence(container, out, deadline):
+    global seq
+    try:
+        json.loads(out)
+        complete = True
+    except ValueError: complete = False
+    seq += 1
+    fname = f'{seq:04d}-{group}-exec-timeout.json'
+    detail = dict(container=container, outer_timeout=True, deadline_seconds=deadline,
+                  stdout_present=bool(out), stdout_bytes=len(out.encode()), stdout_complete_json=complete,
+                  retry=False, snapshots=[])
+    (OUT / fname).write_text(json.dumps(detail, indent=2) + '\n')
+    detail['snapshots'] = timeout_snapshots(container, 'exec-timeout')
+    (OUT / fname).write_text(json.dumps(detail, indent=2) + '\n')
+    return fname
 
 def api_curl_metadata(err):
     metrics, inner_exit = None, None
@@ -201,7 +229,8 @@ def api(method, path, body=None, token=ADMIN):
     args += ['http://127.0.0.1:18080/api/v1' + path]
     evidence = []
     for attempt in (1, 2):
-        rc, out, err = run(args, timeout=20)
+        # API attempts already have their own timing evidence and snapshot path.
+        rc, out, err = run(args, timeout=20, diagnose=False)
         try:
             value = json.loads(out)
             complete = True
@@ -224,7 +253,7 @@ def api(method, path, body=None, token=ADMIN):
                           if outer else ('command_failed' if rc else 'completed'), snapshots=[])
         (OUT / fname).write_text(json.dumps(detail, indent=2) + '\n')
         if outer:
-            detail['snapshots'] = api_timeout_snapshots()
+            detail['snapshots'] = timeout_snapshots()
             (OUT / fname).write_text(json.dumps(detail, indent=2) + '\n')
         if retry: continue
         if rc or (out.strip() and not complete):

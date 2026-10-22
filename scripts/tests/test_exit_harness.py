@@ -257,7 +257,7 @@ class ApiDiagnostics(unittest.TestCase):
         self.ns.update(OUT=self.root, seq=0)
         self.results = []
         self.calls = []
-        def run(args, data=None, timeout=40):
+        def run(args, data=None, timeout=40, diagnose=True):
             self.calls.append((args, timeout))
             if 'curl' in args: return self.results.pop(0)
             return 0, 'process snapshot', ''
@@ -357,6 +357,61 @@ class ApiDiagnostics(unittest.TestCase):
         ns['sp'].run.return_value = subprocess.CompletedProcess(['fake'], 124, '', 'FPE_CURL_EXIT=124')
         rc, _, err = ns['run'](['fake'])
         self.assertFalse(ns['outer_timeout'](rc, err))
+
+
+class ExecTimeoutDiagnostics(unittest.TestCase):
+    def setUp(self):
+        self.ns = helpers()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.ns.update(OUT=self.root, seq=0)
+        self.ns['sp'] = Mock(PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired)
+        self.calls = []
+        def execute(args, **kwargs):
+            self.calls.append((args, kwargs))
+            if args[1] == 'exec':
+                raise subprocess.TimeoutExpired(args, kwargs['timeout'], output=b'{"private_key":"secret-key"}', stderr=b'secret-stderr')
+            # Podman status/top can also stall during host contention.
+            if args[0] == 'podman': raise subprocess.TimeoutExpired(args, kwargs['timeout'])
+            return subprocess.CompletedProcess(args, 0, 'safe process snapshot', '')
+        self.ns['sp'].run.side_effect = execute
+
+    def test_cat_timeout_records_target_snapshots_even_when_podman_status_stalls(self):
+        with self.assertRaises(RuntimeError) as error:
+            self.ns['need'](['podman', 'exec', 'fpe-exit', 'cat', '/run/fpe/node.json'])
+        self.assertIn('exec-timeout.json', str(error.exception))
+        self.assertNotIn('secret-', str(error.exception))
+        evidence = list(self.root.glob('*-exec-timeout.json'))
+        self.assertEqual(len(evidence), 1)
+        data = json.loads(evidence[0].read_text())
+        self.assertEqual(data['container'], 'fpe-exit')
+        self.assertTrue(data['stdout_complete_json'])
+        self.assertFalse(data['retry'])
+        self.assertEqual(len(data['snapshots']), 3)
+        self.assertEqual(len(self.calls), 4, 'snapshot timeouts must not recursively take snapshots')
+        self.assertEqual(self.calls[-1][0], ['podman', 'top', 'fpe-exit', 'pid,ppid,state,etime,comm'])
+        self.assertEqual([kwargs['timeout'] for _, kwargs in self.calls], [40, 3, 3, 3])
+        for path in self.root.iterdir(): self.assertNotIn('secret-', path.read_text())
+
+    def test_join_and_interactive_exec_never_retry_or_expose_arguments(self):
+        for args in [
+            ['podman', 'exec', 'fpe-cli', 'fluxpeer', 'join', 'secret-invite'],
+            ['podman', 'exec', '-i', 'fpe-exit', 'sh', '-c', 'cat > secret-path'],
+        ]:
+            with self.subTest(args=args):
+                before = len(self.calls)
+                with self.assertRaises(RuntimeError) as error: self.ns['need'](args, data='secret-stdin')
+                self.assertNotIn('secret-', str(error.exception))
+                self.assertEqual(len(self.calls) - before, 4)
+        for path in self.root.iterdir(): self.assertNotIn('secret-', path.read_text())
+
+    def test_nonexec_timeouts_and_api_opt_out_do_not_duplicate_diagnostics(self):
+        rc, _, _ = self.ns['run'](['podman', 'ps'])
+        self.assertEqual(rc, 124)
+        rc, _, _ = self.ns['run'](['podman', 'exec', 'fpe-ctl', 'curl'], diagnose=False)
+        self.assertEqual(rc, 124)
+        self.assertEqual(list(self.root.iterdir()), [])
 
 
 if __name__ == '__main__': unittest.main()

@@ -31,6 +31,32 @@ Deadlines cancel asynchronous work; they cannot preempt synchronous code that
 blocks runtime threads. A timed-out write may already have committed: clients
 must check state before repeating a mutation.
 
+## SQLite contention and traffic reporting
+
+SQLite connections use a 15000 ms busy timeout. Set
+`FLUXPEER_SQLITE_BUSY_TIMEOUT_MS` in the control process environment to 1..=60000
+milliseconds to override it; invalid values warn and use 15000. Each connection,
+including replacements, enables WAL with `wal_autocheckpoint=1000` pages. Normal
+commits checkpoint and reuse WAL frames; long-lived external readers can still
+delay checkpoint completion. This is not a hard WAL file-size limit.
+
+Control integrity transactions and stats/endpoints writes retry SQLite BUSY or
+LOCKED errors at most twice (three total attempts), with jittered backoff and a
+fresh transaction each time. The existing HTTP deadline may end the operation
+earlier. Exhausted SQLite contention returns 503 with `Retry-After: 1` and WARN
+logs; other database errors retain their existing handling. HTTP deadline 503s
+also carry `Retry-After: 1`. PostgreSQL's existing transaction retry policy is
+unchanged; SQLite PRAGMAs are never sent to PostgreSQL.
+
+Nodes report traffic every 15 seconds by default. Set
+`FLUXPEER_STATS_INTERVAL_SECS` in the node process environment to 1..=3600 seconds;
+values below 5 are clamped to 5, invalid values fall back to 15. Unchanged
+acknowledged samples are skipped (including stable per-peer data). Stats failures
+are nonfatal and double the delay up to eight times the interval; success resets
+the delay. Reporting sleeps after completion, so slow requests cannot create a
+catch-up burst. The stats `updated_at` timestamp is the last changed sample,
+not a node liveness heartbeat.
+
 ## Relay identity and registration
 
 Enable the optional relay service and its persistent `fprelaydata` volume:

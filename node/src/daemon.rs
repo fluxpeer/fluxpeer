@@ -200,25 +200,33 @@ fn edit_configs(
     edit_configs_with(dir, iface, edit, live_member_ifaces)
 }
 
-fn live_member_ifaces() -> std::io::Result<Vec<String>> { live_member_paths(crate::show::all_sockets()) }
+fn live_member_ifaces() -> std::io::Result<Vec<String>> {
+    Ok(live_member_paths(crate::show::try_all_sockets()?))
+}
 
-fn live_member_paths(paths: Vec<PathBuf>) -> std::io::Result<Vec<String>> {
+fn live_member_paths(paths: Vec<PathBuf>) -> Vec<String> {
+    live_member_paths_with(paths, |path| {
+        #[cfg(unix)]
+        { std::os::unix::net::UnixStream::connect(path).map(|_| ()) }
+        #[cfg(windows)]
+        {
+            let port: u16 = std::fs::read_to_string(path)?.trim().parse().map_err(std::io::Error::other)?;
+            std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), std::time::Duration::from_secs(1)).map(|_| ())
+        }
+    })
+}
+
+fn live_member_paths_with(paths: Vec<PathBuf>, mut connect: impl FnMut(&Path) -> std::io::Result<()>) -> Vec<String> {
     let mut up = Vec::new();
-    #[cfg(unix)]
     for path in paths {
-        match std::os::unix::net::UnixStream::connect(&path) {
+        match connect(&path) {
             Ok(_) => if let Some(iface) = path.file_stem().and_then(|name| name.to_str()) { up.push(iface.to_string()); },
-            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {},
-            Err(error) => return Err(error),
+            // Stale endpoints can fail with platform-specific error kinds. Only
+            // a successful connection proves liveness; keep probing the others.
+            Err(error) => tracing::debug!(path = %path.display(), error_kind = ?error.kind(), "member status endpoint is not live"),
         }
     }
-    #[cfg(windows)]
-    for path in paths {
-        let port: u16 = std::fs::read_to_string(&path)?.trim().parse().map_err(std::io::Error::other)?;
-        if std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), std::time::Duration::from_secs(1)).is_ok()
-            && let Some(iface) = path.file_stem().and_then(|name| name.to_str()) { up.push(iface.to_string()); }
-    }
-    Ok(up)
+    up
 }
 
 fn edit_configs_with(

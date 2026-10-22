@@ -49,6 +49,7 @@ mod relay;
 mod route;
 mod show;
 mod status;
+mod stats_report;
 mod statusd;
 mod tcp_direct;
 mod util;
@@ -1659,33 +1660,7 @@ async fn run_with(mut cfg: Config, protect: Option<ProtectFn>, routes: Option<mo
         let reg = status_reg.clone();
         let client = control::mk_client(&cfg);
         let device_id = cfg.device_id.clone();
-        tasks.spawn(async move {
-            // 3 s cadence so the web's realtime rate (Δbytes/Δt) feels live without
-            // hammering the control-server.
-            let mut iv = tokio::time::interval(Duration::from_secs(3));
-            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                iv.tick().await;
-                let snap = status::snapshot(&reg);
-                let rx: u64 = snap.iter().map(|p| p.rx_bytes).sum();
-                let tx: u64 = snap.iter().map(|p| p.tx_bytes).sum();
-                let peers: Vec<serde_json::Value> = snap
-                    .iter()
-                    .map(|p| {
-                        serde_json::json!({
-                            "public_key": hex::encode(p.pubkey),
-                            "rx_bytes": p.rx_bytes,
-                            "tx_bytes": p.tx_bytes,
-                            "transport": status::transport_name(p.transport),
-                            "last_handshake_unix": p.last_handshake_unix,
-                        })
-                    })
-                    .collect();
-                let _ = client
-                    .report_stats(&device_id, rx as i64, tx as i64, &serde_json::Value::Array(peers))
-                    .await;
-            }
-        });
+        tasks.spawn(stats_report::run(reg, client, device_id));
     }
 
     // --- REVOKE-1: steady-state membership reconcile. Poll the control-server's

@@ -91,22 +91,41 @@ fn status_dirs() -> Vec<PathBuf> {
 
 /// Every running network's status endpoint (`*.sock` on unix, `*.port` on Windows).
 pub(crate) fn all_sockets() -> Vec<PathBuf> {
+    socket_paths_in(status_dirs(), false).unwrap_or_default()
+}
+
+/// Admission checks must propagate directory scan errors instead of assuming
+/// there are no other members. Individual endpoint failures are handled later.
+pub(crate) fn try_all_sockets() -> std::io::Result<Vec<PathBuf>> {
+    socket_paths_in(status_dirs(), true)
+}
+
+fn socket_paths_in(dirs: Vec<PathBuf>, strict: bool) -> std::io::Result<Vec<PathBuf>> {
     let ext = if cfg!(windows) { "port" } else { "sock" };
     let mut out = Vec::new();
-    for dir in status_dirs() {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for e in rd.flatten() {
+    for dir in dirs {
+        match std::fs::read_dir(&dir) {
+            Ok(rd) => for entry in rd {
+                let e = match entry {
+                    Ok(entry) => entry,
+                    Err(error) if strict => return Err(error),
+                    Err(_) => continue,
+                };
                 if e.path().extension().is_some_and(|x| x == ext) {
                     out.push(e.path());
                 } else if e.path().extension().is_some_and(|x| x == "error") {
                     out.push(e.path().with_extension(ext));
                 }
-            }
+            },
+            // An optional platform directory may not exist until a node starts.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) if strict => return Err(error),
+            Err(_) => {},
         }
     }
     out.sort();
     out.dedup();
-    out
+    Ok(out)
 }
 
 /// `fluxpeer networks` — list the networks this device has joined (config dir) +
@@ -236,6 +255,22 @@ fn plural(n: u64) -> &'static str {
 #[cfg(test)]
 mod stopped_tests {
     use super::*;
+
+    #[test]
+    fn strict_socket_scan_propagates_directory_errors_and_allows_absent_optional_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = if cfg!(windows) { "port" } else { "sock" };
+        let endpoint = dir.path().join("fp0").with_extension(ext);
+        std::fs::write(&endpoint, "fixture").unwrap();
+        std::fs::write(endpoint.with_extension("error"), "fixture").unwrap();
+        let absent = dir.path().join("not-created");
+        assert_eq!(socket_paths_in(vec![absent, dir.path().to_owned()], true).unwrap().as_slice(), std::slice::from_ref(&endpoint));
+        // A regular file as the scan root fails deterministically even as root.
+        let expected = std::fs::read_dir(&endpoint).unwrap_err().kind();
+        assert_eq!(socket_paths_in(vec![endpoint.clone()], true).unwrap_err().kind(), expected);
+        assert!(socket_paths_in(vec![endpoint], false).unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn show_and_daemon_status_read_failure_after_the_socket_is_gone() {
         let dir = tempfile::tempdir().unwrap();

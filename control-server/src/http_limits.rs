@@ -40,7 +40,7 @@ async fn deadline(State(timeout): State<Duration>, request: Request, next: Next)
     // only the upgrade/authentication handler is covered by this deadline.
     let result = Timeout::new(next, timeout).oneshot(request).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    match result {
+    let mut response = match result {
         Ok(response) => {
             let status = response.status().as_u16();
             if started.elapsed() > Duration::from_secs(1) {
@@ -54,7 +54,12 @@ async fn deadline(State(timeout): State<Duration>, request: Request, next: Next)
             tracing::error!(%method, %route, elapsed_ms, "control HTTP deadline exceeded");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
+    };
+    if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().entry(axum::http::header::RETRY_AFTER)
+            .or_insert(axum::http::HeaderValue::from_static("1"));
     }
+    response
 }
 
 #[cfg(test)]

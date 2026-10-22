@@ -9,19 +9,34 @@ use crate::domain::{AuditEntry, Device, DeviceStatus, Invite, Network, RelayNode
 use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
 
+fn sqlite_busy_timeout(value: Option<&str>) -> u64 {
+    match value {
+        None => 15_000,
+        Some(value) => match value.parse::<u64>() {
+            Ok(ms @ 1..=60_000) => ms,
+            _ => {
+                tracing::warn!("invalid FLUXPEER_SQLITE_BUSY_TIMEOUT_MS; using 15000 ms (valid range: 1..=60000)");
+                15_000
+            }
+        },
+    }
+}
+
 /// Connect to a database by URL (e.g. `postgres://…` or `sqlite::memory:`).
 pub async fn connect(url: &str) -> Result<AnyPool, sqlx::Error> {
     sqlx::any::install_default_drivers();
     let sqlite = url.starts_with("sqlite:");
+    let busy_ms = if sqlite { sqlite_busy_timeout(std::env::var("FLUXPEER_SQLITE_BUSY_TIMEOUT_MS").ok().as_deref()) } else { 0 };
     AnyPoolOptions::new().max_connections(if url == "sqlite::memory:" { 1 } else { 5 })
         .acquire_timeout(std::time::Duration::from_secs(5))
         .after_connect(move |conn, _| Box::pin(async move {
             if sqlite {
                 // Connection-local settings must also apply to replacement pool
                 // connections. In-memory SQLite keeps its memory journal mode.
-                sqlx::query("PRAGMA busy_timeout = 5000").execute(&mut *conn).await?;
+                sqlx::query(&format!("PRAGMA busy_timeout = {busy_ms}")).execute(&mut *conn).await?;
                 sqlx::query("PRAGMA journal_mode = WAL").execute(&mut *conn).await?;
                 sqlx::query("PRAGMA synchronous = NORMAL").execute(&mut *conn).await?;
+                sqlx::query("PRAGMA wal_autocheckpoint = 1000").execute(&mut *conn).await?;
             }
             Ok(())
         })).connect(url).await
@@ -540,6 +555,16 @@ pub async fn count_networks(pool: &AnyPool) -> Result<i64, sqlx::Error> {
 #[allow(clippy::items_after_test_module)] // non-test items intentionally follow
 mod test {
     use super::*;
+
+    #[test]
+    fn sqlite_busy_timeout_configuration_is_bounded() {
+        assert_eq!(sqlite_busy_timeout(None), 15000);
+        assert_eq!(sqlite_busy_timeout(Some("20")), 20);
+        assert_eq!(sqlite_busy_timeout(Some("60000")), 60000);
+        for value in ["0", "-1", "invalid", "60001", "18446744073709551615"] {
+            assert_eq!(sqlite_busy_timeout(Some(value)), 15000);
+        }
+    }
 
     async fn mem_pool() -> AnyPool {
         sqlx::any::install_default_drivers();

@@ -19,6 +19,7 @@ pub mod persistence;
 mod pop;
 mod integrity;
 mod http_limits;
+mod contention;
 pub mod sql_store;
 pub mod state;
 
@@ -450,6 +451,11 @@ async fn send_config(socket: &mut WebSocket, store: &Arc<Store>, device_id: &str
 // ---- Persistent (SqlStore-backed) variant of the REST API ----
 
 pub(crate) fn internal_error(error: SqlStoreError) -> StatusCode {
+    if let SqlStoreError::Db(ref db_error) = error
+        && contention::sqlite_busy(db_error) {
+        tracing::warn!("SQLite contention; control request temporarily unavailable");
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
     // Pool deadlines are logged at the store boundary, including non-HTTP callers.
     if !matches!(error, SqlStoreError::Db(sqlx::Error::PoolTimedOut)) {
         tracing::error!(error = ?error, "control request failed");

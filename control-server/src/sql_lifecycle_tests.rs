@@ -156,7 +156,8 @@ async fn file_sqlite_pool_settings_and_writer_reservation() {
         let mode: String = sqlx::query_scalar("PRAGMA journal_mode").fetch_one(&mut **conn).await.unwrap();
         let busy: i64 = sqlx::query_scalar("PRAGMA busy_timeout").fetch_one(&mut **conn).await.unwrap();
         let sync: i64 = sqlx::query_scalar("PRAGMA synchronous").fetch_one(&mut **conn).await.unwrap();
-        assert_eq!(mode, "wal"); assert_eq!(busy, 5000); assert_eq!(sync, 1);
+        let checkpoint: i64 = sqlx::query_scalar("PRAGMA wal_autocheckpoint").fetch_one(&mut **conn).await.unwrap();
+        assert_eq!(mode, "wal"); assert_eq!(busy, 15000); assert_eq!(sync, 1); assert_eq!(checkpoint, 1000);
     }
     drop(connections);
     let mut first = crate::integrity::begin(&store.pool).await.unwrap();

@@ -111,16 +111,7 @@ impl SqlStore {
     }
 
     async fn next_seq(&self) -> Result<i64> {
-        let mut attempt = 0;
-        loop {
-            match self.next_seq_once().await {
-                Err(SqlStoreError::Db(error)) if crate::integrity::retryable(&error) && attempt < 7 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10 << attempt)).await;
-                    attempt += 1;
-                }
-                result => return result,
-            }
-        }
+        crate::contention::retry("next_seq", true, || self.next_seq_once()).await
     }
 
     async fn next_seq_once(&self) -> Result<i64> {
@@ -169,6 +160,15 @@ impl SqlStore {
         expires_at: Option<i64>,
         max_uses: Option<u32>,
     ) -> Result<Invite> {
+        crate::contention::retry("create_invite", false, || self.create_invite_once(network_id, expires_at, max_uses)).await
+    }
+
+    async fn create_invite_once(
+        &self,
+        network_id: &str,
+        expires_at: Option<i64>,
+        max_uses: Option<u32>,
+    ) -> Result<Invite> {
         let mut tx = crate::integrity::begin(&self.pool).await?;
         if db::get_network(&mut *tx, network_id).await?.is_none() {
             return Err(SqlStoreError::NetworkNotFound);
@@ -189,6 +189,10 @@ impl SqlStore {
 
     /// Serialize lifecycle changes with enrollment and import across processes.
     pub async fn delete_network(&self, network_id: &str) -> Result<()> {
+        crate::contention::retry("delete_network", false, || self.delete_network_once(network_id)).await
+    }
+
+    async fn delete_network_once(&self, network_id: &str) -> Result<()> {
         let mut tx = crate::integrity::begin(&self.pool).await?;
         let net = db::get_network(&mut *tx, network_id).await?.ok_or(SqlStoreError::NetworkNotFound)?;
         sqlx::query("UPDATE device SET status = 'revoked', auth_token = NULL, address_v4 = NULL, address_v6 = NULL WHERE network_id = $1")
@@ -209,6 +213,10 @@ impl SqlStore {
     }
 
     pub async fn revoke_invite(&self, network_id: &str, code: &str) -> Result<()> {
+        crate::contention::retry("revoke_invite", false, || self.revoke_invite_once(network_id, code)).await
+    }
+
+    async fn revoke_invite_once(&self, network_id: &str, code: &str) -> Result<()> {
         let mut tx = crate::integrity::begin(&self.pool).await?;
         if db::get_network(&mut *tx, network_id).await?.is_none() { return Err(SqlStoreError::NetworkNotFound); }
         let affected = sqlx::query("DELETE FROM invite WHERE network_id = $1 AND code = $2")
@@ -235,16 +243,7 @@ impl SqlStore {
     /// is returned ONCE here and never echoed by any other endpoint.
     pub async fn enroll(&self, invite_code: &str, name: &str, wg_public_key: &str, now: i64) -> Result<(Device, String)> {
         let key = fluxpeer_sdk::key::normalize(wg_public_key).ok_or(SqlStoreError::InvalidKey)?;
-        let mut attempt = 0;
-        loop {
-            match self.enroll_once(invite_code, name, &key, now).await {
-                Err(SqlStoreError::Db(error)) if crate::integrity::retryable(&error) && attempt < 7 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10 << attempt)).await;
-                    attempt += 1;
-                }
-                result => return result,
-            }
-        }
+        crate::contention::retry("enroll", true, || self.enroll_once(invite_code, name, &key, now)).await
     }
 
     async fn enroll_once(&self, invite_code: &str, name: &str, key: &str, now: i64) -> Result<(Device, String)> {
@@ -333,16 +332,7 @@ impl SqlStore {
         }).collect::<Result<Vec<_>>>()?;
         let keys = devices.iter().map(|d| fluxpeer_sdk::key::normalize(&d.wg_public_key)
             .ok_or(SqlStoreError::InvalidKey)).collect::<Result<Vec<_>>>()?;
-        let mut attempt = 0;
-        loop {
-            match self.import_once(network_id, &devices, &keys).await {
-                Err(SqlStoreError::Db(error)) if crate::integrity::retryable(&error) && attempt < 7 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10 << attempt)).await;
-                    attempt += 1;
-                }
-                result => return result,
-            }
-        }
+        crate::contention::retry("import_devices", true, || self.import_once(network_id, &devices, &keys)).await
     }
 
     async fn import_once(&self, network_id: &str, devices: &[ImportDevice], keys: &[String]) -> Result<ImportResult> {
@@ -420,16 +410,7 @@ impl SqlStore {
     }
 
     pub async fn revoke_device(&self, device_id: &str) -> Result<()> {
-        let mut attempt = 0;
-        loop {
-            match self.revoke_device_once(device_id).await {
-                Err(SqlStoreError::Db(error)) if crate::integrity::retryable(&error) && attempt < 7 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10 << attempt)).await;
-                    attempt += 1;
-                }
-                result => return result,
-            }
-        }
+        crate::contention::retry("revoke_device", true, || self.revoke_device_once(device_id)).await
     }
 
     async fn revoke_device_once(&self, device_id: &str) -> Result<()> {
@@ -482,6 +463,10 @@ impl SqlStore {
     /// Advertise a subnet route from a device (created UNAPPROVED — no config effect
     /// until approved, so no epoch bump yet).
     pub async fn advertise_route(&self, device_id: &str, prefix: &str) -> Result<Route> {
+        crate::contention::retry("advertise_route", false, || self.advertise_route_once(device_id, prefix)).await
+    }
+
+    async fn advertise_route_once(&self, device_id: &str, prefix: &str) -> Result<Route> {
         let mut tx = crate::integrity::begin(&self.pool).await?;
         let dev = db::get_device(&mut *tx, device_id)
             .await?
@@ -538,6 +523,10 @@ impl SqlStore {
 
     /// Record a node-reported traffic stats sample (cumulative rx/tx + per-peer blob).
     pub async fn report_stats(&self, device_id: &str, rx: i64, tx: i64, peers_json: &str, at: i64) -> Result<()> {
+        crate::contention::retry("report_stats", false, || self.report_stats_once(device_id, rx, tx, peers_json, at)).await
+    }
+
+    async fn report_stats_once(&self, device_id: &str, rx: i64, tx: i64, peers_json: &str, at: i64) -> Result<()> {
         let mut transaction = self.pool.begin().await?;
         Self::lock_active_device(&mut transaction, device_id).await?;
         db::upsert_device_stats(&mut *transaction, device_id, rx, tx, peers_json, at).await?;
@@ -656,6 +645,18 @@ impl SqlStore {
         stun_url: Option<String>,
         identity: (Option<String>, Option<String>),
     ) -> Result<RelayNode> {
+        crate::contention::retry("register_relay_authenticated", false, || self.register_relay_authenticated_once(region, url, network_id.clone(), anytls, stun_url.clone(), identity.clone())).await
+    }
+
+    async fn register_relay_authenticated_once(
+        &self,
+        region: &str,
+        url: &str,
+        network_id: Option<String>,
+        anytls: bool,
+        stun_url: Option<String>,
+        identity: (Option<String>, Option<String>),
+    ) -> Result<RelayNode> {
         let (node_id, public_key) = identity;
         let mut tx = crate::integrity::begin(&self.pool).await?;
         if let Some(id) = &network_id && db::get_network(&mut *tx, id).await?.is_none() { return Err(SqlStoreError::NetworkNotFound); }
@@ -679,6 +680,10 @@ impl SqlStore {
     }
 
     pub async fn update_relay(&self, relay: RelayNode) -> Result<RelayNode> {
+        crate::contention::retry("update_relay", false, || self.update_relay_once(relay.clone())).await
+    }
+
+    async fn update_relay_once(&self, relay: RelayNode) -> Result<RelayNode> {
         let mut tx = crate::integrity::begin(&self.pool).await?;
         if let Some(scope) = &relay.network_id && db::get_network(&mut *tx, scope).await?.is_none() { return Err(SqlStoreError::NetworkNotFound); }
         let old = sqlx::query("SELECT network_id FROM relay WHERE id = $1").bind(&relay.id)
@@ -703,6 +708,10 @@ impl SqlStore {
     /// A device reports its current candidate endpoints; peers pick them up on
     /// their next config-pull/push (epoch bumped to notify watchers).
     pub async fn set_endpoints(&self, device_id: &str, endpoints: &[String]) -> Result<()> {
+        crate::contention::retry("set_endpoints", false, || self.set_endpoints_once(device_id, endpoints)).await
+    }
+
+    async fn set_endpoints_once(&self, device_id: &str, endpoints: &[String]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         Self::lock_active_device(&mut tx, device_id).await?;
         let device = db::get_device(&mut *tx, device_id)
@@ -993,3 +1002,7 @@ mod integrity_tests;
 #[cfg(test)]
 #[path = "sql_lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "sqlite_contention_tests.rs"]
+mod contention_tests;
