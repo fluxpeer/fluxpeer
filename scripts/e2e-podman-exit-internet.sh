@@ -288,6 +288,7 @@ def capture(label='after'):
         ('client-log', px('fpe-cli', 'tail', '-n', '85', '/run/fpe/node.log')),
         ('exit-log', px('fpe-exit', 'tail', '-n', '85', '/run/fpe/node.log')),
         ('relay-log', px('fpe-ctl', 'tail', '-n', '55', '/run/fpe/relay.log')),
+        ('control-log', px('fpe-ctl', 'tail', '-n', '80', '/run/fpe/control.log')),
     ]
     for name, cmd in cmds: record(label + '-' + name, cmd)
 
@@ -374,6 +375,9 @@ def scenario(name, fn):
     except Exception:
         message = traceback.format_exc()
         (OUT / f'{name}-exception.txt').write_text(message)
+        # Preserve server-side evidence for any harness failure (e.g. control 5xx).
+        for svc in ('control', 'relay'):
+            record(f'exception-{svc}-log', px('fpe-ctl', 'tail', '-n', '300', f'/run/fpe/{svc}.log'))
         checks.append(dict(scenario=name, check='harness-completion', actual_rc=1, verdict='FAIL', error=message))
         print(message, flush=True)
     finally:
