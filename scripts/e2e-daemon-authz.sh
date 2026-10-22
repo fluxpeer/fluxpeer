@@ -4,7 +4,7 @@
 # expose dangerous verbs to any bearer-holder by default:
 #   * no/bad auth                         → {"error":"unauthorized"}
 #   * authed get_config                   → returns config but private_key REDACTED
-#   * authed high-risk verbs (set_config/import/shutdown) DEFAULT-DENIED
+#   * authed high-risk verbs (set_config/import) DEFAULT-DENIED; shutdown needs the token only (AD-P1-6)
 #   * with FLUXPEER_ALLOW_ADMIN_API=1 those verbs are allowed (opt-in)
 #   * low-risk verbs (networks) authed    → ok
 # Protocol: raw TCP, one JSON line in `{"auth":..,"cmd":..,..}`, one JSON line out.
@@ -66,11 +66,17 @@ R=$(req "{\"auth\":\"$TOK\",\"cmd\":\"set_config\",\"iface\":\"fpauthz\",\"confi
 echo "$R" | grep -qiE 'denied|disabled|forbidden|admin' && ok "set_config default-denied" || no "set_config NOT denied: $R"
 R=$(req "{\"auth\":\"$TOK\",\"cmd\":\"import\",\"config\":{\"private_key\":\"$SENT_KEY\"}}")
 echo "$R" | grep -qiE 'denied|disabled|forbidden|admin' && ok "import default-denied" || no "import NOT denied: $R"
+# AD-P1-6 (T-0040): shutdown is a safe disconnect gated by the daemon token
+# only. Unauthenticated shutdown is rejected; an authenticated one succeeds
+# with an explicit teardown ack and the daemon then exits.
+R=$(req '{"cmd":"shutdown"}')
+echo "$R" | grep -q unauthorized && ok "no-auth shutdown rejected" || no "no-auth shutdown not rejected: $R"
+R=$(req "{\"auth\":\"$TOK\",\"cmd\":\"networks\"}")
+echo "$R" | grep -q unauthorized && no "daemon dead after rejected shutdown: $R" || ok "daemon survived rejected shutdown"
 R=$(req "{\"auth\":\"$TOK\",\"cmd\":\"shutdown\"}")
-echo "$R" | grep -qiE 'denied|disabled|forbidden|admin' && ok "shutdown default-denied" || no "shutdown NOT denied: $R"
-# daemon must still be alive after a denied shutdown
-sleep 1; R=$(req "{\"auth\":\"$TOK\",\"cmd\":\"networks\"}")
-echo "$R" | grep -q unauthorized && no "post-shutdown daemon dead/odd: $R" || ok "daemon survived denied shutdown"
+echo "$R" | grep -q '"shutdown":true' && echo "$R" | grep -q '"ok":true' && ok "authed shutdown acknowledged" || no "authed shutdown failed: $R"
+sleep 2; R=$(req "{\"auth\":\"$TOK\",\"cmd\":\"networks\"}" 2>&1 || true)
+echo "$R" | grep -q '"iface"' && no "daemon still serving after shutdown: $R" || ok "daemon exited after shutdown"
 
 echo "===== RESULTS: $pass pass / $fail fail ====="
 [ "$fail" = 0 ]

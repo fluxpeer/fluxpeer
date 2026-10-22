@@ -645,7 +645,10 @@ try:
             start('fpe-exit', e); start('fpe-cli', c)
             time.sleep(12)
             rc, out, _, ev = record('ks-guard-ruleset', px('fpe-cli', 'nft', 'list', 'ruleset'))
-            require_observation('ks-guard-installed', rc == 0 and 'hook output' in out and 'policy drop' in out, ev)
+            # nft backend: own table with `policy drop`; iptables(-nft) backend:
+            # chain FPO_<tun> ending in drop, jumped to from OUTPUT.
+            installed = rc == 0 and ('policy drop' in out or ('chain FPO_fpe0' in out and 'jump FPO_fpe0' in out))
+            require_observation('ks-guard-installed', installed, ev)
             probes(True)
             check('ks-on-physical-blocked', px('fpe-cli', 'ping', '-c', '2', '-W', '2', f'{MESH}.50'), False)
             check('ks-on-control-carrier-allowed', px('fpe-cli', 'curl', '-fsS', '--max-time', '5',
@@ -666,7 +669,7 @@ try:
             rc, out, _, ev = record('ks-released-ruleset', px('fpe-cli', 'nft', 'list', 'ruleset'))
             # The harness scaffold table (fpe_guard) uses `policy accept`; only
             # the client kill-switch table carries `policy drop`.
-            require_observation('ks-guard-released', rc == 0 and 'policy drop' not in out, ev)
+            require_observation('ks-guard-released', rc == 0 and 'policy drop' not in out and 'FPO_fpe0' not in out, ev)
             check('ks-released-physical-reachable', px('fpe-cli', 'ping', '-c', '2', '-W', '2', f'{MESH}.50'))
             capture('after-killswitch')
         finally:
@@ -685,8 +688,11 @@ try:
         time.sleep(16)
         exit_cfg = api('GET', f'/devices/{state["e"]["device_id"]}/config', token=state['e']['auth_token'])
         check('wrong-pin-relay-overlay-fails', px('fpe-cli', 'ping', '-c', '2', '-W', '2', exit_cfg['address_v4']), False)
-        rc, out, _, ev = record('wrong-pin-client-log', px('fpe-cli', 'tail', '-n', '200', '/run/fpe/node.log'))
-        require_observation('wrong-pin-rejected-in-log', rc == 0 and 'invalid relay key confirmation' in out, ev)
+        record('wrong-pin-client-log', px('fpe-cli', 'tail', '-n', '200', '/run/fpe/node.log'))
+        # A client pinned to the wrong key derives the wrong DH secret, so the
+        # relay rejects its identity proof and closes before confirmation.
+        rc, out, _, ev = record('wrong-pin-relay-log', px('fpe-ctl', 'tail', '-n', '400', '/run/fpe/relay.log'))
+        require_observation('wrong-pin-rejected-by-relay', rc == 0 and 'relay authentication rejected' in out, ev)
         stop_pair()
     scenario('S11-relay-wrong-pin', s11)
     def sysctl_failure():

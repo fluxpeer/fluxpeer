@@ -20,7 +20,7 @@ have(){ command -v "$1" >/dev/null 2>&1; }
 SUDO=""; [ "$(id -u)" = 0 ] || SUDO="sudo -n"
 
 nft_has_table(){ $SUDO nft list table inet "$TABLE" >/dev/null 2>&1; }
-nft_rule_count(){ $SUDO nft list table inet "$TABLE" 2>/dev/null | grep -cE '^[[:space:]]*iifname .* (masquerade|accept|drop)([[:space:]]|$)'; }
+nft_rule_count(){ $SUDO nft list table inet "$TABLE" 2>/dev/null | grep -cE '^[[:space:]]*(meta nfproto [a-z0-9]+ )?iifname .* (masquerade|accept|drop)([[:space:]]|$)'; }
 ipt_masq_count(){ $SUDO iptables -w 10 -t nat -S POSTROUTING 2>/dev/null | grep -F "$TABLE:nat" | grep -c MASQUERADE; }
 ipt_fwd_count(){ $SUDO iptables -w 10 -S FORWARD 2>/dev/null | grep -cF "$TABLE:forward"; }
 
@@ -55,7 +55,7 @@ have nft && test_backend nft || echo "  (nft absent — skip nft backend)"
 have iptables && test_backend iptables || echo "  (iptables absent — skip iptables backend)"
 
 echo "########## auto-detection (no FLUXPEER_FW_BACKEND) ##########"
-det=$($SUDO "$B" fw-selftest detect 2>&1 || true)
+det=$($SUDO env -u FLUXPEER_FW_BACKEND "$B" fw-selftest detect 2>&1 || true)
 echo "  detected: $det"
 if have iptables; then expected=iptables; else expected=nft; fi
 echo "$det" | grep -qi "$expected" && ok "auto-detect picks $expected" || no "auto-detect failed (got: $det)"
