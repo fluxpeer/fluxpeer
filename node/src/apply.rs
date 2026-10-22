@@ -249,6 +249,8 @@ pub(crate) struct Status {
     pub last_error: Option<ApplyError>,
     pub applied_epoch: Option<u64>,
     pub restart_required: bool,
+    pub self_exit: bool,
+    pub exit_active: bool,
 }
 pub(crate) type SharedStatus = std::sync::Arc<parking_lot::Mutex<Status>>;
 enum ApplyEvent<'a> { Failed(&'a ApplyError), Recovered }

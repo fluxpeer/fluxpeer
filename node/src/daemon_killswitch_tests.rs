@@ -118,6 +118,9 @@ fn live_member_detection_ignores_stale_sockets_and_finds_live_ones() {
     let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
         .with_max_level(tracing::Level::DEBUG).with_writer(move || capture.try_clone().unwrap()).finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    // Parallel tests without a subscriber may have cached these callsites as
+    // disabled; recompute interest now that this thread has a DEBUG subscriber.
+    tracing::callsite::rebuild_interest_cache();
     // Inject each connect result: no listener shutdown timing or backlog state.
     let live = live_member_paths_with(paths.clone(), |path| {
         seen.push(path.to_owned());

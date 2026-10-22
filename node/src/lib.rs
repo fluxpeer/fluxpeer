@@ -831,6 +831,11 @@ impl Reconciler {
         let epoch = self.desired_epoch;
         let self_exit = self.self_exit;
         let effects = host.apply(epoch, peers, self_exit, membership.is_err()).await;
+        {
+            let active = host.nat_state.lock().applied.is_some();
+            let mut status = self.apply_status.lock();
+            status.self_exit = self_exit; status.exit_active = active;
+        }
         apply::all([membership, effects])?;
         self.platform.applied(&self.desired).map_err(|e| ApplyError::new(&["mobile", "onRoutes"], e.to_string()))
     }
@@ -1333,7 +1338,12 @@ async fn run_with(mut cfg: Config, protect: Option<ProtectFn>, routes: Option<mo
     initial_host.guard_carriers(&initial_peers, false).await?;
     let self_exit = r.self_exit;
     let result = initial_host.apply(init_epoch, initial_peers, self_exit, false).await;
-    apply_status.lock().complete(init_epoch, result);
+    {
+        let active = initial_host.nat_state.lock().applied.is_some();
+        let mut status = apply_status.lock();
+        status.self_exit = self_exit; status.exit_active = active;
+        status.complete(init_epoch, result);
+    }
 
 
     let (tun_tx, tun_rx) = dev.into_framed().split();

@@ -24,6 +24,7 @@ pub(crate) struct Options {
 
 pub struct Nft;
 pub struct Iptables;
+pub struct Fw4;
 
 fn iptables_run(runner: &mut impl apply::Runner, args: &[&str]) -> Result<String> {
     let Some((bin, rest)) = args.split_first() else { return Err(ApplyError::new(args, "empty iptables command")); };
@@ -33,6 +34,8 @@ fn iptables_run(runner: &mut impl apply::Runner, args: &[&str]) -> Result<String
 }
 
 pub fn detect() -> Result<Box<dyn Firewall>> {
+    // OpenWrt must edit fw4 policy, regardless of an iptables compatibility binary.
+    if cfg!(target_os = "linux") && std::path::Path::new("/sbin/fw4").exists() { return Ok(Box::new(Fw4)); }
     detect_with(&mut apply::System, std::env::var("FLUXPEER_FW_BACKEND").ok().as_deref())
 }
 
@@ -176,6 +179,7 @@ macro_rules! backend {
 }
 backend!(Nft, "nft");
 backend!(Iptables, "iptables");
+backend!(Fw4, "fw4");
 
 #[cfg(any(target_os = "linux", test))]
 fn execute_with(runner: &mut impl apply::Runner, root: &std::path::Path, backend: &str, op: Operation, interfaces: (&str, &str), options: &Options) -> Result {
@@ -183,6 +187,9 @@ fn execute_with(runner: &mut impl apply::Runner, root: &std::path::Path, backend
     let id = instance(tun)?;
     // Serialize both rule edits and shared sysctl ownership across processes.
     let state = forwarding::State::lock(root)?;
+    if backend == "fw4" {
+        return fw4_with(runner, state, op, (phys, tun), &id, options);
+    }
     if matches!(op, Operation::Up) {
         let preflight = if backend == "iptables" { iptables_check_nft(runner, tun, phys) }
             else { nft_json(runner, &["nft", "-j", "list", "ruleset"]).map_err(ForwardCheckError::Inspection).and_then(|rules| nft_check_forward(&rules, tun, phys)) };
@@ -196,6 +203,38 @@ fn execute_with(runner: &mut impl apply::Runner, root: &std::path::Path, backend
     else { iptables_with(runner, op, phys, tun, &id, &options.overlay_cidr)?; }
     // A failed rule removal retains the forwarding lease for the cleanup retry.
     if matches!(op, Operation::Down) { state.release(runner, &id)?; }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+const FW4_HELPER: &str = "/usr/libexec/fluxpeer-fw4";
+
+#[cfg(any(target_os = "linux", test))]
+fn fw4_with(runner: &mut impl apply::Runner, state: forwarding::State, op: Operation, interfaces: (&str, &str), id: &str, options: &Options) -> Result {
+    let (phys, tun) = interfaces;
+    match op {
+        Operation::Up => {
+            options.overlay_cidr.parse::<fluxpeer_sdk::prefix::IpPrefix>()
+                .map_err(|e| ApplyError::new(&["firewall", "overlay_cidr"], e.to_string()))?;
+            // Keep the lease if any following operation fails, for crash recovery.
+            state.acquire(runner, id)?;
+            runner.run(&[FW4_HELPER, "exit-up", tun], None)?;
+            let mut rules = nft_json(runner, &["nft", "-j", "list", "ruleset"])?;
+            // Only the checked helper owns fw4 policy. Other firewalls still fail closed.
+            let items = rules.get_mut("nftables").and_then(|v| v.as_array_mut())
+                .ok_or_else(|| ApplyError::new(&["nft"], "missing nftables ruleset array"))?;
+            items.retain(|v| !v.get("chain").is_some_and(|c| c.get("family").and_then(|v| v.as_str()) == Some("inet") && c.get("table").and_then(|v| v.as_str()) == Some("fw4")));
+            check_external(nft_check_forward(&rules, tun, phys), false)?;
+            nft_up(runner, phys, tun, id, &options.overlay_cidr, false)?;
+        }
+        Operation::Down => {
+            runner.run(&[FW4_HELPER, "exit-down", tun], None)?;
+            nft_with(runner, op, phys, tun, id, "")?;
+            state.release(runner, id)?;
+        }
+        // These DROP-only guards remain valid across fw4 reloads.
+        Operation::KillswitchOn | Operation::KillswitchOff => nft_with(runner, op, phys, tun, id, "")?,
+    }
     Ok(())
 }
 
@@ -352,6 +391,10 @@ fn has_lease_at(root: &std::path::Path, tun: &str) -> Result<bool> {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn recover(tun: &str) -> Result {
+    if std::path::Path::new("/sbin/fw4").exists() {
+        use apply::Runner;
+        apply::System.run(&[FW4_HELPER, "exit-down", tun], None)?;
+    }
     recover_with(&mut apply::System, std::path::Path::new("/run/fluxpeer-firewall"), tun)
 }
 
@@ -498,19 +541,26 @@ fn nft_check_forward(ruleset: &serde_json::Value, tun: &str, phys: &str) -> std:
 }
 
 #[cfg(any(target_os = "linux", test))]
+fn nft_up(runner: &mut impl apply::Runner, phys: &str, tun: &str, id: &str, overlay_cidr: &str, forward: bool) -> Result {
+    // One nft transaction: replace only this instance's table. Quoted
+    // interface strings are JSON escaped (also valid nft string syntax).
+    let phys = serde_json::to_string(phys).map_err(|e| ApplyError::new(&["nft"], e.to_string()))?;
+    let tun = serde_json::to_string(tun).map_err(|e| ApplyError::new(&["nft"], e.to_string()))?;
+    // Generic Linux guards both families; fw4 owns forwarding on OpenWrt.
+    // NAT remains restricted to the overlay address family.
+    let family = if overlay_cidr.contains(':') { "ipv6" } else { "ipv4" };
+    let forward = if forward {
+        format!(" chain forward {{ type filter hook forward priority filter; policy accept; iifname {tun} oifname {phys} accept; iifname {phys} oifname {tun} ct state established,related accept; iifname {phys} oifname {tun} ct state != {{ established, related }} drop; }}\n")
+    } else { String::new() };
+    let script = format!("add table inet {id}\ndelete table inet {id}\ntable inet {id} {{\n chain postrouting {{ type nat hook postrouting priority srcnat; policy accept; meta nfproto {family} iifname {tun} oifname {phys} masquerade; }}\n{forward}}}\n");
+    runner.run(&["nft", "-f", "-"], Some(&script))?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn nft_with(runner: &mut impl apply::Runner, op: Operation, phys: &str, tun: &str, id: &str, overlay_cidr: &str) -> Result {
     match op {
-        Operation::Up => {
-            // One nft transaction: replace only this instance's table. Quoted
-            // interface strings are JSON escaped (also valid nft string syntax).
-            let phys = serde_json::to_string(phys).map_err(|e| ApplyError::new(&["nft"], e.to_string()))?;
-            let tun = serde_json::to_string(tun).map_err(|e| ApplyError::new(&["nft"], e.to_string()))?;
-            // Both backends guard forwarding in both families (including new
-            // unsolicited WAN ingress), but NAT only the overlay address family.
-            let family = if overlay_cidr.contains(':') { "ipv6" } else { "ipv4" };
-            let script = format!("add table inet {id}\ndelete table inet {id}\ntable inet {id} {{\n chain postrouting {{ type nat hook postrouting priority srcnat; policy accept; meta nfproto {family} iifname {tun} oifname {phys} masquerade; }}\n chain forward {{ type filter hook forward priority filter; policy accept; iifname {tun} oifname {phys} accept; iifname {phys} oifname {tun} ct state established,related accept; iifname {phys} oifname {tun} ct state != {{ established, related }} drop; }}\n}}\n");
-            runner.run(&["nft", "-f", "-"], Some(&script))?;
-        }
+        Operation::Up => nft_up(runner, phys, tun, id, overlay_cidr, true)?,
         Operation::Down => {
             let guard = format!("{id}_forward_guard");
             apply::all([id, guard.as_str()].into_iter().map(|table| {
@@ -545,6 +595,60 @@ mod tests {
     use apply::test_support::{Scripted, error};
 
     fn options() -> Options { Options { overlay_cidr: "100.72.0.0/24".into(), trust_external: false } }
+
+    struct OpenWrtHost { host: Host, fail_helper: bool, actions: Vec<Vec<String>> }
+    impl apply::Runner for OpenWrtHost {
+        fn run(&mut self, args: &[&str], input: Option<&str>) -> Result<String> {
+            if args.first() == Some(&FW4_HELPER) {
+                self.actions.push(args.iter().map(|s| s.to_string()).collect());
+                if self.fail_helper { return Err(error(Some(1), "fw4 reload failed")); }
+                return Ok(String::new());
+            }
+            self.host.run(args, input)
+        }
+    }
+    fn openwrt_host() -> OpenWrtHost {
+        OpenWrtHost { host: Host { external_rules: Some(r#"{"nftables":[{"chain":{"family":"inet","table":"fw4","name":"forward","hook":"forward","policy":"drop"}}]}"#.into()), ..Host::default() }, fail_helper: false, actions: vec![] }
+    }
+
+    #[test]
+    fn fw4_two_members_use_managed_policy_and_only_owned_nat_tables() {
+        for order in [["fp0", "fp1"], ["fp1", "fp0"]] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut host = openwrt_host();
+            for tun in order {
+                execute_with(&mut host, dir.path(), "fw4", Operation::Up, ("wan0", tun), &options()).unwrap();
+                assert!(has_lease_at(dir.path(), tun).unwrap());
+            }
+            assert_eq!(host.host.tables.len(), 2);
+            for script in &host.host.scripts {
+                assert!(script.contains("masquerade"));
+                assert!(!script.contains("chain forward"));
+            }
+            assert!(!host.host.commands.iter().any(|args| args.first().is_some_and(|s| s.contains("iptables"))));
+            execute_with(&mut host, dir.path(), "fw4", Operation::Down, ("wan0", order[0]), &options()).unwrap();
+            assert!(host.host.forwarding);
+            assert!(host.host.tables.contains_key(&instance(order[1]).unwrap()));
+            assert_eq!(host.actions.last().unwrap(), &[FW4_HELPER, "exit-down", order[0]]);
+            execute_with(&mut host, dir.path(), "fw4", Operation::Down, ("wan0", order[1]), &options()).unwrap();
+            assert!(!host.host.forwarding); assert!(host.host.tables.is_empty());
+        }
+    }
+
+    #[test]
+    fn fw4_errors_keep_cleanup_lease_and_external_firewalls_remain_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = openwrt_host(); host.fail_helper = true;
+        assert!(execute_with(&mut host, dir.path(), "fw4", Operation::Up, ("wan0", "fp0"), &options()).is_err());
+        assert!(has_lease_at(dir.path(), "fp0").unwrap()); assert!(host.host.tables.is_empty());
+        assert!(execute_with(&mut host, dir.path(), "fw4", Operation::Down, ("wan0", "fp0"), &options()).is_err());
+        assert!(has_lease_at(dir.path(), "fp0").unwrap());
+        host.fail_helper = false;
+        host.host.external_rules = Some(r#"{"nftables":[{"chain":{"family":"inet","table":"other","name":"forward","hook":"forward","policy":"drop"}}]}"#.into());
+        assert!(execute_with(&mut host, dir.path(), "fw4", Operation::Up, ("wan0", "fp0"), &options()).is_err());
+        execute_with(&mut host, dir.path(), "fw4", Operation::Down, ("wan0", "fp0"), &options()).unwrap();
+        assert!(!has_lease_at(dir.path(), "fp0").unwrap()); assert!(!host.host.forwarding);
+    }
 
     #[test]
     fn ip6tables_exit_three_permissions_are_never_optional_even_with_missing_text() {

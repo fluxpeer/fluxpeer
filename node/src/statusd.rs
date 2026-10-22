@@ -244,6 +244,8 @@ fn json_status(
             "last_error": applied.last_error,
             "applied_epoch": applied.applied_epoch,
             "restart_required": applied.restart_required,
+            "self_exit": applied.self_exit,
+            "exit_active": applied.exit_active,
         },
         "peers": peers,
     });
@@ -253,6 +255,17 @@ fn json_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_distinguishes_control_approval_from_effective_provider_state() {
+        let state: crate::apply::SharedStatus = Default::default();
+        for (approved, active) in [(false, false), (true, false), (true, true), (false, true)] {
+            { let mut status = state.lock(); status.self_exit = approved; status.exit_active = active; }
+            let doc: serde_json::Value = serde_json::from_str(&json_status(&Default::default(), &state, "test", "fp0", 1234, Ipv4Addr::LOCALHOST, "")).unwrap();
+            assert_eq!(doc["interface"]["self_exit"], approved);
+            assert_eq!(doc["interface"]["exit_active"], active);
+        }
+    }
 
     #[test]
     fn json_exposes_command_failure_and_retains_last_successful_epoch() {
