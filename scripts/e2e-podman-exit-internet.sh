@@ -43,6 +43,7 @@ image_created = False
 seq = 0
 group = 'setup'
 state = {}
+relay_public_key = None
 
 def run(args, data=None, timeout=40):
     try:
@@ -197,6 +198,15 @@ def start(c, cfg, file_dns=False):
     need(P + ['exec', '-d', c, 'sh', '-c', 'echo $$ > /run/fpe/node.pid; '
         f'exec env {env}RUST_LOG=info,fp_transport_anytls::health=error fluxpeer node run /run/fpe/node.json > /run/fpe/node.log 2>&1'])
 
+def start_relay():
+    public_key = need(px('fpe-ctl', 'fluxpeer', 'relay', 'public-key', '--key-file', '/run/fpe/relay/relay.key')).strip()
+    if not re.fullmatch(r'[0-9a-f]{64}', public_key):
+        raise RuntimeError('relay public-key returned an invalid hex key')
+    need(P + ['exec', '-d', 'fpe-ctl', 'sh', '-c', 'exec env FLUXPEER_RELAY_KEY_FILE=/run/fpe/relay/relay.key FLUXPEER_RELAY_ADDR=0.0.0.0:13478 '
+        'FLUXPEER_RELAY_ANYTLS_ADDR=0.0.0.0:13443 FLUXPEER_RELAY_BOND_ADDR=0.0.0.0:13479 '
+        'FLUXPEER_RELAY_NODE_ID=fluxpeer-relay RUST_LOG=info fluxpeer relay > /run/fpe/relay.log 2>&1'])
+    return public_key
+
 def settings(use_exit='auto', transport='direct', dns=True, port=41841, force_exit=False):
     e, c = dict(state['e']), dict(state['c'])
     for cfg, addr, listen in [(e, f'{MESH}.20', port), (c, f'{MESH}.30', 41840)]:
@@ -210,6 +220,7 @@ def settings(use_exit='auto', transport='direct', dns=True, port=41841, force_ex
                 cfg['relay_anytls'] = transport == 'anytls'
                 cfg['relay_bond'] = transport == 'bond'
                 cfg['relay_node_id'] = 'fluxpeer-relay'
+                cfg['relay_public_key'] = relay_public_key
     # AD-1: the exit side needs NO local flag — the control-plane's approved
     # 0.0.0.0/0 route (self_exit) enables its forwarding/NAT dynamically.
     # force_exit exercises the legacy `exit_node: true` local override instead.
@@ -245,7 +256,7 @@ def new_network(name, directory=None):
     state['default_route'] = route('0.0.0.0/0')
     if directory:
         api('POST', '/relays', dict(region='fpe-test', url=f'{MESH}.10:{13443 if directory == "anytls" else 13478}',
-            network_id=state['net'], anytls=directory == 'anytls', stun_url=f'{MESH}.10:13478', node_id='fluxpeer-relay'))
+            network_id=state['net'], anytls=directory == 'anytls', stun_url=f'{MESH}.10:13478', node_id='fluxpeer-relay', public_key=relay_public_key))
 
 def observe_counters():
     # Backend-owned rules already count packets. Read the real tables instead
@@ -489,9 +500,7 @@ try:
     need(P + ['exec', '-d', 'fpe-ctl', 'sh', '-c', f'exec env FLUXPEER_ADMIN_PASSWORD={ADMIN} '
         'FLUXPEER_CONTROL_ADDR=0.0.0.0:18080 DATABASE_URL="sqlite:///run/fpe/db.sqlite?mode=rwc" '
         'RUST_LOG=info fluxpeer control > /run/fpe/control.log 2>&1'])
-    need(P + ['exec', '-d', 'fpe-ctl', 'sh', '-c', 'exec env FLUXPEER_RELAY_ADDR=0.0.0.0:13478 '
-        'FLUXPEER_RELAY_ANYTLS_ADDR=0.0.0.0:13443 FLUXPEER_RELAY_BOND_ADDR=0.0.0.0:13479 '
-        'FLUXPEER_RELAY_NODE_ID=fluxpeer-relay RUST_LOG=info fluxpeer relay > /run/fpe/relay.log 2>&1'])
+    relay_public_key = start_relay()
     for i in range(30):
         if run(px('fpe-ctl', 'curl', '-fsS', 'http://127.0.0.1:18080/api/v1/health'))[0] == 0: break
         time.sleep(1)

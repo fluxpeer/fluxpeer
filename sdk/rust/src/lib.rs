@@ -445,8 +445,8 @@ impl Client {
         Ok(())
     }
 
-    /// Legacy registration without a transport identity. Prefer `register_relay_with_identity`
-    /// for AnyTLS relays so clients do not fall back to the generated directory id.
+    /// Legacy registration without a transport identity or key. Protocol v2 relay
+    /// clients require the public key supplied by `register_relay_authenticated`.
     pub async fn register_relay(
         &self,
         region: &str,
@@ -469,9 +469,23 @@ impl Client {
         stun_url: Option<&str>,
         node_id: Option<&str>,
     ) -> Result<Value> {
+        self.register_relay_authenticated(region, url, network_id, anytls, stun_url, (node_id, None)).await
+    }
+
+    /// Register the pinned relay public key published at relay startup.
+    pub async fn register_relay_authenticated(
+        &self,
+        region: &str,
+        url: &str,
+        network_id: Option<&str>,
+        anytls: bool,
+        stun_url: Option<&str>,
+        identity: (Option<&str>, Option<&str>),
+    ) -> Result<Value> {
+        let (node_id, public_key) = identity;
         self.http()?
             .post(self.url("/relays"))
-            .json(&json!({ "region": region, "url": url, "network_id": network_id, "anytls": anytls, "stun_url": stun_url, "node_id": node_id }))
+            .json(&json!({ "region": region, "url": url, "network_id": network_id, "anytls": anytls, "stun_url": stun_url, "node_id": node_id, "public_key": public_key }))
             .send()
             .await?
             .error_for_status()?

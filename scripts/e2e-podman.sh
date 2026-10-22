@@ -69,6 +69,9 @@ echo "✓ control + relay containers up; control healthy"
 
 say "create network + invite, build a join token (ctrl = host published port)"
 NET=$(curl -s -X POST -H "Authorization: Bearer $ADMIN" -H 'content-type: application/json' "$S/api/v1/networks" -d '{"name":"podman-e2e"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])') || fail "create network"
+RELAY_PUBLIC_KEY=$(sudo podman exec fluxpeer-relay fluxpeer relay public-key) || fail "relay identity"
+sudo podman exec fluxpeer-control fluxpeer ctl --server http://127.0.0.1:8080 relay add e2e \
+  "$QAIP:$RELAY_PORT" --network-id "$NET" --node-id fluxpeer-relay --public-key "$RELAY_PUBLIC_KEY" >/dev/null || fail "register relay"
 INV=$(curl -s -X POST -H "Authorization: Bearer $ADMIN" -H 'content-type: application/json' "$S/api/v1/networks/$NET/invites" -d '{}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["code"])')
 TOK="fp://join/$(python3 -c "import base64,json;print(base64.urlsafe_b64encode(json.dumps({'ctrl':'http://$QAIP:$PORT','code':'$INV'}).encode()).decode().rstrip('='))")"
 

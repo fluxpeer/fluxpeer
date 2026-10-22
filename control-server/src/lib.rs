@@ -355,10 +355,13 @@ struct RegisterRelayReq {
     stun_url: Option<String>,
     #[serde(default)]
     node_id: Option<String>,
+    #[serde(default)]
+    public_key: Option<String>,
 }
 
 // Missing identity is a legacy request; an explicit identity must be bounded visible ASCII.
 fn validate_relay_identity(req: &RegisterRelayReq) -> Result<(), StatusCode> {
+    if req.public_key.as_deref().is_some_and(|key| fluxpeer_sdk::key::decode(key).is_none()) { return Err(StatusCode::BAD_REQUEST); }
     if req.node_id.as_ref().is_some_and(|id| !fluxpeer_sdk::valid_relay_identity(id)) {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -372,7 +375,7 @@ async fn register_relay(
     validate_relay_identity(&req)?;
     Ok((
         StatusCode::CREATED,
-        Json(store.register_relay(&req.region, &req.url, req.network_id, req.anytls, req.stun_url, req.node_id)),
+        Json(store.register_relay_authenticated(&req.region, &req.url, req.network_id, req.anytls, req.stun_url, (req.node_id, req.public_key))),
     ))
 }
 
@@ -383,7 +386,7 @@ async fn update_relay(State(store): State<Arc<Store>>, Path(id): Path<String>, J
 
 fn relay_update(id: String, req: RegisterRelayReq) -> domain::RelayNode {
     domain::RelayNode { id, region: req.region, stun_url: req.stun_url.or_else(|| Some(req.url.clone())),
-        url: req.url, network_id: req.network_id, anytls: req.anytls, node_id: req.node_id }
+        url: req.url, network_id: req.network_id, anytls: req.anytls, node_id: req.node_id, public_key: req.public_key }
 }
 
 async fn list_relays(State(store): State<Arc<Store>>, Path(network_id): Path<String>) -> Json<Vec<domain::RelayNode>> {
@@ -784,7 +787,7 @@ async fn sql_register_relay(
     Json(req): Json<RegisterRelayReq>,
 ) -> Result<(StatusCode, Json<domain::RelayNode>), StatusCode> {
     validate_relay_identity(&req)?;
-    s.register_relay(&req.region, &req.url, req.network_id, req.anytls, req.stun_url, req.node_id)
+    s.register_relay_authenticated(&req.region, &req.url, req.network_id, req.anytls, req.stun_url, (req.node_id, req.public_key))
         .await
         .map(|r| (StatusCode::CREATED, Json(r)))
         .map_err(sql_status)

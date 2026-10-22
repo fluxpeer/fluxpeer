@@ -48,6 +48,7 @@ pub(crate) fn disco_shared(own_priv: &fp_crypto::x25519::StaticSecret, peer_pub:
 
 /// 12-byte disco tx_id = big-endian unix-seconds (8) ‖ random nonce (4). The MAC
 /// binds it, so the receiver can enforce [`DISCO_REPLAY_WINDOW_SECS`].
+#[cfg(test)]
 pub(crate) fn disco_tx_id() -> [u8; 12] {
     let mut tx = [0u8; 12];
     let now = std::time::SystemTime::now()

@@ -17,10 +17,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/fluxpeer /usr/local/bin/fluxpeer
 # control-server's embedded SQLite lands here (durable via a volume) when
-# DATABASE_URL is unset; harmless for the relay/node roles.
+# DATABASE_URL is unset; the relay also persists its private identity here.
 WORKDIR /data
 VOLUME ["/data"]
-ENV FLUXPEER_CONTROL_ADDR=0.0.0.0:8080 \
+ENV FLUXPEER_DATA_DIR=/data \
+    FLUXPEER_CONTROL_ADDR=0.0.0.0:8080 \
     FLUXPEER_RELAY_ADDR=0.0.0.0:3478
 # `fluxpeer` is the entrypoint, so `podman run … fluxpeer-img control|relay|node run …`
 # selects the role. (The driver passes the subcommand as the container args.)

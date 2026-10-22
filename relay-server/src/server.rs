@@ -26,7 +26,7 @@ use crate::proto::{Error as ProtoError, Frame, PublicKey};
 use crate::ratelimit::TokenBucket;
 
 /// Relay wire-protocol version advertised in `ServerInfo`.
-pub const RELAY_PROTOCOL_VERSION: u32 = 1;
+pub const RELAY_PROTOCOL_VERSION: u32 = 2;
 
 /// Server tuning.
 #[derive(Debug, Clone)]
@@ -55,9 +55,9 @@ impl Default for Config {
     }
 }
 
-/// Decides whether a client may use the relay. Real deployments scope this to a
+/// Additional authorization after proof of key possession. Deployments may scope this to a
 /// network/invite via the control-server relay directory; the default allows any
-/// client speaking a compatible protocol version.
+/// proven client speaking a compatible protocol version.
 pub trait Auth: Send + Sync {
     fn authorize(&self, pubkey: &PublicKey, protocol_version: u32) -> bool;
 }
@@ -85,14 +85,16 @@ pub struct RelayServer {
     hub: Arc<Hub>,
     cfg: Config,
     auth: Arc<dyn Auth>,
+    link_auth: Arc<crate::auth::ServerAuth>,
 }
 
 impl RelayServer {
-    pub fn new(cfg: Config, auth: Arc<dyn Auth>) -> Self {
+    pub fn new(cfg: Config, auth: Arc<dyn Auth>, secret: fp_crypto::x25519::StaticSecret) -> Self {
         Self {
             hub: Arc::new(Hub::with_capacity(cfg.queue_cap)),
             cfg,
             auth,
+            link_auth: Arc::new(crate::auth::ServerAuth::new(secret)),
         }
     }
 
@@ -126,7 +128,7 @@ impl RelayServer {
     /// the shared [`Self::serve_bonded_conn`] pump.
     pub async fn serve_anytls(self: Arc<Self>, config: fp_transport::Config, node_id: String) -> std::io::Result<()> {
         fp_transport_anytls::set_anytls_config(fp_transport_anytls::AnytlsConfig::with_node_id(&node_id));
-        let listener = <fp_transport_anytls::AnytlsConnector as fp_transport::Connector>::bind(config)
+        let listener = fp_transport_anytls::AnytlsConnector::bind_authenticated(config, Some(self.link_auth.clone()))
             .await
             .map_err(std::io::Error::other)?;
         // Keep `_keep` alive so the listener's `closer` never fires (the process
@@ -161,7 +163,7 @@ impl RelayServer {
     /// core is identical to [`Self::serve_conn`] (handshake → hub register → pump),
     /// but over the bond's sender/receiver instead of a byte stream.
     pub async fn serve_bonded(self: Arc<Self>, config: fp_transport::Config) -> std::io::Result<()> {
-        let listener = <TcpBondConnector as fp_transport::Connector>::bind(config)
+        let listener = TcpBondConnector::bind_authenticated(config, Some(self.link_auth.clone()))
             .await
             .map_err(std::io::Error::other)?;
         // Keep `_keep` alive so the listener's `closer` never fires (we never
@@ -196,6 +198,9 @@ impl RelayServer {
     async fn serve_bonded_conn(&self, resp: fp_transport::AcceptResponse) -> std::io::Result<()> {
         let mut sender = resp.sender;
         let mut receiver = resp.receiver;
+        let identity = sender.link_session().filter(|s| s.active()).ok_or_else(|| invalid("relay requires authenticated bond"))?;
+
+        let _lease = crate::auth::Lease(identity.clone());
 
         // 1. Handshake: the first packet must be ClientInfo.
         let pubkey = match Frame::decode(&resp.packet) {
@@ -206,7 +211,7 @@ impl RelayServer {
                 },
                 _,
             )) => {
-                if !self.auth.authorize(&pubkey, protocol_version) {
+                if protocol_version != RELAY_PROTOCOL_VERSION || identity.peer() != pubkey || !self.auth.authorize(&pubkey, protocol_version) {
                     tracing::debug!("tcp-bond relay auth rejected (version {protocol_version})");
                     return Ok(());
                 }
@@ -227,7 +232,7 @@ impl RelayServer {
             .map_err(std::io::Error::other)?;
 
         // 3. Register; `self_tx` carries self-addressed replies (Pong/PeerGone).
-        let (self_tx, mut out_rx) = self.hub.connect(pubkey);
+        let (self_tx, mut out_rx) = self.hub.connect_authenticated(pubkey, Some(identity));
         let mut bucket = TokenBucket::new(self.cfg.rate_per_sec, self.cfg.burst, Instant::now());
 
         // 4. Pump: interleave outbound delivery and inbound routing.
@@ -263,20 +268,24 @@ impl RelayServer {
     }
 
     /// Drive one client connection over any byte stream.
-    pub async fn serve_conn<S>(&self, stream: S) -> std::io::Result<()>
+    pub async fn serve_conn<S>(&self, mut stream: S) -> std::io::Result<()>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin + Send,
     {
+        let identity = tokio::time::timeout(Duration::from_secs(10), self.link_auth.plain(&mut stream)).await
+            .map_err(|_| invalid("relay authentication timeout"))??;
         let (rd, mut wr) = tokio::io::split(stream);
         let mut reader = FrameReader::new(rd);
 
+        let _lease = crate::auth::Lease(identity.clone());
+
         // 1. Handshake: the first frame must be ClientInfo.
-        let pubkey = match reader.next_frame().await? {
+        let pubkey = match tokio::time::timeout(Duration::from_secs(10), reader.next_frame()).await.map_err(|_| invalid("ClientInfo timeout"))?? {
             Some(Frame::ClientInfo {
                 pubkey,
                 protocol_version,
             }) => {
-                if !self.auth.authorize(&pubkey, protocol_version) {
+                if protocol_version != RELAY_PROTOCOL_VERSION || identity.peer() != pubkey || !self.auth.authorize(&pubkey, protocol_version) {
                     tracing::debug!("relay auth rejected (version {protocol_version})");
                     return Ok(());
                 }
@@ -296,7 +305,7 @@ impl RelayServer {
 
         // 3. Register; `self_tx` lets us queue self-addressed replies (Pong/PeerGone)
         // through the same single write path as relayed frames.
-        let (self_tx, mut out_rx) = self.hub.connect(pubkey);
+        let (self_tx, mut out_rx) = self.hub.connect_authenticated(pubkey, Some(identity));
         let mut bucket = TokenBucket::new(self.cfg.rate_per_sec, self.cfg.burst, Instant::now());
 
         // 4. Pump: interleave outbound delivery and inbound routing.
@@ -339,7 +348,7 @@ impl RelayServer {
                 if !bucket.allow(Instant::now()) {
                     return; // rate-limited: drop silently (best-effort transport)
                 }
-                if let Routed::PeerGone(dst) = self.hub.route(from, frame) {
+                if let Routed::PeerGone(dst) = self.hub.route_session(from, Some(self_tx), frame) {
                     let _ = self_tx.try_send(Frame::PeerGone { pubkey: dst });
                 }
             }
@@ -409,7 +418,7 @@ mod test {
     use tokio::net::TcpStream;
 
     fn key(b: u8) -> PublicKey {
-        [b; 32]
+        fp_crypto::x25519::PublicKey::from(&fp_crypto::x25519::StaticSecret::from([b; 32])).to_bytes()
     }
 
     async fn write_frame<S: AsyncWrite + Unpin>(s: &mut S, f: Frame) {
@@ -427,7 +436,10 @@ mod test {
         Frame::decode(&full).unwrap().0
     }
 
-    async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, k: PublicKey) {
+    async fn handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(s: &mut S, k: PublicKey) {
+        use fp_transport::link::LinkAuthenticator;
+        let seed = (0..=255).find(|b| key(*b) == k).unwrap();
+        crate::auth::ClientAuth::new(fp_crypto::x25519::StaticSecret::from([seed; 32]), key(123)).client(s, [0; 16], 0).await.unwrap();
         write_frame(
             s,
             Frame::ClientInfo {
@@ -445,7 +457,7 @@ mod test {
     }
 
     async fn start_server() -> std::net::SocketAddr {
-        let server = Arc::new(RelayServer::new(Config::default(), Arc::new(AllowAll::default())));
+        let server = Arc::new(RelayServer::new(Config::default(), Arc::new(AllowAll::default()), fp_crypto::x25519::StaticSecret::from([123; 32])));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(server.serve(listener));
@@ -569,7 +581,7 @@ mod test {
         .await;
         let mut buf = [0u8; 1];
         // server should drop us: read returns 0 (EOF)
-        assert_eq!(c.read(&mut buf).await.unwrap(), 0);
+        assert!(matches!(c.read(&mut buf).await, Ok(0) | Err(_)));
     }
 
     #[tokio::test]
@@ -577,6 +589,7 @@ mod test {
         let server = Arc::new(RelayServer::new(
             Config::default(),
             Arc::new(AllowAll { min_version: 2 }),
+            fp_crypto::x25519::StaticSecret::from([123; 32]),
         ));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -592,10 +605,38 @@ mod test {
         )
         .await;
         let mut buf = [0u8; 1];
-        assert_eq!(
-            c.read(&mut buf).await.unwrap(),
-            0,
-            "rejected client gets closed, no ServerInfo"
-        );
+        assert!(matches!(c.read(&mut buf).await, Ok(0) | Err(_)));
     }
+    #[tokio::test]
+    async fn forged_registration_cannot_replace_victim_but_proven_reconnect_can() {
+        use fp_transport::link::LinkAuthenticator;
+        let server = Arc::new(RelayServer::new(Config::default(), Arc::new(AllowAll::default()), fp_crypto::x25519::StaticSecret::from([123; 32])));
+        let (mut victim, stream) = tokio::io::duplex(4096);
+        let running = server.clone(); let old_task = tokio::spawn(async move { running.serve_conn(stream).await });
+        handshake(&mut victim, key(42)).await;
+        write_frame(&mut victim, Frame::Ping { data: [0; 8] }).await; read_frame(&mut victim).await;
+        assert!(server.hub.connected(&key(42)));
+        // Knowing the victim public key does not suffice to answer its challenge.
+        let (mut attacker, stream) = tokio::io::duplex(4096);
+        let running = server.clone(); let attempt = tokio::spawn(async move { running.serve_conn(stream).await });
+        attacker.write_u32(2).await.unwrap(); attacker.write_all(&key(42)).await.unwrap();
+        let mut nonce = [0; 32]; attacker.read_exact(&mut nonce).await.unwrap(); attacker.write_all(&[0; 32]).await.unwrap();
+        assert!(attempt.await.unwrap().is_err()); assert_eq!(server.hub.peer_count(), 1);
+        // A valid proof of a different key cannot claim the victim in ClientInfo.
+        let (mut attacker, stream) = tokio::io::duplex(4096);
+        let running = server.clone(); let attempt = tokio::spawn(async move { running.serve_conn(stream).await });
+        crate::auth::ClientAuth::new(fp_crypto::x25519::StaticSecret::from([77; 32]), key(123)).client(&mut attacker, [0; 16], 0).await.unwrap();
+        write_frame(&mut attacker, Frame::ClientInfo { pubkey: key(42), protocol_version: RELAY_PROTOCOL_VERSION }).await;
+        attempt.await.unwrap().unwrap(); assert_eq!(server.hub.peer_count(), 1);
+        write_frame(&mut victim, Frame::Ping { data: [1; 8] }).await;
+        assert_eq!(read_frame(&mut victim).await, Frame::Pong { data: [1; 8] });
+        let (mut replacement, stream) = tokio::io::duplex(4096);
+        let running = server.clone(); let new_task = tokio::spawn(async move { running.serve_conn(stream).await });
+        handshake(&mut replacement, key(42)).await;
+        write_frame(&mut replacement, Frame::SendPacket { dst: key(42), payload: b"replacement".to_vec() }).await;
+        assert_eq!(read_frame(&mut replacement).await, Frame::RecvPacket { src: key(42), payload: b"replacement".to_vec() });
+        drop(victim); old_task.await.unwrap().unwrap(); assert!(server.hub.connected(&key(42)));
+        drop(replacement); new_task.await.unwrap().unwrap(); assert_eq!(server.hub.peer_count(), 0);
+    }
+
 }

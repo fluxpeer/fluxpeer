@@ -76,6 +76,9 @@ pub struct RelayNode {
     /// Absent on legacy registrations. Must match FLUXPEER_RELAY_NODE_ID.
     #[serde(default)]
     pub node_id: Option<String>,
+    /// Pinned relay X25519 public key; absent legacy rows cannot serve protocol v2.
+    #[serde(default)]
+    pub public_key: Option<String>,
 }
 
 /// A subnet route advertised by a device acting as a Subnet Router:

@@ -19,7 +19,10 @@ enum Cmd {
     /// Run the coordination/control-server (env: FLUXPEER_CONTROL_ADDR, DATABASE_URL).
     Control,
     /// Run a relay-server (env: FLUXPEER_RELAY_ADDR + optional _STUN/_ANYTLS/_BOND/_NODE_ID).
-    Relay,
+    Relay {
+        #[command(subcommand)]
+        cmd: Option<RelayCmd>,
+    },
     /// Run or key a mesh node.
     Node {
         #[command(subcommand)]
@@ -94,6 +97,16 @@ enum Cmd {
     DnsSelftest {
         #[command(subcommand)]
         cmd: DnsSelftestCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RelayCmd {
+    /// Print the relay's hex public key, creating its persisted identity if absent.
+    PublicKey {
+        /// Override FLUXPEER_RELAY_KEY_FILE and the default state directory.
+        #[arg(long)]
+        key_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -185,7 +198,16 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Control => fluxpeer_control_server::serve_from_env()
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?,
-        Cmd::Relay => fluxpeer_relay_server::serve_from_env()
+        Cmd::Relay { cmd: Some(RelayCmd::PublicKey { key_file }) } => {
+            let path = fluxpeer_relay_server::auth::identity_path(key_file);
+            let key = tokio::task::spawn_blocking(move || fluxpeer_relay_server::auth::load_identity(&path)).await??;
+            let public = fluxpeer_relay_server::auth::ServerAuth::new(key).public_key();
+            use std::io::Write;
+            let mut output = std::io::stdout().lock();
+            for byte in public { write!(output, "{byte:02x}")?; }
+            writeln!(output)?;
+        }
+        Cmd::Relay { cmd: None } => fluxpeer_relay_server::serve_from_env()
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?,
         Cmd::Node { cmd } => match cmd {

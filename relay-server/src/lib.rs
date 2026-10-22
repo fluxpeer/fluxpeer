@@ -7,6 +7,7 @@
 //! - [`ratelimit`] — per-client token-bucket inbound rate limiting.
 //! - [`server`] — the network layer: handshake/auth + accept loop over any stream.
 
+pub mod auth;
 pub mod hub;
 pub mod proto;
 pub mod ratelimit;
@@ -36,7 +37,10 @@ pub async fn serve_from_env() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(b) = std::env::var("FLUXPEER_RELAY_BURST").ok().and_then(|s| s.parse().ok()) {
         cfg.burst = b;
     }
-    let server = Arc::new(RelayServer::new(cfg, Arc::new(AllowAll::default())));
+    let key_path = auth::identity_path(None);
+    let secret = tokio::task::spawn_blocking(move || auth::load_identity(&key_path)).await??;
+    tracing::info!(public_key = %hex::encode(fp_crypto::x25519::PublicKey::from(&secret).as_bytes()), "relay identity loaded");
+    let server = Arc::new(RelayServer::new(cfg, Arc::new(AllowAll::default()), secret));
 
     // The relay DOUBLES AS the STUN responder: the control-server advertises a
     // relay's URL as its STUN server by default (see `register_relay`,

@@ -41,6 +41,7 @@ mod firewall;
 mod gso;
 mod join;
 mod peer;
+mod disco;
 mod relay;
 mod route;
 mod show;
@@ -67,12 +68,20 @@ type AllowedMap = Arc<arc_swap::ArcSwap<worker::RouteTable>>;
 /// hostage. Only forced mode without a usable target blocks bootstrap.
 fn relay_candidates(cfg: &Config, directory: &[control::RelayDir]) -> Vec<RelayTarget> {
     if let Some(addr) = cfg.relay.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()) {
+        let public_key = match cfg.relay_public_key.as_deref() {
+            Some(key) => hex32(key).ok(),
+            None => directory.iter().find(|d| d.addresses.contains(&addr)).and_then(|d| d.public_key),
+        };
+        if public_key.is_none() {
+            tracing::warn!(%addr, "relay protocol v2 requires a valid relay_public_key or matching directory key");
+            return Vec::new();
+        }
         return vec![RelayTarget { addr, anytls: cfg.relay_anytls, bond: cfg.relay_bond, bond_links: cfg.relay_bond_links,
-            node_id: cfg.relay_node_id.clone().unwrap_or_else(|| "fluxpeer-relay".into()) }];
+            public_key, node_id: cfg.relay_node_id.clone().unwrap_or_else(|| "fluxpeer-relay".into()) }];
     }
-    directory.iter().filter(|d| control::relay_transport_matches(cfg.force_relay, d.anytls, cfg.relay_anytls, cfg.relay_bond))
+    directory.iter().filter(|d| d.public_key.is_some()).filter(|d| control::relay_transport_matches(cfg.force_relay, d.anytls, cfg.relay_anytls, cfg.relay_bond))
         .flat_map(|d| d.addresses.iter().map(|&addr| RelayTarget { addr, anytls: d.anytls, bond: cfg.relay_bond,
-            bond_links: cfg.relay_bond_links, node_id: d.node_id.clone() })).collect()
+            bond_links: cfg.relay_bond_links, public_key: d.public_key, node_id: d.node_id.clone() })).collect()
 }
 async fn bootstrap_directory_with<F, Fut>(cfg: &Config, mut fetch: F) -> std::io::Result<(Vec<control::RelayDir>, Vec<RelayTarget>, bool)>
 where F: FnMut() -> Fut, Fut: std::future::Future<Output = std::io::Result<Vec<control::RelayDir>>> {
@@ -1150,7 +1159,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     let (app_in_tx, app_in_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
     let (app_out_tx, app_out_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
     let relay_sender = RelayOut::new(app_out_tx, targets_rx.clone());
-    tasks.spawn(relay_supervisor(targets_rx, *own_pub.as_bytes(), app_out_rx, app_in_tx));
+    tasks.spawn(relay_supervisor(targets_rx, own_priv.clone(), app_out_rx, app_in_tx));
     let (relay_in, relay_out): (Option<RelayIn>, Option<RelayOut>) = (Some(app_in_rx), Some(relay_sender));
 
     // --- Build per-peer state, partition across N workers, send first probe ---
@@ -1192,6 +1201,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
 
     // Routing tables (shard = peer index % N): the readers use these to fan each
     // packet to the worker that owns its peer.
+    let disco_routes: disco::Routes = Default::default();
     let index_owner: worker::IndexOwner = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     let mut peer_to_wid: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
     let mut cand_to_wid: std::collections::HashMap<SocketAddr, usize> = std::collections::HashMap::new();
@@ -1221,8 +1231,8 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
         status_reg.write().insert(pi.pubkey, stat.clone());
         allowed = allowed.with_peer(pi.pubkey, wid, &pi.allowed_ips);
         let mut peer = Peer::fresh(pi.pubkey, pi.candidates, cfg.force_relay, stat, &own_priv);
-        if !cfg.force_relay {
-            let ping = peer.disco_ping(own_pub.as_bytes());
+        peer.disco_routes = disco_routes.clone();
+        if !cfg.force_relay && let Some(ping) = peer.disco_ping(own_pub.as_bytes()) {
             for c in &peer.candidates {
                 let _ = udp.send_to(&ping, *c).await;
             }
@@ -1324,7 +1334,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
         let stun_replies = stun_replies.clone();
         let wtxs = wtxs.clone();
         let peer_to_wid = peer_to_wid.clone();
-        let cand_to_wid = cand_to_wid.clone();
+        let disco_routes = disco_routes.clone();
         let index_owner = index_owner.clone();
         let own_priv = own_priv.clone();
         tasks.spawn(async move {
@@ -1341,8 +1351,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
                     if stun_replies.receive(data, from) { continue; }
                     let wid = {
                         let pw = peer_to_wid.read();
-                        let cw = cand_to_wid.read();
-                        worker::route_udp(data, from, &pw, &cw, &index_owner, &own_priv, &own_pub)
+                        worker::route_udp(data, from, &pw, &disco_routes, &index_owner, &own_priv, &own_pub)
                     };
                     let Some(wid) = wid else {
                         continue;
@@ -1418,6 +1427,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     // Spawn the N worker actors (each owns its shard's peers + cryptors).
     for (wid, wrx) in wrxs.into_iter().enumerate() {
         let state = worker::WorkerState {
+            disco_routes: disco_routes.clone(),
             peers: std::mem::take(&mut shards[wid]),
             index_map: worker::IndexTable::new(std::mem::take(&mut shard_maps[wid]), index_owner.clone(), wid),
             udp: udp.clone(),
@@ -1651,7 +1661,7 @@ mod exit_contract_tests {
 
     fn directory_config(relay: Option<&str>, forced: bool) -> Config {
         serde_json::from_value(serde_json::json!({"private_key":"00".repeat(32),"device_id":"test", "control_server":"http://127.0.0.1",
-            "listen_port":0,"tun_name":"test","prefix_len":24,"relay":relay,"force_relay":forced})).unwrap()
+            "listen_port":0,"tun_name":"test","prefix_len":24,"relay":relay,"relay_public_key":"11".repeat(32),"force_relay":forced})).unwrap()
     }
     #[tokio::test]
     async fn directory_dns_failure_does_not_block_explicit_relay_or_auto_startup() {
@@ -1670,7 +1680,7 @@ mod exit_contract_tests {
         use axum::{routing::get, Json, Router};
         let response = serde_json::json!({"config_epoch":1,"peers":[{"wg_public_key":hex::encode([1;32]),
             "allowed_ips":["100.72.16.2/32","0.0.0.0/0"],"exit":true}],
-            "relays":[{"id":"relay-1","node_id":"edge","url":"127.0.0.1:4444","anytls":false}]});
+            "relays":[{"id":"relay-1","public_key":"11".repeat(32),"node_id":"edge","url":"127.0.0.1:4444","anytls":false}]});
         let app = Router::new().route("/api/v1/devices/test/config", get(move || { let response = response.clone(); async move { Json(response) } }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1699,7 +1709,7 @@ mod exit_contract_tests {
         let snapshot = Arc::new(parking_lot::Mutex::new(serde_json::json!({
             "config_epoch":2,"mtu":1400,"dns":["192.0.2.53"],
             "peers":[{"wg_public_key":hex::encode([1;32]),"endpoints":["192.0.2.1:1"],"allowed_ips":["100.72.16.2/32"]}],
-            "relays":[{"id":"relay-1","node_id":"edge-a","url":"192.0.2.10:443","anytls":true}]
+            "relays":[{"id":"relay-1","public_key":"11".repeat(32), "node_id":"edge-a","url":"192.0.2.10:443","anytls":true}]
         })));
         let capture = snapshot.clone();
         let app = Router::new().route("/api/v1/devices/test/config", get(move || {
@@ -1798,7 +1808,7 @@ mod exit_contract_tests {
         let (_, targets, background) = bootstrap_directory_with(&cfg, || {
             calls += 1;
             std::future::ready(if calls == 1 { Err(std::io::Error::other("directory DNS failed")) } else {
-                Ok(vec![control::RelayDir { addresses: vec!["192.0.2.1:443".parse().unwrap()], anytls: false, node_id: "edge".into(), stun: None }])
+                Ok(vec![control::RelayDir { public_key: Some([7; 32]), addresses: vec!["192.0.2.1:443".parse().unwrap()], anytls: false, node_id: "edge".into(), stun: None }])
             })
         }).await.unwrap();
         assert_eq!(calls, 2); assert_eq!(targets.len(), 1); assert!(!background);
@@ -2385,7 +2395,7 @@ mod exit_contract_tests {
         let (targets, _rx) = tokio::sync::watch::channel(vec![]);
         let mut refresh = DirectoryRefresh::new(cfg, targets);
         refresh.stun = Some((udp, replies, vec![client_address.to_string()]));
-        let entries = vec![control::RelayDir { addresses: vec!["192.0.2.1:443".parse().unwrap()], anytls: false, node_id: "edge".into(), stun: Some(stun_address) }];
+        let entries = vec![control::RelayDir { public_key: Some([7; 32]), addresses: vec!["192.0.2.1:443".parse().unwrap()], anytls: false, node_id: "edge".into(), stun: Some(stun_address) }];
         refresh.refresh_stun(&entries).await.unwrap();
         assert_eq!(saved.lock()["endpoints"], serde_json::json!([client_address.to_string(), "198.51.100.42:4567"]));
         reader.await.unwrap(); fixture.await.unwrap(); server.abort();
@@ -2414,4 +2424,19 @@ mod lifecycle_tests {
         assert!(tasks.is_empty());
         assert!(error.stderr.contains("DNS cleanup failure"));
     }
+    #[test]
+    fn relay_pin_is_required_and_invalid_explicit_pin_cannot_fall_back() {
+        let mut cfg: Config = serde_json::from_value(serde_json::json!({"private_key":"00".repeat(32), "device_id":"fixture",
+            "control_server":"http://127.0.0.1", "listen_port":0, "tun_name":"test", "prefix_len":24, "relay":"192.0.2.1:443"})).unwrap();
+        cfg.relay_public_key = None;
+        assert!(relay_candidates(&cfg, &[]).is_empty());
+        let mut entry = control::RelayDir { addresses: vec!["192.0.2.1:443".parse().unwrap()], anytls: false,
+            node_id: "edge".into(), public_key: Some([7; 32]), stun: None };
+        assert_eq!(relay_candidates(&cfg, &[entry.clone()])[0].public_key, Some([7; 32]));
+        cfg.relay_public_key = Some("invalid".into());
+        assert!(relay_candidates(&cfg, &[entry.clone()]).is_empty());
+        cfg.relay = None; entry.public_key = None;
+        assert!(relay_candidates(&cfg, &[entry]).is_empty());
+    }
+
 }

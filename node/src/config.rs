@@ -41,6 +41,9 @@ pub(crate) struct Config {
     pub(crate) relay_anytls: bool,
     #[serde(default)]
     pub(crate) relay_node_id: Option<String>,
+    /// Pinned X25519 public key for an explicitly configured relay (hex).
+    #[serde(default)]
+    pub(crate) relay_public_key: Option<String>,
     /// Aggregate N TCP links per relay (health-weighted bond) instead of a single
     /// plain-TCP connection. Mutually exclusive with `relay_anytls`.
     #[serde(default)]

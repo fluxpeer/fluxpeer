@@ -105,7 +105,7 @@ impl AnytlsListener {
     /// Complete the AnyTLS handshake on an accepted TCP socket and return the
     /// first yamux byte stream (a background task keeps the connection driven).
     pub async fn accept(&self, tcp: TcpStream) -> Result<AnytlsStream, Error> {
-        let mut accepted = accept_server_connection(tcp, &self.tls_acceptor, &self.password_hash).await?;
+        let mut accepted = accept_server_connection(tcp, &self.tls_acceptor, &self.password_hash, None).await?;
         let stream = accepted
             .next_inbound()
             .await

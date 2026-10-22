@@ -33,8 +33,12 @@ pub enum Routed {
     Ignored,
 }
 
+struct Connection { tx: Sender<Frame>, auth: Option<fp_transport::link::Session> }
+impl Drop for Connection {
+    fn drop(&mut self) { if let Some(auth) = &self.auth { auth.invalidate(); } }
+}
 pub struct Hub {
-    peers: Mutex<HashMap<PublicKey, Sender<Frame>>>,
+    peers: Mutex<HashMap<PublicKey, Connection>>,
     queue_cap: usize,
 }
 
@@ -61,8 +65,12 @@ impl Hub {
     /// to deliver self-addressed replies (Pong, PeerGone) into the same stream.
     /// Replaces any prior session for this pubkey.
     pub fn connect(&self, pubkey: PublicKey) -> (Sender<Frame>, Receiver<Frame>) {
+        self.connect_authenticated(pubkey, None)
+    }
+
+    pub fn connect_authenticated(&self, pubkey: PublicKey, auth: Option<fp_transport::link::Session>) -> (Sender<Frame>, Receiver<Frame>) {
         let (tx, rx) = channel(self.queue_cap);
-        self.peers.lock().insert(pubkey, tx.clone());
+        self.peers.lock().insert(pubkey, Connection { tx: tx.clone(), auth });
         (tx, rx)
     }
 
@@ -71,7 +79,7 @@ impl Hub {
     pub fn disconnect_session(&self, pubkey: &PublicKey, tx: &Sender<Frame>) {
         let mut g = self.peers.lock();
         if let Some(cur) = g.get(pubkey)
-            && cur.same_channel(tx)
+            && cur.tx.same_channel(tx)
         {
             g.remove(pubkey);
         }
@@ -92,12 +100,17 @@ impl Hub {
     /// Route one inbound frame from `src`. Only `SendPacket` is forwarded
     /// (delivered as `RecvPacket`); everything else is `Ignored` here.
     pub fn route(&self, src: PublicKey, frame: Frame) -> Routed {
+        self.route_session(src, None, frame)
+    }
+
+    pub fn route_session(&self, src: PublicKey, session: Option<&Sender<Frame>>, frame: Frame) -> Routed {
         let Frame::SendPacket { dst, payload } = frame else {
             return Routed::Ignored;
         };
         let guard = self.peers.lock();
+        if session.is_some_and(|tx| guard.get(&src).is_none_or(|c| !c.tx.same_channel(tx))) { return Routed::Ignored; }
         match guard.get(&dst) {
-            Some(tx) => match tx.try_send(Frame::RecvPacket { src, payload }) {
+            Some(conn) => match conn.tx.try_send(Frame::RecvPacket { src, payload }) {
                 Ok(()) => Routed::Delivered,
                 Err(TrySendError::Full(_)) => Routed::Dropped(dst),
                 Err(TrySendError::Closed(_)) => Routed::PeerGone(dst),

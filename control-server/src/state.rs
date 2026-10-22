@@ -334,6 +334,19 @@ impl Store {
         stun_url: Option<String>,
         node_id: Option<String>,
     ) -> RelayNode {
+        self.register_relay_authenticated(region, url, network_id, anytls, stun_url, (node_id, None))
+    }
+
+    pub fn register_relay_authenticated(
+        &self,
+        region: &str,
+        url: &str,
+        network_id: Option<String>,
+        anytls: bool,
+        stun_url: Option<String>,
+        identity: (Option<String>, Option<String>),
+    ) -> RelayNode {
+        let (node_id, public_key) = identity;
         let relay = RelayNode {
             id: format!("relay-{}", self.next_seq()),
             region: region.to_string(),
@@ -342,6 +355,7 @@ impl Store {
             anytls,
             stun_url: stun_url.or_else(|| Some(url.to_string())),
             node_id,
+            public_key,
         };
         let mut inner = self.inner.lock();
         inner.relays.insert(relay.id.clone(), relay.clone());

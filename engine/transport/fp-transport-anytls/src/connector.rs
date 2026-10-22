@@ -48,12 +48,16 @@ pub struct AnytlsConnector;
 
 #[async_trait::async_trait]
 impl fp_transport::Connector for AnytlsConnector {
-    async fn bind(config: Config) -> Result<Box<dyn Listener>, fp_transport::Error> {
+    async fn bind(config: Config) -> Result<Box<dyn Listener>, fp_transport::Error> { Self::bind_authenticated(config, None).await }
+    async fn connect(config: Config) -> Result<SenderAndReceiver, fp_transport::Error> { Self::connect_authenticated(config, None).await }
+}
+impl AnytlsConnector {
+    pub async fn bind_authenticated(config: Config, authenticator: Option<fp_transport::link::Authenticator>) -> Result<Box<dyn Listener>, fp_transport::Error> {
         let anytls_cfg = get_config_cloned();
         let addr = SocketAddr::new(config.endpoint, config.port);
 
         let (tls_acceptor, password_hash) = build_server_tls(&anytls_cfg)?;
-        let acceptor = Arc::new(AnytlsAcceptor::new(tls_acceptor, password_hash, anytls_cfg));
+        let acceptor = Arc::new(AnytlsAcceptor::new_authenticated(tls_acceptor, password_hash, anytls_cfg, authenticator));
 
         let tcp_listener = Arc::new(
             tokio::net::TcpListener::bind(addr)
@@ -79,7 +83,7 @@ impl fp_transport::Connector for AnytlsConnector {
         Ok(Box::new(AnytlsListener { acceptor, shutdown }))
     }
 
-    async fn connect(config: Config) -> Result<SenderAndReceiver, fp_transport::Error> {
+    pub async fn connect_authenticated(config: Config, authenticator: Option<fp_transport::link::Authenticator>) -> Result<SenderAndReceiver, fp_transport::Error> {
         let anytls_cfg = get_config_cloned();
         let addr = SocketAddr::new(config.endpoint, config.port);
 
@@ -87,7 +91,7 @@ impl fp_transport::Connector for AnytlsConnector {
             .map_err(|e| fp_transport::Error::UnexpectedResult(format!("TLS config: {}", e)))?;
         let tls_connector = Arc::new(tokio_rustls::TlsConnector::from(tls_config));
 
-        let group = crate::bond::build_client_bond(&anytls_cfg, addr, &tls_connector).await?;
+        let group = crate::bond::build_client_bond(&anytls_cfg, addr, &tls_connector, authenticator).await?;
 
         let n = group.alive_count().await;
         tracing::info!(bond_connections = n, "AnyTLS client connected");

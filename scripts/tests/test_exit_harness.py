@@ -201,4 +201,47 @@ class ShellAndScope(unittest.TestCase):
                     self.assertFalse(any(isinstance(v, str) and v.startswith('https://') for v in literals))
 
 
+class RelayIdentity(unittest.TestCase):
+    def test_provision_and_start_use_same_key_path(self):
+        ns = helpers()
+        ns['need'] = Mock(side_effect=['ab' * 32 + '\n', ''])
+        self.assertEqual(ns['start_relay'](), 'ab' * 32)
+        provision, start = [c.args[0] for c in ns['need'].call_args_list]
+        self.assertEqual(provision, ['podman', 'exec', 'fpe-ctl', 'fluxpeer', 'relay',
+                                    'public-key', '--key-file', '/run/fpe/relay/relay.key'])
+        self.assertIn('FLUXPEER_RELAY_KEY_FILE=' + provision[-1] + ' ', start[-1])
+        self.assertIn('fluxpeer relay >', start[-1])
+
+    def test_bad_key_stops_before_starting_relay(self):
+        ns = helpers()
+        for value in ('', 'legacy binary help', 'ab' * 31):
+            ns['need'] = Mock(return_value=value)
+            with self.assertRaises(RuntimeError): ns['start_relay']()
+            self.assertEqual(ns['need'].call_count, 1)
+
+    def test_pin_survives_network_reset_and_reaches_every_relay_path(self):
+        ns = helpers()
+        pin = 'cd' * 32
+        ns.update(MESH='192.0.2', LAN='198.51.100', relay_public_key=pin)
+        ns['stop_pair'] = Mock()
+        ns['enroll'] = Mock(return_value={})
+        ns['endpoints'] = Mock()
+        ns['route'] = Mock()
+        ns['api'] = Mock(return_value={'id': 'test-network'})
+        for carrier in ('tcp', 'anytls'):
+            ns['new_network']('test', directory=carrier)
+            registration = ns['api'].call_args.args
+            self.assertEqual(registration[:2], ('POST', '/relays'))
+            self.assertEqual(registration[2]['public_key'], pin)
+            self.assertEqual(registration[2]['network_id'], 'test-network')
+            for transport in ('tcp', 'bond', 'anytls'):
+                for cfg in ns['settings'](transport=transport):
+                    self.assertEqual(cfg['relay_public_key'], pin)
+                    self.assertTrue(cfg['force_relay'])
+            for transport in ('direct', 'directory-tcp', 'directory-anytls'):
+                for cfg in ns['settings'](transport=transport):
+                    self.assertNotIn('relay_public_key', cfg)
+                    self.assertNotIn('relay', cfg)
+
+
 if __name__ == '__main__': unittest.main()

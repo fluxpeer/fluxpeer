@@ -2,8 +2,8 @@
 #
 # Open-source self-host = ONE service. Storage defaults to an embedded SQLite
 # file on the `fpdata` volume — no database server to run or maintain (ample for
-# a self-hosted mesh, cf. Headscale). admin-lite + relay-server are added as they
-# land. PostgreSQL is NOT part of the open stack; it is opt-in for the
+# a self-hosted mesh, cf. Headscale). Enable the relay profile for an authenticated
+# relay with a persistent identity. PostgreSQL is opt-in for the
 # commercial/hosted deployment only — see the commented block at the bottom.
 name: fluxpeer
 
@@ -14,6 +14,7 @@ services:
       dockerfile: deploy/Dockerfile
     environment:
       FLUXPEER_CONTROL_ADDR: 0.0.0.0:8080
+      FLUXPEER_ADMIN_PASSWORD: ${FLUXPEER_ADMIN_PASSWORD:-}
       # No DATABASE_URL → embedded SQLite at /data/fluxpeer.db (durable via volume).
       # For the commercial/hosted deployment, point at PostgreSQL instead:
       #   DATABASE_URL: postgres://fluxpeer:fluxpeer@postgres:5432/fluxpeer
@@ -24,10 +25,25 @@ services:
     restart: unless-stopped
 
   # admin-lite:   # SvelteKit static, served behind control-server / proxy
-  # relay-server: # self-built DERP-style relay (443/anytls)
+  relay-server:
+    profiles: [relay]
+    build:
+      context: ..
+      dockerfile: deploy/Containerfile
+    command: [relay]
+    environment:
+      FLUXPEER_DATA_DIR: /data
+      FLUXPEER_RELAY_ADDR: 0.0.0.0:3478
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+    volumes:
+      - fprelaydata:/data
+    restart: unless-stopped
 
 volumes:
   fpdata:
+  fprelaydata:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Commercial / hosted only (NOT the open self-host default). To run control-server

@@ -91,6 +91,7 @@ pub(crate) fn parse_settings(conf: &serde_json::Value) -> (Option<i32>, Vec<Stri
 /// relay/STUN endpoints from coordination instead of pinning them in config).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RelayDir {
+    pub(crate) public_key: Option<[u8; 32]>,
     pub(crate) addresses: Vec<SocketAddr>,
     pub(crate) anytls: bool,
     pub(crate) node_id: String,
@@ -183,7 +184,15 @@ where F: Fn(String) -> Fut + Sync, Fut: std::future::Future<Output = std::io::Re
             None
         }
     };
-    Ok(Some(RelayDir { addresses, anytls: entry["anytls"].as_bool().unwrap_or(false), node_id: node_id.to_owned(), stun }))
+    let public_key = match entry.get("public_key") {
+        None | Some(serde_json::Value::Null) => {
+            tracing::warn!(relay = id, "relay directory lacks a protocol v2 public_key; relay transport unavailable");
+            None
+        }
+        Some(serde_json::Value::String(key)) => Some(crate::util::hex32(key)?),
+        _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid relay public_key")),
+    };
+    Ok(Some(RelayDir { public_key, addresses, anytls: entry["anytls"].as_bool().unwrap_or(false), node_id: node_id.to_owned(), stun }))
 }
 
 #[derive(Debug)]
@@ -585,7 +594,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, router(store)).await.unwrap(); });
         let client = Client::new(&url);
         for identity in ["fluxpeer-relay", "custom-edge-identity"] {
-            let registered = client.register_relay_with_identity("eu", "localhost:443", None, true, Some("localhost:3478"), Some(identity)).await.unwrap();
+            let registered = client.register_relay_authenticated("eu", "localhost:443", None, true, Some("localhost:3478"), (Some(identity), Some(&"11".repeat(32)))).await.unwrap();
             assert_ne!(registered["id"], identity);
             assert_eq!(registered["node_id"], identity);
         }
@@ -600,6 +609,7 @@ mod tests {
             // The relay listener and node dialer both use with_node_id(). The
             // directory-generated relay-N id must never seed the client password.
             assert_eq!(AnytlsConfig::with_node_id(&entry.node_id).password, AnytlsConfig::derive_password(identity));
+            assert_eq!(entry.public_key, Some([0x11; 32]));
             assert!(entry.anytls);
             assert!(entry.addresses.iter().all(|a| a.ip().is_loopback() && a.port() == 443));
             assert!(entry.stun.is_some_and(|a| a.is_ipv4() && a.ip().is_loopback() && a.port() == 3478));

@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 fn key(b: u8) -> PublicKey {
-    [b; 32]
+    fp_crypto::x25519::PublicKey::from(&fp_crypto::x25519::StaticSecret::from([b; 32])).to_bytes()
 }
 
 async fn write_frame(s: &mut TcpStream, f: Frame) {
@@ -31,6 +31,12 @@ async fn read_frame(s: &mut TcpStream) -> Frame {
 async fn connect(addr: &str, k: PublicKey) -> TcpStream {
     let mut s = TcpStream::connect(addr).await.expect("connect relay");
     s.set_nodelay(true).unwrap();
+    use fp_transport::link::LinkAuthenticator;
+    let relay: [u8; 32] = hex::decode(std::env::var("RELAY_TEST_PUBLIC_KEY").expect("protocol v2 requires RELAY_TEST_PUBLIC_KEY"))
+        .unwrap().try_into().unwrap();
+    let seed = (0..=255).find(|b| key(*b) == k).unwrap();
+    fluxpeer_relay_server::auth::ClientAuth::new(fp_crypto::x25519::StaticSecret::from([seed; 32]), relay)
+        .client(&mut s, [0; 16], 0).await.unwrap();
     write_frame(
         &mut s,
         Frame::ClientInfo {

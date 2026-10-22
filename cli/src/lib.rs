@@ -131,6 +131,9 @@ pub enum RelayCmd {
         /// Actual relay transport identity; must match the relay process environment.
         #[arg(long, env = "FLUXPEER_RELAY_NODE_ID")]
         node_id: Option<String>,
+        /// X25519 public key from `fluxpeer relay public-key` (hex or base64).
+        #[arg(long)]
+        public_key: String,
     },
     /// List relays usable by a network.
     List { network_id: String },
@@ -234,10 +237,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 anytls,
                 stun_url,
                 node_id,
-            } => {
+                public_key,            } => {
                 if let Some(warning) = relay_identity_warning(anytls, node_id.as_deref()) { eprintln!("warning: {warning}"); }
-                print_json(&client.register_relay_with_identity(&region, &url, network_id.as_deref(), anytls,
-                    stun_url.as_deref(), Some(node_id.as_deref().unwrap_or("fluxpeer-relay"))).await?);
+                print_json(&client.register_relay_authenticated(&region, &url, network_id.as_deref(), anytls,
+                    stun_url.as_deref(), (Some(node_id.as_deref().unwrap_or("fluxpeer-relay")), Some(&public_key))).await?);
             },
             RelayCmd::List { network_id } => print_json(&client.list_relays(&network_id).await?),
         },
@@ -387,10 +390,10 @@ mod test {
         let cmd = <Cli as clap::CommandFactory>::command().mut_subcommand("relay", |cmd| {
             cmd.mut_subcommand("add", |cmd| cmd.mut_arg("node_id", |arg| arg.env(None::<&str>)))
         });
-        let matches = cmd.try_get_matches_from(["fp", "relay", "add", "eu", "localhost:443", "--anytls"]).unwrap();
+        let matches = cmd.try_get_matches_from(["fp", "relay", "add", "eu", "localhost:443", "--public-key", &"11".repeat(32), "--anytls"]).unwrap();
         let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap();
         assert!(matches!(cli.command, Command::Relay { command: RelayCmd::Add { node_id, .. } } if node_id.is_none()));
-        let cli = Cli::try_parse_from(["fp", "relay", "add", "eu", "localhost:443", "--anytls", "--node-id", "custom-edge"]).unwrap();
+        let cli = Cli::try_parse_from(["fp", "relay", "add", "eu", "localhost:443", "--public-key", &"11".repeat(32), "--anytls", "--node-id", "custom-edge"]).unwrap();
         assert!(matches!(cli.command, Command::Relay { command: RelayCmd::Add { node_id, .. } } if node_id.as_deref() == Some("custom-edge")));
     }
 

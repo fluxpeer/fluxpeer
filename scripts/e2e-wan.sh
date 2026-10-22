@@ -7,10 +7,10 @@
 # public relay). This exercises NAT traversal + relay, which netns/LAN tests can't.
 #
 # Supply your own infra (no defaults are baked in) via flags or env:
-#   scripts/e2e-wan.sh --ctl http://HOST:8090 --admin PW --relay HOST:3478 \
+#   scripts/e2e-wan.sh --ctl http://HOST:8090 --admin PW --relay HOST:3478 --relay-public-key HEX \
 #                      --node-a <ssh-host> --node-b <ssh-host> [--keep]
 # env equivalents: FLUXPEER_E2E_CTL / FLUXPEER_ADMIN_PASSWORD / FLUXPEER_E2E_RELAY /
-#                  FLUXPEER_E2E_NODE_A / FLUXPEER_E2E_NODE_B
+#                  FLUXPEER_E2E_RELAY_PUBLIC_KEY / FLUXPEER_E2E_NODE_A / FLUXPEER_E2E_NODE_B
 #
 # Bakes in the bring-up gotchas (see also e2e-2node.sh):
 #  - kill stale fp-node on both nodes first.
@@ -25,6 +25,7 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CTL="${FLUXPEER_E2E_CTL:-}"
 ADMIN="${FLUXPEER_ADMIN_PASSWORD:-}"
 RELAY="${FLUXPEER_E2E_RELAY:-}"
+RELAY_PUBLIC_KEY="${FLUXPEER_E2E_RELAY_PUBLIC_KEY:-}"
 NODE_A="${FLUXPEER_E2E_NODE_A:-}"
 NODE_B="${FLUXPEER_E2E_NODE_B:-}"
 KEEP=0
@@ -32,6 +33,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --ctl) CTL="$2"; shift 2 ;;
   --admin) ADMIN="$2"; shift 2 ;;
   --relay) RELAY="$2"; shift 2 ;;
+  --relay-public-key) RELAY_PUBLIC_KEY="$2"; shift 2 ;;
   --node-a) NODE_A="$2"; shift 2 ;;
   --node-b) NODE_B="$2"; shift 2 ;;
   --keep) KEEP=1; shift ;;
@@ -43,12 +45,16 @@ missing=""
 [ -n "$CTL" ]    || missing="$missing --ctl"
 [ -n "$ADMIN" ]  || missing="$missing --admin"
 [ -n "$RELAY" ]  || missing="$missing --relay"
+[ -n "$RELAY_PUBLIC_KEY" ] || missing="$missing --relay-public-key"
 [ -n "$NODE_A" ] || missing="$missing --node-a"
 [ -n "$NODE_B" ] || missing="$missing --node-b"
 if [ -n "$missing" ]; then
   echo "missing required:$missing (pass as flags or env — see header)" >&2
   exit 2
 fi
+
+# Obtain this pin on the relay host with `fluxpeer relay public-key`.
+[[ "$RELAY_PUBLIC_KEY" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "relay public key must be 64 hex characters" >&2; exit 2; }
 
 SSH=(ssh -o ProxyCommand=none -o ProxyJump=none -o ConnectTimeout=15)
 SCP=(scp -o ProxyCommand=none -o ProxyJump=none -o ConnectTimeout=15)
@@ -97,7 +103,7 @@ IB=$("$FLUX" ctl --server "$CTL" invite create "$NET" | python3 -c 'import sys,j
 "$FLUX" join "$(mktoken "$IB")" --no-run --out "$TMP/b.json" --name wan-b >/dev/null 2>&1 || fail "enroll b"
 # Give both configs the public relay + STUN (relay doubles as STUN) so NATed nodes
 # learn their reflexive address and can relay-fall-back if hole-punch fails.
-for f in a b; do python3 -c "import json;c=json.load(open('$TMP/$f.json'));c['stun_server']='$RELAY';c['relay']='$RELAY';json.dump(c,open('$TMP/$f.json','w'))"; done
+for f in a b; do python3 -c "import json;c=json.load(open('$TMP/$f.json'));c['stun_server']='$RELAY';c['relay']='$RELAY';c['relay_public_key']='$RELAY_PUBLIC_KEY';json.dump(c,open('$TMP/$f.json','w'))"; done
 # Multi-iface nodes (LAN + VPN + docker) otherwise advertise an addr the peer can't
 # reach (handshake completes via STUN-reflexive but data is one-way — same as the
 # layer-2 finding). Pin each node's advertised endpoint to its primary LAN IP.

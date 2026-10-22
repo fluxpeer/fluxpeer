@@ -35,6 +35,7 @@ async fn decrypted_sources_are_checked_on_udp_tcp_and_relay_before_tun_delivery(
     let (tun_out, mut tun_in) = mpsc::channel(16);
     let registry = status::registry(); registry.write().insert(*remote_pub.as_bytes(), stat.clone());
     let mut state = WorkerState {
+        disco_routes: Default::default(),
         peers: vec![peer], index_map: IndexTable::new(HashMap::from([(index, *remote_pub.as_bytes())]), Arc::default(), 0),
         udp: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()), relay_out: None,
         own_priv: own, own_pub, force_relay: false, tun_out, status: registry,
@@ -136,6 +137,7 @@ pub(crate) async fn assert_source_delivery(allowed: Arc<arc_swap::ArcSwap<RouteT
     sender.on_recv(peer.raw.on_send(&[], &mut wire).unwrap(), &mut plain).unwrap();
     let (tun_out, mut tun_in) = mpsc::channel(4);
     let mut state = WorkerState {
+        disco_routes: Default::default(),
         peers: vec![peer], index_map: IndexTable::new(HashMap::new(), Arc::default(), 0),
         udp: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()), relay_out: None,
         own_priv: own, own_pub, force_relay: false, tun_out, status: status::registry(), allowed,

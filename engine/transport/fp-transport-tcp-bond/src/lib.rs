@@ -23,3 +23,7 @@ pub use health::BondHealthSummary;
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
+
+/// Physical-link fixture support, matching the AnyTLS integration-test API.
+#[doc(hidden)]
+pub mod __test_helpers { pub use crate::conn::ManagedConnection; }

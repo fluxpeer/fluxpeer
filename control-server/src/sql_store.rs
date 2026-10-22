@@ -630,6 +630,19 @@ impl SqlStore {
         stun_url: Option<String>,
         node_id: Option<String>,
     ) -> Result<RelayNode> {
+        self.register_relay_authenticated(region, url, network_id, anytls, stun_url, (node_id, None)).await
+    }
+
+    pub async fn register_relay_authenticated(
+        &self,
+        region: &str,
+        url: &str,
+        network_id: Option<String>,
+        anytls: bool,
+        stun_url: Option<String>,
+        identity: (Option<String>, Option<String>),
+    ) -> Result<RelayNode> {
+        let (node_id, public_key) = identity;
         let mut tx = crate::integrity::begin(&self.pool).await?;
         if let Some(id) = &network_id && db::get_network(&mut *tx, id).await?.is_none() { return Err(SqlStoreError::NetworkNotFound); }
         let relay = RelayNode {
@@ -640,6 +653,7 @@ impl SqlStore {
             anytls,
             stun_url: stun_url.or_else(|| Some(url.to_string())),
             node_id,
+            public_key,
         };
         db::insert_relay(&mut *tx, &relay).await?;
         let networks: Vec<String> = sqlx::query_scalar("SELECT id FROM network WHERE CAST($1 AS TEXT) IS NULL OR id = $1")
@@ -656,9 +670,9 @@ impl SqlStore {
         let old = sqlx::query("SELECT network_id FROM relay WHERE id = $1").bind(&relay.id)
             .fetch_optional(&mut *tx).await?.ok_or(SqlStoreError::RelayNotFound)?;
         let old_scope: Option<String> = old.try_get("network_id")?;
-        sqlx::query("UPDATE relay SET region = $2, url = $3, network_id = $4, anytls = $5, stun_url = $6, node_id = $7 WHERE id = $1")
+        sqlx::query("UPDATE relay SET region = $2, url = $3, network_id = $4, anytls = $5, stun_url = $6, node_id = $7, public_key = $8 WHERE id = $1")
             .bind(&relay.id).bind(&relay.region).bind(&relay.url).bind(&relay.network_id)
-            .bind(i64::from(relay.anytls)).bind(&relay.stun_url).bind(&relay.node_id).execute(&mut *tx).await?;
+            .bind(i64::from(relay.anytls)).bind(&relay.stun_url).bind(&relay.node_id).bind(&relay.public_key).execute(&mut *tx).await?;
         let networks: Vec<String> = sqlx::query_scalar("SELECT id FROM network WHERE CAST($1 AS TEXT) IS NULL OR CAST($2 AS TEXT) IS NULL OR id = $1 OR id = $2")
             .bind(&old_scope).bind(&relay.network_id).fetch_all(&mut *tx).await?;
         for id in &networks { db::bump_network_epoch(&mut *tx, id).await?; }
@@ -827,9 +841,9 @@ mod test {
         let a = s.create_network("a").await.unwrap(); let b = s.create_network("b").await.unwrap();
         let c = s.create_network("c").await.unwrap();
         let mut wa = s.subscribe(&a.id); let mut wb = s.subscribe(&b.id); let mut wc = s.subscribe(&c.id);
-        let mut relay = s.register_relay("eu", "192.0.2.1:443", Some(a.id.clone()), true, None, Some("edge".into())).await.unwrap();
+        let mut relay = s.register_relay_authenticated("eu", "192.0.2.1:443", Some(a.id.clone()), true, None, (Some("edge".into()), Some("11".repeat(32)))).await.unwrap();
         assert_eq!(*wa.borrow_and_update(), 1); assert!(!wb.has_changed().unwrap()); assert!(!wc.has_changed().unwrap());
-        relay.network_id = Some(b.id.clone()); relay.url = "192.0.2.2:443".into();
+        relay.network_id = Some(b.id.clone()); relay.url = "192.0.2.2:443".into(); relay.public_key = Some("22".repeat(32));
         s.update_relay(relay.clone()).await.unwrap();
         assert_eq!(*wa.borrow_and_update(), 2); assert_eq!(*wb.borrow_and_update(), 1); assert!(!wc.has_changed().unwrap());
         assert!(s.list_relays(&a.id).await.unwrap().is_empty());

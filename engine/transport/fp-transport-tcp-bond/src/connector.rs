@@ -15,7 +15,11 @@ pub struct TcpBondConnector;
 
 #[async_trait::async_trait]
 impl fp_transport::Connector for TcpBondConnector {
-    async fn bind(config: Config) -> Result<Box<dyn Listener>, fp_transport::Error> {
+    async fn bind(config: Config) -> Result<Box<dyn Listener>, fp_transport::Error> { Self::bind_authenticated(config, None).await }
+    async fn connect(config: Config) -> Result<SenderAndReceiver, fp_transport::Error> { Self::connect_authenticated(config, None).await }
+}
+impl TcpBondConnector {
+    pub async fn bind_authenticated(config: Config, authenticator: Option<fp_transport::link::Authenticator>) -> Result<Box<dyn Listener>, fp_transport::Error> {
         let tcp_bond_cfg = get_config_cloned();
         let addr = SocketAddr::new(config.endpoint, config.port);
 
@@ -42,7 +46,7 @@ impl fp_transport::Connector for TcpBondConnector {
         let cfg = tcp_bond_cfg.clone();
         let shutdown_clone = shutdown.clone();
         tokio::spawn(async move {
-            accept_loop(listener_clone, pending_clone, primary_tx, cfg, shutdown_clone).await;
+            accept_loop(listener_clone, pending_clone, primary_tx, cfg, shutdown_clone, authenticator).await;
         });
 
         Ok(Box::new(TcpBondListener {
@@ -51,11 +55,11 @@ impl fp_transport::Connector for TcpBondConnector {
         }))
     }
 
-    async fn connect(config: Config) -> Result<SenderAndReceiver, fp_transport::Error> {
+    pub async fn connect_authenticated(config: Config, authenticator: Option<fp_transport::link::Authenticator>) -> Result<SenderAndReceiver, fp_transport::Error> {
         let tcp_bond_cfg = get_config_cloned();
         let addr = SocketAddr::new(config.endpoint, config.port);
 
-        let group = crate::bond::build_client_bond(&tcp_bond_cfg, addr).await?;
+        let group = crate::bond::build_client_bond(&tcp_bond_cfg, addr, authenticator).await?;
 
         let n = group.alive_count().await;
         tracing::info!(bond_connections = n, "TCP bond client connected");
@@ -70,9 +74,8 @@ impl fp_transport::Connector for TcpBondConnector {
 // -- Shared state --
 
 struct PendingBond {
-    group: Arc<BondGroup>,
-    expected: u8,
-    arrived: std::sync::atomic::AtomicU8,
+    group: std::sync::Weak<BondGroup>,
+    arrived: std::sync::atomic::AtomicUsize,
 }
 
 // -- Listener that receives completed primary bonds from the acceptor task --
@@ -113,9 +116,9 @@ impl Listener for TcpBondListener {
                 }
             };
 
-            // Read first packet (Noise handshake) -- no timeout, dispatcher controls lifetime
-            match group.recv().await {
-                Ok(first_packet) => {
+            // Bound stalled authenticated clients before handing them to the relay.
+            match tokio::time::timeout(std::time::Duration::from_secs(10), group.recv()).await {
+                Ok(Ok(first_packet)) => {
                     let sender: Box<dyn fp_transport::TransportSender> =
                         Box::new(BondedSender { group: group.clone() });
                     let receiver: Box<dyn fp_transport::TransportReceiver> = Box::new(BondedReceiver { group });
@@ -126,8 +129,8 @@ impl Listener for TcpBondListener {
                         peer_addr: peer_ip,
                     });
                 }
-                Err(e) => {
-                    tracing::warn!("Bond recv failed before first packet: {}", e);
+                result => {
+                    tracing::warn!(?result, "Bond recv failed before first packet");
                     continue; // Try next primary
                 }
             }
@@ -143,6 +146,7 @@ async fn accept_loop(
     primary_tx: tokio::sync::mpsc::Sender<PrimaryMsg>,
     config: TcpBondConfig,
     shutdown: Arc<tokio::sync::Notify>,
+    authenticator: Option<fp_transport::link::Authenticator>,
 ) {
     // Exponential backoff state for accept() errors (FD exhaustion etc.)
     let mut backoff_ms: u64 = 100;
@@ -181,8 +185,9 @@ async fn accept_loop(
         let tx = primary_tx.clone();
         let cfg = config.clone();
 
+        let authenticator = authenticator.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(tcp, peer_addr, &pend, &tx, &cfg).await {
+            if let Err(e) = handle_connection(tcp, peer_addr, &pend, &tx, &cfg, authenticator.as_ref()).await {
                 tracing::warn!(%peer_addr, "Connection handling failed: {}", e);
             }
         });
@@ -195,57 +200,67 @@ async fn handle_connection(
     pending: &Arc<RwLock<HashMap<[u8; 16], PendingBond>>>,
     primary_tx: &tokio::sync::mpsc::Sender<PrimaryMsg>,
     config: &TcpBondConfig,
+    authenticator: Option<&fp_transport::link::Authenticator>,
 ) -> Result<(), fp_transport::Error> {
-    let mut accepted = accept_server_connection(tcp).await?;
+    let mut accepted = tokio::time::timeout(std::time::Duration::from_secs(10), accept_server_connection(tcp, authenticator)).await.map_err(|_| fp_transport::Error::IO(fp_transport::link::denied("bond authentication timeout")))??;
     let bond_id = accepted.bond_id;
-    let bond_total = accepted.bond_total;
 
-    // Atomically determine if we're primary (first to insert) or secondary
-    let (is_primary, group) = {
-        let mut pending_w = pending.write().await;
-        if let Some(pb) = pending_w.get(&bond_id) {
-            // Secondary: join existing bond
-            let group = pb.group.clone();
-            if let Some(Ok(stream)) = accepted.next_inbound().await {
-                let health = Arc::new(ConnHealth::new(config));
-                let idx = pb.arrived.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                group.add_stream(idx as usize + 1, health, stream).await;
-                tracing::info!(
-                    arrived = idx + 2,
-                    expected = pb.expected,
-                    "Secondary bond connection joined"
-                );
+    // The hook has already verified this link. Primary proof confirmation
+    // can arrive before its transport task is scheduled to publish the group.
+    // Only proven secondaries wait here; unknown/pending groups fail in the hook.
+    if authenticator.is_some() && accepted.link_index != 0 {
+        tokio::time::timeout(config.bond_join_timeout, async {
+            loop {
+                if accepted.link_session.as_ref().is_some_and(|s| !s.active()) {
+                    return Err(fp_transport::Error::IO(fp_transport::link::denied("revoked bond")));
+                }
+                if pending.read().await.get(&bond_id).and_then(|pb| pb.group.upgrade()).is_some() { return Ok(()); }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
-            tokio::spawn(async move { while let Some(Ok(_)) = accepted.next_inbound().await {} });
-            return Ok(());
+        }).await.map_err(|_| fp_transport::Error::IO(fp_transport::link::denied("primary bond publication timeout")))??;
+    }
+
+    // Decide membership without holding the registry lock during stream IO.
+    let (is_primary, group, index) = {
+        let mut pending_w = pending.write().await;
+        pending_w.retain(|_, pb| pb.group.upgrade().is_some_and(|g| g.link_session.read().as_ref().is_none_or(|s| s.active())));
+        if let Some(pb) = pending_w.get(&bond_id) {
+            let group = pb.group.upgrade().ok_or_else(|| fp_transport::Error::IO(fp_transport::link::denied("expired bond")))?;
+            if let Some(session) = &accepted.link_session
+                && (!session.active() || !group.link_session.read().as_ref().is_some_and(|s| Arc::ptr_eq(s, session)))
+            { return Err(fp_transport::Error::IO(fp_transport::link::denied("bond session mismatch"))); }
+            let index = pb.arrived.fetch_add(1, std::sync::atomic::Ordering::Relaxed).saturating_add(1);
+            (false, group, index)
         } else {
-            // Primary: create and register
+            if authenticator.is_some() && accepted.link_index != 0 { return Err(fp_transport::Error::IO(fp_transport::link::denied("primary bond not ready"))); }
             let group = BondGroup::new(bond_id);
-            pending_w.insert(
-                bond_id,
-                PendingBond {
-                    group: group.clone(),
-                    expected: bond_total,
-                    arrived: std::sync::atomic::AtomicU8::new(0),
-                },
-            );
-            (true, group)
+            *group.link_session.write() = accepted.link_session.clone();
+            pending_w.insert(bond_id, PendingBond { group: Arc::downgrade(&group), arrived: std::sync::atomic::AtomicUsize::new(0) });
+            (true, group, 0)
         }
     };
-
-    // Suppress unused variable warning -- is_primary is used implicitly by control flow
-    let _ = is_primary;
+    if !is_primary {
+        let stream = tokio::time::timeout(config.bond_join_timeout, accepted.next_inbound()).await
+            .map_err(|_| fp_transport::Error::IO(fp_transport::link::denied("bond stream timeout")))?
+            .ok_or_else(|| fp_transport::Error::IO(fp_transport::link::denied("bond stream closed")))?
+            .map_err(|error| fp_transport::Error::UnexpectedResult(error.to_string()))?;
+        group.add_stream(index, Arc::new(ConnHealth::new(config)), stream).await;
+        tokio::spawn(async move { while let Some(Ok(_)) = accepted.next_inbound().await {} });
+        return Ok(());
+    }
 
     // Cleanup timeout
     let pending_cleanup = pending.clone();
     let join_timeout = config.bond_join_timeout;
+    let authenticated = authenticator.is_some();
     tokio::spawn(async move {
+        if authenticated { return; }
         tokio::time::sleep(join_timeout).await;
         pending_cleanup.write().await.remove(&bond_id);
     });
 
     // Get first yamux stream (carries Noise handshake)
-    let yamux_stream = match accepted.next_inbound().await {
+    let yamux_stream = match tokio::time::timeout(config.bond_join_timeout, accepted.next_inbound()).await.map_err(|_| fp_transport::Error::IO(fp_transport::link::denied("bond stream timeout")))? {
         Some(Ok(s)) => s,
         Some(Err(e)) => {
             pending.write().await.remove(&bond_id);

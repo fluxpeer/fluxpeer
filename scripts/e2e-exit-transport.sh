@@ -76,7 +76,9 @@ echo "===== control-server + multi-transport relay ====="
 DATABASE_URL="sqlite://$D/db.sqlite?mode=rwc" FLUXPEER_CONTROL_ADDR=0.0.0.0:$CPORT FLUXPEER_ADMIN_PASSWORD=reg \
   nohup $B control >"$D/control.log" 2>&1 & sleep 2
 # ONE relay process, three carriers + STUN, all on the bridge IP.
-FLUXPEER_RELAY_ADDR=0.0.0.0:$RPORT_TCP FLUXPEER_RELAY_ANYTLS_ADDR=0.0.0.0:$RPORT_TLS \
+RELAY_PUBLIC_KEY=$("$B" relay public-key --key-file "$D/relay/relay.key") || exit 1
+[[ "$RELAY_PUBLIC_KEY" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid relay public key" >&2; exit 1; }
+FLUXPEER_RELAY_KEY_FILE="$D/relay/relay.key" FLUXPEER_RELAY_ADDR=0.0.0.0:$RPORT_TCP FLUXPEER_RELAY_ANYTLS_ADDR=0.0.0.0:$RPORT_TLS \
   FLUXPEER_RELAY_BOND_ADDR=0.0.0.0:$RPORT_BOND FLUXPEER_RELAY_NODE_ID=fluxpeer-relay \
   nohup $B relay >"$D/relay.log" 2>&1 & sleep 2
 curl -s $CTRL/health >/dev/null && ok "control-server up" || no "control-server down"
@@ -109,7 +111,9 @@ cp "$D/cfg/C.json" "$D/cfg/C.base.json"; cp "$D/cfg/E.json" "$D/cfg/E.base.json"
 # Rebuild a node config from its base: $1=base-tag(C|E) $2=tun $3=port $4=extra-json
 patch(){ python3 -c "import json,sys
 b='$D/cfg/$1.base.json';p='$D/cfg/$1.json';c=json.load(open(b));c['tun_name']='$2';c['listen_port']=$3
-c.update(json.loads('''$4'''));json.dump(c,open(p,'w'))"; }
+c.update(json.loads('''$4'''))
+if 'relay' in c: c['relay_public_key']='$RELAY_PUBLIC_KEY'
+json.dump(c,open(p,'w'))"; }
 
 # Transport matrix the CLIENT selects. Each entry patches BOTH ends to that carrier
 # (the C↔E mesh hop must agree); the exit↔intranet forwarding is identical underneath.

@@ -67,6 +67,12 @@ pub async fn migrate(pool: &AnyPool) -> Result<(), sqlx::Error> {
         });
         if !duplicate { return Err(error); }
     }
+    if let Err(error) = sqlx::query("ALTER TABLE relay ADD COLUMN public_key TEXT").execute(pool).await {
+        let duplicate = error.as_database_error().is_some_and(|e| {
+            e.code().as_deref() == Some("42701") || e.message() == "duplicate column name: public_key"
+        });
+        if !duplicate { return Err(error); }
+    }
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS admin (\
             username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, created_at BIGINT NOT NULL)",
@@ -225,7 +231,7 @@ pub async fn list_network_stats(pool: &AnyPool, network_id: &str) -> Result<Vec<
 
 /// Insert a relay into the directory.
 pub async fn insert_relay(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, r: &RelayNode) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO relay (id, region, url, network_id, anytls, stun_url, node_id) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+    sqlx::query("INSERT INTO relay (id, region, url, network_id, anytls, stun_url, node_id, public_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
         .bind(&r.id)
         .bind(&r.region)
         .bind(&r.url)
@@ -233,6 +239,7 @@ pub async fn insert_relay(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, r
         .bind(i64::from(r.anytls))
         .bind(&r.stun_url)
         .bind(&r.node_id)
+        .bind(&r.public_key)
         .execute(pool)
         .await?;
     Ok(())
@@ -242,7 +249,7 @@ pub async fn insert_relay(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, r
 /// (`network_id IS NULL`).
 pub async fn list_relays(pool: &AnyPool, network_id: &str) -> Result<Vec<RelayNode>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT id, region, url, network_id, anytls, stun_url, node_id FROM relay WHERE network_id = $1 OR network_id IS NULL",
+        "SELECT id, region, url, network_id, anytls, stun_url, node_id, public_key FROM relay WHERE network_id = $1 OR network_id IS NULL",
     )
     .bind(network_id)
     .fetch_all(pool)
@@ -257,6 +264,7 @@ pub async fn list_relays(pool: &AnyPool, network_id: &str) -> Result<Vec<RelayNo
             anytls: r.try_get::<i64, _>("anytls")? != 0,
             stun_url: r.try_get::<Option<String>, _>("stun_url")?,
             node_id: r.try_get::<Option<String>, _>("node_id")?,
+            public_key: r.try_get::<Option<String>, _>("public_key")?,
         }))
         .collect::<Result<Vec<_>, sqlx::Error>>()
 }
@@ -542,7 +550,8 @@ mod test {
         migrate(&pool).await.unwrap(); // Repeated startup must be harmless.
         let legacy = list_relays(&pool, "net-1").await.unwrap().remove(0);
         assert_eq!(legacy.node_id, None);
-        let relay = RelayNode { id: "relay-new".into(), node_id: Some("edge-custom".into()), ..legacy };
+        assert_eq!(legacy.public_key, None);
+        let relay = RelayNode { id: "relay-new".into(), node_id: Some("edge-custom".into()), public_key: Some("11".repeat(32)), ..legacy };
         insert_relay(&pool, &relay).await.unwrap();
         assert_eq!(list_relays(&pool, "net-1").await.unwrap().into_iter().find(|r| r.id == relay.id), Some(relay));
     }

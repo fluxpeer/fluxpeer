@@ -34,6 +34,7 @@ struct Link {
 /// A group of bonded connections that looks like one (Sender, Receiver) to the upper layer.
 pub struct BondGroup {
     pub bond_id: [u8; 16],
+    pub link_session: parking_lot::RwLock<Option<fp_transport::link::Session>>,
     links: RwLock<Vec<Link>>,
     recv_rx: Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     recv_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -41,11 +42,17 @@ pub struct BondGroup {
     spray: AtomicUsize,
 }
 
+impl Drop for BondGroup {
+    fn drop(&mut self) { if let Some(session) = self.link_session.get_mut().as_ref() { session.invalidate(); } }
+}
 impl BondGroup {
+    fn auth_active(&self) -> bool { self.link_session.read().as_ref().is_none_or(|s| s.active()) }
+
     pub fn new(bond_id: [u8; 16]) -> Arc<Self> {
         let (tx, rx) = tokio::sync::mpsc::channel(4096);
         Arc::new(Self {
             bond_id,
+            link_session: parking_lot::RwLock::new(None),
             links: RwLock::new(Vec::new()),
             recv_rx: Mutex::new(rx),
             recv_tx: tx,
@@ -104,11 +111,13 @@ impl BondGroup {
         // Reader: pushes received packets into the shared channel.
         let rtx = self.recv_tx.clone();
         let health_r = health.clone();
+        let auth_session = self.link_session.read().clone();
         tokio::spawn(async move {
             let mut rdr = reader;
             loop {
                 match read_length_prefixed(&mut rdr).await {
                     Ok(pkt) => {
+                        if auth_session.as_ref().is_some_and(|s| !s.active()) { break; }
                         if pkt.is_empty() {
                             continue;
                         }
@@ -134,6 +143,7 @@ impl BondGroup {
     /// skipping dead links and links whose queue is full (try the next). All
     /// full/dead → drop (wg retransmits). Spreads a single flow over every link.
     pub async fn send(&self, mut pkt: Vec<u8>) -> Result<(), fp_transport::Error> {
+        if !self.auth_active() { return Err(fp_transport::Error::IO(fp_transport::link::denied("revoked bond"))); }
         let links = self.links.read().await;
         let n = links.len();
         if n == 0 {
@@ -141,7 +151,7 @@ impl BondGroup {
         }
         let start = self.spray.fetch_add(1, Ordering::Relaxed) % n;
         for k in 0..n {
-            let link = &links[(start + k) % n];
+            let Some(link) = links.get((start + k) % n) else { continue; };
             if link.health.is_dead() {
                 continue;
             }
@@ -213,13 +223,17 @@ pub struct BondedSender {
     pub group: Arc<BondGroup>,
 }
 
+impl Drop for BondedSender {
+    fn drop(&mut self) { if let Some(session) = self.group.link_session.read().as_ref() { session.invalidate(); } }
+}
 #[async_trait::async_trait]
 impl fp_transport::TransportSender for BondedSender {
+    fn link_session(&self) -> Option<fp_transport::link::Session> { self.group.link_session.read().clone() }
     async fn send(&mut self, pkt: Vec<u8>) -> Result<(), fp_transport::Error> {
         self.group.send(pkt).await
     }
     async fn close(&mut self) {
-        // Writers will be closed when BondGroup is dropped
+        if let Some(session) = self.group.link_session.read().as_ref() { session.invalidate(); }
     }
 }
 
@@ -233,7 +247,7 @@ impl fp_transport::TransportReceiver for BondedReceiver {
         self.group.recv().await
     }
     async fn close(&mut self) {
-        // Readers will stop when BondGroup is dropped
+        if let Some(session) = self.group.link_session.read().as_ref() { session.invalidate(); }
     }
 }
 
@@ -242,32 +256,38 @@ impl fp_transport::TransportReceiver for BondedReceiver {
 pub async fn build_client_bond(
     config: &TcpBondConfig,
     addr: SocketAddr,
+    authenticator: Option<fp_transport::link::Authenticator>,
 ) -> Result<Arc<BondGroup>, fp_transport::Error> {
     let bond_id = crate::conn::generate_bond_id();
     let n = config.effective_bond_connections();
     let group = BondGroup::new(bond_id);
 
-    // Establish N connections concurrently
-    let mut handles = Vec::with_capacity(n);
-    for i in 0..n {
-        let cfg = config.clone();
-        let a = addr;
-        let bid = bond_id;
-        handles.push(tokio::spawn(async move {
-            ManagedConnection::connect(i, a, &cfg, &bid).await
-        }));
-    }
-
-    let mut conns: Vec<ManagedConnection> = Vec::with_capacity(n);
-    for (i, handle) in handles.into_iter().enumerate() {
-        match handle.await {
-            Ok(Ok(conn)) => conns.push(conn),
-            Ok(Err(e)) => {
-                tracing::warn!(i, "Bond connection {} failed: {}", i, e);
-            }
-            Err(e) => {
-                tracing::warn!(i, "Bond connection {} panicked: {}", i, e);
-            }
+    let mut conns = Vec::with_capacity(n);
+    // Relay primary must complete before any secondary proof; direct WG callers
+    // retain concurrent establishment without a link authentication hook.
+    let start = if authenticator.is_some() {
+        let conn = ManagedConnection::connect_authenticated(0, addr, config, &bond_id, authenticator.clone()).await?;
+        *group.link_session.write() = conn.link_session.clone();
+        let stream = conn.open_stream().await?;
+        group.add_stream(conn.id, conn.health.clone(), stream).await;
+        conns.push(conn);
+        1
+    } else { 0 };
+    let results = futures::future::join_all((start..n).map(|i| {
+        let authenticator = authenticator.clone();
+        async move {
+        ManagedConnection::connect_authenticated(i, addr, config, &bond_id, authenticator.clone()).await
+    }})).await;
+    for result in results {
+        match result {
+            Ok(conn) => match conn.open_stream().await {
+                Ok(stream) => {
+                    group.add_stream(conn.id, conn.health.clone(), stream).await;
+                    conns.push(conn);
+                }
+                Err(error) => tracing::warn!(%error, "bond stream failed"),
+            },
+            Err(error) => tracing::warn!(%error, "bond connection failed"),
         }
     }
 
@@ -285,22 +305,10 @@ pub async fn build_client_bond(
         n
     );
 
-    // Open one yamux stream per connection, add to bond group
-    for conn in &conns {
-        match conn.open_stream().await {
-            Ok(stream) => {
-                group.add_stream(conn.id, conn.health.clone(), stream).await;
-            }
-            Err(e) => {
-                tracing::warn!(conn_id = conn.id, "Failed to open stream: {}", e);
-            }
-        }
-    }
-
     // Background: health check + reconnect dead connections
     let group_for_bg = group.clone();
     let config_for_bg = config.clone();
-    let mut next_id = conns.len();
+    let mut next_id = n;
     // Keep managed connections alive (their drivers need to stay running)
     let managed = Arc::new(RwLock::new(conns));
     let managed_for_bg = managed.clone();
@@ -309,6 +317,7 @@ pub async fn build_client_bond(
         let mut interval = tokio::time::interval(config_for_bg.health_check_interval);
         loop {
             interval.tick().await;
+            if !group_for_bg.auth_active() { break; }
 
             // Ping all managed connections
             {
@@ -338,12 +347,12 @@ pub async fn build_client_bond(
             if alive < target {
                 tracing::info!(alive, target, "Replenishing bond connections");
                 let bid = group_for_bg.bond_id;
-                match ManagedConnection::connect(next_id, addr, &config_for_bg, &bid).await {
+                match ManagedConnection::connect_authenticated(next_id, addr, &config_for_bg, &bid, authenticator.clone()).await {
                     Ok(conn) => {
                         if let Ok(stream) = conn.open_stream().await {
                             group_for_bg.add_stream(conn.id, conn.health.clone(), stream).await;
                             managed_for_bg.write().await.push(conn);
-                            next_id += 1;
+                            next_id = match next_id.checked_add(1) { Some(id) => id, None => break };
                         }
                     }
                     Err(e) => {

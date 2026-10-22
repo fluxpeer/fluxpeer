@@ -23,6 +23,7 @@ pub trait Listener: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait TransportSender: Send + Sync {
+    fn link_session(&self) -> Option<crate::link::Session> { None }
     async fn send(&mut self, pkt: Vec<u8>) -> Result<(), crate::Error>;
     async fn close(&mut self);
 }

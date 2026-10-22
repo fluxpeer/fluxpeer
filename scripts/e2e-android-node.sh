@@ -56,16 +56,20 @@ say "deploy binary to $GW_HOST (binary only — never source on a node)"
 scp -q "$BIN" "$GW_HOST:/tmp/fluxpeer-e2e" || fail "scp binary"
 "${SSH[@]}" "$GW_HOST" "chmod +x /tmp/fluxpeer-e2e"
 
+RELAY_PUBLIC_KEY=$("${SSH[@]}" "$GW_HOST" "/tmp/fluxpeer-e2e relay public-key --key-file /tmp/fpe2e-relay-state/relay.key") || fail "relay identity"
+[[ "$RELAY_PUBLIC_KEY" =~ ^[0-9a-f]{64}$ ]] || fail "invalid relay public key"
 say "start control + relay(+STUN)"
 "${SSH[@]}" "$GW_HOST" "setsid bash -c 'rm -f /tmp/fpe2e-control.db; DATABASE_URL=\"sqlite:///tmp/fpe2e-control.db?mode=rwc\" FLUXPEER_CONTROL_ADDR=0.0.0.0:$CPORT FLUXPEER_ADMIN_PASSWORD=$ADMIN /tmp/fluxpeer-e2e control >/tmp/fpe2e-control.log 2>&1' </dev/null >/dev/null 2>&1 &"
-"${SSH[@]}" "$GW_HOST" "setsid bash -c 'FLUXPEER_RELAY_ADDR=0.0.0.0:$RPORT FLUXPEER_RELAY_STUN=0.0.0.0:$RPORT /tmp/fluxpeer-e2e relay >/tmp/fpe2e-relay.log 2>&1' </dev/null >/dev/null 2>&1 &"
+"${SSH[@]}" "$GW_HOST" "setsid bash -c 'FLUXPEER_RELAY_KEY_FILE=/tmp/fpe2e-relay-state/relay.key FLUXPEER_RELAY_ADDR=0.0.0.0:$RPORT FLUXPEER_RELAY_STUN_ADDR=0.0.0.0:$RPORT /tmp/fluxpeer-e2e relay >/tmp/fpe2e-relay.log 2>&1' </dev/null >/dev/null 2>&1 &"
 sleep 4
 curl -s -o /dev/null -w '%{http_code}' "$CTRL/api/v1/networks" -H "Authorization: Bearer $ADMIN" | grep -q 200 || fail "control not reachable at $CTRL"
 
 say "create network + invite"
 "${SSH[@]}" "$GW_HOST" "FLUXPEER_CONTROL_URL=$CTRL FLUXPEER_ADMIN_PASSWORD=$ADMIN /tmp/fluxpeer-e2e ctl --server $CTRL network create e2e" >/dev/null 2>&1 || true
-NID=$("${SSH[@]}" "$GW_HOST" "/tmp/fluxpeer-e2e ctl --server $CTRL network list" 2>/dev/null | grep -oE 'net-[0-9]+' | head -1)
-CODE=$("${SSH[@]}" "$GW_HOST" "/tmp/fluxpeer-e2e ctl --server $CTRL invite create $NID" 2>/dev/null | grep -oE '[0-9a-f]{32}' | head -1)
+NID=$("${SSH[@]}" "$GW_HOST" "FLUXPEER_ADMIN_PASSWORD=$ADMIN /tmp/fluxpeer-e2e ctl --server $CTRL network list" 2>/dev/null | grep -oE 'net-[0-9]+' | head -1)
+[ -n "$NID" ] || fail "no network id"
+"${SSH[@]}" "$GW_HOST" "FLUXPEER_ADMIN_PASSWORD=$ADMIN /tmp/fluxpeer-e2e ctl --server $CTRL relay add e2e $GWIP:$RPORT --network-id $NID --node-id fluxpeer-relay --public-key $RELAY_PUBLIC_KEY" >/dev/null || fail "register relay"
+CODE=$("${SSH[@]}" "$GW_HOST" "FLUXPEER_ADMIN_PASSWORD=$ADMIN /tmp/fluxpeer-e2e ctl --server $CTRL invite create $NID" 2>/dev/null | grep -oE '[0-9a-f]{32}' | head -1)
 [ -n "$CODE" ] || fail "no invite code"; echo "network=$NID invite=$CODE"
 
 say "enroll + run the gateway node (PoP)"
@@ -110,7 +114,7 @@ echo "http-over-mesh: $([ "$HTTP" = 1 ] && echo OK || echo FAIL)"
 
 if [ "$KEEP" = 0 ]; then
   say "cleanup (--keep to skip)"
-  "${SSH[@]}" "$GW_HOST" "sudo pkill -f 'fluxpeer-e2e node run'; pkill -f 'fluxpeer-e2e control'; pkill -f 'fluxpeer-e2e relay'; pkill -f 'http.server 8088'; sudo ip link del fp0 2>/dev/null; rm -f /tmp/fpe2e-* /tmp/fluxpeer-e2e" 2>/dev/null || true
+  "${SSH[@]}" "$GW_HOST" "sudo pkill -f 'fluxpeer-e2e node run'; pkill -f 'fluxpeer-e2e control'; pkill -f 'fluxpeer-e2e relay'; pkill -f 'http.server 8088'; sudo ip link del fp0 2>/dev/null; rm -rf /tmp/fpe2e-relay-state; rm -f /tmp/fpe2e-* /tmp/fluxpeer-e2e" 2>/dev/null || true
 fi
 [ "${PING:-}" = "0% packet loss" ] && [ "${HTTP:-0}" = 1 ] && { echo; echo "✓ PASS: android e2e over real node ($GWOV)"; exit 0; }
 echo; echo "✗ data-plane not verified (ensure the phone connected during the wait window)"; exit 1

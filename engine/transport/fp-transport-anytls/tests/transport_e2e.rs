@@ -30,7 +30,7 @@ async fn test_raw_conn_roundtrip() {
     let server = tokio::spawn(async move {
         let (tcp, _) = tcp_listener.accept().await.expect("tcp accept");
         let mut accepted =
-            fp_transport_anytls::__test_helpers::accept_server_connection(tcp, &tls_acceptor, &password_hash)
+            fp_transport_anytls::__test_helpers::accept_server_connection(tcp, &tls_acceptor, &password_hash, None)
                 .await
                 .expect("server setup");
 

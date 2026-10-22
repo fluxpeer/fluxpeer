@@ -44,7 +44,7 @@ fluxpeer-podman — deploy fluxpeer roles as Podman containers (runtime: $RUNTIM
 
   install [--no-cache]              build the unified image ($IMAGE) from the repo
   up control [--port 8080] [--admin-password PW] [--data VOL]
-  up relay   [--port 3478]
+  up relay   [--port 3478] [--data VOL]
   join  <fp://join/…|token> [name] [--port N] [--exit]
                                    enroll a node + run it (name default: node)
   down  <name>                     graceful stop (SIGTERM, lets routes/DNS restore)
@@ -94,9 +94,10 @@ cmd_up_control() {
 
 cmd_up_relay() {
   need podman
-  local port=3478 name
+  local port=3478 data="fluxpeer-relay-data" name
   while [ $# -gt 0 ]; do case "$1" in
     --port) port="$2"; shift 2 ;;
+    --data) data="$2"; shift 2 ;;
     *) die "up relay: unknown arg $1" ;;
   esac; done
   name="$(container_of relay)"
@@ -104,10 +105,12 @@ cmd_up_relay() {
   # shellcheck disable=SC2046
   podman run -d --name "$name" $(runtime_flag) \
     -p "${port}:3478/udp" -p "${port}:3478/tcp" \
+    -v "${data}:/data" \
+    -e "FLUXPEER_DATA_DIR=/data" \
     -e "FLUXPEER_RELAY_ADDR=0.0.0.0:3478" \
     --restart unless-stopped \
     "$IMAGE" relay
-  echo "✓ relay up on :$port (udp+tcp)"
+  echo "✓ relay up on :$port (udp+tcp, identity volume $data)"
 }
 
 cmd_up() {

@@ -28,7 +28,7 @@ use tokio::sync::RwLock;
 type ReadyMsg = (Arc<BondGroup>, std::net::IpAddr, Vec<u8>);
 
 struct PendingBond {
-    group: Arc<BondGroup>,
+    group: std::sync::Weak<BondGroup>,
     arrived: std::sync::atomic::AtomicU8,
 }
 
@@ -38,6 +38,7 @@ struct PendingBond {
 /// any number of accepted `TcpStream`s into it and pop ready connections via
 /// `accept_ready()`.
 pub struct AnytlsAcceptor {
+    authenticator: Option<fp_transport::link::Authenticator>,
     tls_acceptor: Arc<tokio_rustls::TlsAcceptor>,
     password_hash: [u8; 32],
     config: AnytlsConfig,
@@ -54,8 +55,12 @@ pub struct AnytlsAcceptor {
 
 impl AnytlsAcceptor {
     pub fn new(tls_acceptor: Arc<tokio_rustls::TlsAcceptor>, password_hash: [u8; 32], config: AnytlsConfig) -> Self {
+        Self::new_authenticated(tls_acceptor, password_hash, config, None)
+    }
+    pub fn new_authenticated(tls_acceptor: Arc<tokio_rustls::TlsAcceptor>, password_hash: [u8; 32], config: AnytlsConfig, authenticator: Option<fp_transport::link::Authenticator>) -> Self {
         let (primary_tx, primary_rx) = tokio::sync::mpsc::channel::<ReadyMsg>(256);
         Self {
+            authenticator,
             tls_acceptor,
             password_hash,
             config,
@@ -102,10 +107,25 @@ impl AnytlsAcceptor {
         tcp: tokio::net::TcpStream,
         peer_addr: SocketAddr,
     ) -> Result<(), fp_transport::Error> {
-        let mut accepted = accept_server_connection(tcp, &self.tls_acceptor, &self.password_hash).await?;
+        let mut accepted = tokio::time::timeout(std::time::Duration::from_secs(10), accept_server_connection(tcp, &self.tls_acceptor, &self.password_hash, self.authenticator.as_ref())).await.map_err(|_| fp_transport::Error::IO(fp_transport::link::denied("bond authentication timeout")))??;
         let bond_id = accepted.bond_id;
         let bond_total = accepted.bond_total;
         tracing::info!(%peer_addr, bond_total, "AnyTLS connection accepted");
+
+        // The hook has already verified this link. Primary proof confirmation
+        // can arrive before its transport task is scheduled to publish the group.
+        // Only proven secondaries wait here; unknown/pending groups fail in the hook.
+        if self.authenticator.is_some() && accepted.link_index != 0 {
+            tokio::time::timeout(self.config.bond_join_timeout, async {
+                loop {
+                    if accepted.link_session.as_ref().is_some_and(|s| !s.active()) {
+                        return Err(fp_transport::Error::IO(fp_transport::link::denied("revoked bond")));
+                    }
+                    if self.pending.read().await.get(&bond_id).and_then(|pb| pb.group.upgrade()).is_some() { return Ok(()); }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }).await.map_err(|_| fp_transport::Error::IO(fp_transport::link::denied("primary bond publication timeout")))??;
+        }
 
         // Determine primary vs secondary without holding the lock across awaits.
         // Primary = first connection with this bond_id; secondary = subsequent.
@@ -113,12 +133,18 @@ impl AnytlsAcceptor {
         // first-packet wait task and must flip the flag on success.
         let (is_primary, group, idx, promoted) = {
             let mut pending_w = self.pending.write().await;
+            pending_w.retain(|_, pb| pb.group.upgrade().is_some_and(|g| g.link_session.read().as_ref().is_none_or(|s| s.active())));
             if let Some(pb) = pending_w.get(&bond_id) {
-                let group = pb.group.clone();
+                let group = pb.group.upgrade().ok_or_else(|| fp_transport::Error::IO(fp_transport::link::denied("expired bond")))?;
+                if let Some(session) = &accepted.link_session
+                    && (!session.active() || !group.link_session.read().as_ref().is_some_and(|s| Arc::ptr_eq(s, session)))
+                { return Err(fp_transport::Error::IO(fp_transport::link::denied("bond session mismatch"))); }
                 let idx = pb.arrived.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 (false, group, idx, None)
             } else {
+                if self.authenticator.is_some() && accepted.link_index != 0 { return Err(fp_transport::Error::IO(fp_transport::link::denied("primary bond not ready"))); }
                 let group = BondGroup::new(bond_id);
+                *group.link_session.write() = accepted.link_session.clone();
                 // `promoted` is shared only between this connection's cleanup task and
                 // its first-packet task (clones below); it intentionally lives outside
                 // the `pending` map entry, which is just the join-window registry.
@@ -126,7 +152,7 @@ impl AnytlsAcceptor {
                 pending_w.insert(
                     bond_id,
                     PendingBond {
-                        group: group.clone(),
+                        group: Arc::downgrade(&group),
                         arrived: std::sync::atomic::AtomicU8::new(0),
                     },
                 );
@@ -162,7 +188,7 @@ impl AnytlsAcceptor {
 
         if !is_primary {
             tracing::info!(
-                arrived = idx + 2,
+                arrived = usize::from(idx) + 2,
                 expected = bond_total,
                 "Secondary bond connection joined"
             );
@@ -186,15 +212,18 @@ impl AnytlsAcceptor {
         let pending_cleanup = self.pending.clone();
         let join_timeout = self.config.bond_join_timeout;
         let promoted_for_cleanup = promoted.clone();
+        let authenticated = self.authenticator.is_some();
         tokio::spawn(async move {
-            tokio::time::sleep(join_timeout).await;
+            tokio::time::sleep(join_timeout)
+                .await;
+            if authenticated && promoted_for_cleanup.load(std::sync::atomic::Ordering::SeqCst) { return; }
             if let Some(evicted) = pending_cleanup.write().await.remove(&bond_id)
                 && !promoted_for_cleanup.load(std::sync::atomic::Ordering::SeqCst)
             {
                 // Half-formed bond that never received a first packet → reap it.
                 // `close()` is idempotent, so racing the first-packet task's own
                 // close() is harmless.
-                evicted.group.close();
+                if let Some(group) = evicted.group.upgrade() { group.close(); }
             }
         });
 

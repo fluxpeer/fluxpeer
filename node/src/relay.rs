@@ -1,6 +1,9 @@
 //! Relay transport: one connection multiplexed by pubkey, with failover.
 
 use std::net::SocketAddr;
+use fp_crypto::x25519::{StaticSecret, PublicKey};
+use fp_transport::link::LinkAuthenticator;
+use fluxpeer_relay_server::auth::ClientAuth;
 use std::time::Duration;
 
 use fluxpeer_relay_server::proto::Frame as RelayFrame;
@@ -29,10 +32,12 @@ impl RelayOut {
 
 /// Drive the relay protocol over a byte stream (TCP or AnyTLS): handshake, then
 /// spawn reader/writer tasks keyed by peer pubkey. Returns keyed channels.
-pub(crate) async fn connect_relay<S>(stream: S, own_pub: [u8; 32]) -> std::io::Result<(RelayIn, RelaySender)>
+pub(crate) async fn connect_relay<S>(mut stream: S, auth: &ClientAuth) -> std::io::Result<(RelayIn, RelaySender)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let identity = auth.client(&mut stream, [0; 16], 0).await?;
+    let own_pub = identity.peer();
     let (mut rd, mut wr) = tokio::io::split(stream);
     wr.write_all(
         &RelayFrame::ClientInfo {
@@ -54,7 +59,9 @@ where
             "relay ServerInfo frame too large",
         ));
     }
-    rd.read_exact(&mut vec![0u8; len]).await?;
+    let mut reply = hdr.to_vec(); reply.resize(5 + len, 0);
+    rd.read_exact(reply.get_mut(5..).ok_or_else(|| std::io::Error::other("invalid relay header"))?).await?;
+    validate_server_info(&reply)?;
 
     let (in_tx, in_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
     let (out_tx, mut out_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
@@ -63,6 +70,7 @@ where
     // keepalive (dead relay, even when idle), or the app dropping `out_tx` ends the
     // task, drops `in_tx`, and closes `in_rx` — the supervisor's failover signal.
     tokio::spawn(async move {
+        let _lease = fluxpeer_relay_server::auth::Lease(identity);
         let mut buf = Vec::new();
         let mut tmp = [0u8; 4096];
         let mut ka = tokio::time::interval(Duration::from_secs(3));
@@ -116,6 +124,8 @@ pub(crate) async fn connect_relay_bonded(
     mut receiver: Box<dyn TransportReceiver>,
     own_pub: [u8; 32],
 ) -> std::io::Result<(RelayIn, RelaySender)> {
+    let identity = sender.link_session().filter(|s| s.active() && s.peer() == own_pub)
+        .ok_or_else(|| fp_transport::link::denied("relay requires authenticated bond"))?;
     sender
         .send(
             RelayFrame::ClientInfo {
@@ -126,11 +136,11 @@ pub(crate) async fn connect_relay_bonded(
         )
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    // First reply is ServerInfo — read and discard.
-    receiver
+    let reply = receiver
         .recv()
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
+    validate_server_info(&reply)?;
 
     let (in_tx, in_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
     let (out_tx, mut out_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
@@ -138,6 +148,7 @@ pub(crate) async fn connect_relay_bonded(
     // `out_tx`, ends the task, drops `in_tx`, and closes `in_rx` — the supervisor's
     // failover signal. The bond handles keepalive/reconnect internally.
     tokio::spawn(async move {
+        let _lease = fluxpeer_relay_server::auth::Lease(identity);
         loop {
             tokio::select! {
                 out = out_rx.recv() => match out {
@@ -166,6 +177,13 @@ pub(crate) async fn connect_relay_bonded(
     Ok((in_rx, out_tx))
 }
 
+fn validate_server_info(bytes: &[u8]) -> std::io::Result<()> {
+    match RelayFrame::decode(bytes) {
+        Ok((RelayFrame::ServerInfo { protocol_version: RELAY_PROTOCOL_VERSION }, n)) if n == bytes.len() => Ok(()),
+        _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "expected relay ServerInfo version 2")),
+    }
+}
+
 /// One relay the node can connect to (from the directory or hand-written cfg).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RelayTarget {
@@ -176,11 +194,12 @@ pub(crate) struct RelayTarget {
     /// Links a bonded transport (anytls or tcp-bond) aggregates; None = default (3).
     pub(crate) bond_links: Option<usize>,
     pub(crate) node_id: String,
+    pub(crate) public_key: Option<[u8; 32]>,
 }
 
 /// Dial one relay (AnyTLS/443 or plain TCP) and run the framing handshake, with a
 /// timeout so a black-holed target can't stall failover.
-pub(crate) async fn dial_relay(t: &RelayTarget, own_pub: [u8; 32]) -> std::io::Result<(RelayIn, RelaySender)> {
+pub(crate) async fn dial_relay(t: &RelayTarget, own_priv: &StaticSecret) -> std::io::Result<(RelayIn, RelaySender)> {
     // The bond paths (anytls/443 and tcp-bond) establish N links + an N-way join
     // handshake, so they need a longer ceiling than a single plain-TCP connect
     // (default 10s join timeout). Keep the plain path snappy so a black-holed
@@ -190,6 +209,9 @@ pub(crate) async fn dial_relay(t: &RelayTarget, own_pub: [u8; 32]) -> std::io::R
     } else {
         Duration::from_secs(5)
     };
+    let relay_key = t.public_key.ok_or_else(|| fp_transport::link::denied("relay protocol v2 requires a pinned public_key"))?;
+    let auth = std::sync::Arc::new(ClientAuth::new(own_priv.clone(), relay_key));
+    let own_pub = PublicKey::from(own_priv).to_bytes();
     let connect = async {
         if t.anytls {
             // AnyTLS/443 over the bonded connector: N TLS yamux links aggregated
@@ -201,12 +223,12 @@ pub(crate) async fn dial_relay(t: &RelayTarget, own_pub: [u8; 32]) -> std::io::R
             }
             fp_transport_anytls::set_anytls_config(acfg);
             let (sender, receiver) =
-                <fp_transport_anytls::AnytlsConnector as fp_transport::Connector>::connect(fp_transport::Config {
+                fp_transport_anytls::AnytlsConnector::connect_authenticated(fp_transport::Config {
                     endpoint: t.addr.ip(),
                     port: t.addr.port(),
                     timeout: Duration::from_secs(10),
                     tls: None,
-                })
+                }, Some(auth.clone()))
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             connect_relay_bonded(sender, receiver, own_pub).await
@@ -218,12 +240,12 @@ pub(crate) async fn dial_relay(t: &RelayTarget, own_pub: [u8; 32]) -> std::io::R
                 });
             }
             let (sender, receiver) =
-                <fp_transport_tcp_bond::TcpBondConnector as fp_transport::Connector>::connect(fp_transport::Config {
+                fp_transport_tcp_bond::TcpBondConnector::connect_authenticated(fp_transport::Config {
                     endpoint: t.addr.ip(),
                     port: t.addr.port(),
                     timeout: Duration::from_secs(10),
                     tls: None,
-                })
+                }, Some(auth.clone()))
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             connect_relay_bonded(sender, receiver, own_pub).await
@@ -232,7 +254,7 @@ pub(crate) async fn dial_relay(t: &RelayTarget, own_pub: [u8; 32]) -> std::io::R
             // on the real interface, not loop into the VPN tun. No-op off mobile.
             let s = fp_transport::connect_tcp(t.addr).await?;
             s.set_nodelay(true).ok();
-            connect_relay(s, own_pub).await
+            connect_relay(s, &auth).await
         }
     };
     tokio::time::timeout(dial_timeout, connect)
@@ -246,7 +268,7 @@ pub(crate) async fn dial_relay(t: &RelayTarget, own_pub: [u8; 32]) -> std::io::R
 /// reconnects. Returns only when the app shuts down (its channels close).
 pub(crate) async fn relay_supervisor(
     mut targets: tokio::sync::watch::Receiver<Vec<RelayTarget>>,
-    own_pub: [u8; 32],
+    own_priv: StaticSecret,
     mut app_out_rx: mpsc::Receiver<([u8; 32], Vec<u8>)>,
     app_in_tx: mpsc::Sender<([u8; 32], Vec<u8>)>,
 ) {
@@ -265,7 +287,7 @@ pub(crate) async fn relay_supervisor(
             continue;
         };
         idx = idx.wrapping_add(1);
-        let (mut conn_in, conn_out) = match dial_relay(&t, own_pub).await {
+        let (mut conn_in, conn_out) = match dial_relay(&t, &own_priv).await {
             Ok(c) => {
                 let transport = if t.anytls {
                     "anytls/443"
@@ -329,6 +351,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let fixture = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            let _session = fluxpeer_relay_server::auth::ServerAuth::new(StaticSecret::from([123; 32])).plain(&mut stream).await.unwrap();
             let mut request = [0; 41];
             stream.read_exact(&mut request).await.unwrap();
             assert!(matches!(RelayFrame::decode(&request).unwrap().0, RelayFrame::ClientInfo { .. }));
@@ -339,14 +362,21 @@ mod tests {
         let (targets, updates) = tokio::sync::watch::channel(vec![]);
         let (app_out, outgoing) = mpsc::channel(8);
         let (incoming, mut app_in) = mpsc::channel(8);
-        let supervisor = tokio::spawn(relay_supervisor(updates, [1; 32], outgoing, incoming));
+        let supervisor = tokio::spawn(relay_supervisor(updates, StaticSecret::from([1; 32]), outgoing, incoming));
         tokio::task::yield_now().await;
         assert!(!supervisor.is_finished());
-        targets.send_replace(vec![RelayTarget { addr, anytls: false, bond: false, bond_links: None, node_id: "edge".into() }]);
+        targets.send_replace(vec![RelayTarget { addr, anytls: false, bond: false, bond_links: None, node_id: "edge".into(), public_key: Some(PublicKey::from(&StaticSecret::from([123; 32])).to_bytes()) }]);
         let received = tokio::time::timeout(Duration::from_secs(2), app_in.recv()).await.unwrap().unwrap();
         assert_eq!(received, ([3; 32], b"recovered".to_vec()));
         drop(app_out); drop(app_in);
         tokio::time::timeout(Duration::from_secs(2), supervisor).await.unwrap().unwrap();
         fixture.abort();
     }
+    #[test]
+    fn rejects_wrong_server_info_version_and_frame_kind() {
+        assert!(validate_server_info(&RelayFrame::ServerInfo { protocol_version: 1 }.encode()).is_err());
+        assert!(validate_server_info(&RelayFrame::Ping { data: [0; 8] }.encode()).is_err());
+        assert!(validate_server_info(&RelayFrame::ServerInfo { protocol_version: 2 }.encode()).is_ok());
+    }
+
 }

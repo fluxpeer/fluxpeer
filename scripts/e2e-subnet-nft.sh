@@ -56,13 +56,17 @@ sudo ip netns exec $NSC ping -c1 -W1 $INTRA >/dev/null 2>&1 && no "LAN reachable
 echo "===== control + relay ====="
 DATABASE_URL="sqlite://$D/db.sqlite?mode=rwc" FLUXPEER_CONTROL_ADDR=0.0.0.0:$CPORT FLUXPEER_ADMIN_PASSWORD=reg \
   nohup "$B" control >"$D/control.log" 2>&1 & sleep 2
-FLUXPEER_RELAY_ADDR=0.0.0.0:$RPORT_TCP FLUXPEER_RELAY_NODE_ID=fluxpeer-relay nohup "$B" relay >"$D/relay.log" 2>&1 & sleep 2
+RELAY_PUBLIC_KEY=$("$B" relay public-key --key-file "$D/relay/relay.key") || exit 1
+[[ "$RELAY_PUBLIC_KEY" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid relay public key" >&2; exit 1; }
+FLUXPEER_RELAY_KEY_FILE="$D/relay/relay.key" FLUXPEER_RELAY_ADDR=0.0.0.0:$RPORT_TCP FLUXPEER_RELAY_NODE_ID=fluxpeer-relay nohup "$B" relay >"$D/relay.log" 2>&1 & sleep 2
 curl -s $CTRL/health >/dev/null && ok "control up" || { no "control down"; echo "RESULTS: $pass/$fail"; exit 1; }
 export FLUXPEER_CONTROL_URL=$CTRL FLUXPEER_ADMIN_PASSWORD=reg
 
 echo "===== network + enroll router(E) + client(C) ====="
 "$B" ctl --server $CTRL network create subnet >/dev/null 2>&1
 NID=$("$B" ctl --server $CTRL network list 2>/dev/null | grep -oE 'net-[0-9]+' | head -1)
+"$B" ctl --server "$CTRL" relay add e2e "10.88.0.1:$RPORT_TCP" --network-id "$NID" \
+  --node-id fluxpeer-relay --public-key "$RELAY_PUBLIC_KEY" >/dev/null || exit 1
 mktok(){ local c; c=$("$B" ctl --server $CTRL invite create "$NID" 2>/dev/null | grep -oE '[0-9a-f]{32}' | head -1)
   python3 -c "import json,base64;print('fp://join/'+base64.urlsafe_b64encode(json.dumps({'ctrl':'$CTRL','code':'$c'}).encode()).decode().rstrip('='))"; }
 "$B" join "$(mktok)" --out "$D/cfg/E.json" --no-run --name router 2>&1 | grep -q enrolled && ok "router enrolled" || no "router enroll"

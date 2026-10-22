@@ -21,7 +21,7 @@ async fn main() {
     println!("Testing full bond ({} connections) to {addr} ...", cfg.bond_connections);
     match tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        fp_transport_anytls::bond::build_client_bond(&cfg, addr, &tls_connector),
+        fp_transport_anytls::bond::build_client_bond(&cfg, addr, &tls_connector, None),
     )
     .await
     {

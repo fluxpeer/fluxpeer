@@ -899,6 +899,7 @@ dependencies = [
  "fluxpeer-control-server",
  "fluxpeer-node",
  "fluxpeer-relay-server",
+ "tempfile",
  "tokio",
  "tracing-subscriber",
 ]
@@ -984,15 +985,26 @@ dependencies = [
 name = "fluxpeer-relay-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "blake2",
+ "fp-crypto",
  "fp-disco",
  "fp-transport",
  "fp-transport-anytls",
  "fp-transport-tcp-bond",
+ "getrandom 0.2.17",
+ "hex",
+ "hmac",
+ "libc",
  "parking_lot",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

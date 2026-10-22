@@ -11,10 +11,12 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::relay::RelayOut;
-use crate::util::{T_DATA, T_HANDSHAKE_RESP, auth_disco_dgram, disco_shared, disco_tx_id, le_u32};
+use crate::util::{T_DATA, T_HANDSHAKE_RESP, auth_disco_dgram, disco_shared, le_u32};
 
 /// Per-peer wg session + path state.
 pub(crate) struct Peer {
+    pub(crate) probes: parking_lot::Mutex<crate::disco::Probes>,
+    pub(crate) disco_routes: crate::disco::Routes,
     pub(crate) pubkey: [u8; 32],
     /// Per-peer disco MAC key = static-static DH(own_priv, peer_pubkey), cached so
     /// every disco ping/pong to/from this peer is authenticated without re-deriving.
@@ -84,6 +86,10 @@ pub(crate) struct Peer {
     pub(crate) stat: Arc<crate::status::PeerStat>,
 }
 
+impl Drop for Peer {
+    fn drop(&mut self) { self.disco_routes.lock().retain(|_, (peer, _)| *peer != self.pubkey); }
+}
+
 impl Peer {
     /// A fresh peer with no session yet, ready to handshake. `force_relay` skips the
     /// direct path entirely (relay-only). Shared by the initial setup and the live
@@ -96,6 +102,8 @@ impl Peer {
         own_priv: &StaticSecret,
     ) -> Self {
         Peer {
+            probes: parking_lot::Mutex::default(),
+            disco_routes: Default::default(),
             pubkey,
             disco_key: disco_shared(own_priv, &pubkey),
             direct_addr: if force_relay { None } else { candidates.first().copied() },
@@ -138,14 +146,14 @@ impl Peer {
     /// Build an authenticated disco Ping toward this peer (a hole-punch probe),
     /// MAC'd with the per-peer DH key + a fresh timestamped tx_id so the peer can
     /// trust the path hint and reject replays.
-    pub(crate) fn disco_ping(&self, own_pub: &[u8; 32]) -> Vec<u8> {
-        auth_disco_dgram(
-            &self.disco_key,
-            &Disco::Ping {
-                tx_id: disco_tx_id(),
-                sender: *own_pub,
-            },
-        )
+    pub(crate) fn disco_ping(&self, own_pub: &[u8; 32]) -> Option<Vec<u8>> {
+        let mut targets = self.candidates.clone();
+        if let Some(addr) = self.direct_addr && !targets.contains(&addr) { targets.push(addr); }
+        self.disco_ping_to(own_pub, targets)
+    }
+    pub(crate) fn disco_ping_to(&self, own_pub: &[u8; 32], targets: Vec<SocketAddr>) -> Option<Vec<u8>> {
+        let tx_id = self.probes.lock().start(self.pubkey, targets, &self.disco_routes, crate::disco::now())?;
+        Some(auth_disco_dgram(&self.disco_key, &Disco::Ping { tx_id, sender: *own_pub }))
     }
 
     /// Fold a fresh RTT sample (init→resp) into the smoothed estimate.

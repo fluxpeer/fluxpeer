@@ -9,7 +9,6 @@ use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -18,41 +17,12 @@ type ClientYamuxConn = yamux::Connection<tokio_util::compat::Compat<TcpStream>>;
 type ServerYamuxConn = yamux::Connection<tokio_util::compat::Compat<TcpStream>>;
 
 // -- Bond header --
-const BOND_HEADER_LEN: usize = 18;
-const BOND_VERSION: u8 = 1;
 
 pub fn generate_bond_id() -> [u8; 16] {
     use rand::RngCore;
     let mut id = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut id);
     id
-}
-
-async fn write_bond_header<W: AsyncWriteExt + Unpin>(
-    w: &mut W,
-    bond_id: &[u8; 16],
-    total: u8,
-) -> Result<(), std::io::Error> {
-    let mut buf = [0u8; BOND_HEADER_LEN];
-    buf[0] = BOND_VERSION;
-    buf[1..17].copy_from_slice(bond_id);
-    buf[17] = total;
-    w.write_all(&buf).await?;
-    w.flush().await
-}
-
-async fn read_bond_header<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<([u8; 16], u8), std::io::Error> {
-    let mut buf = [0u8; BOND_HEADER_LEN];
-    r.read_exact(&mut buf).await?;
-    if buf[0] != BOND_VERSION {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("unsupported bond version: {}", buf[0]),
-        ));
-    }
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&buf[1..17]);
-    Ok((id, buf[17]))
 }
 
 // -- Channel-based yamux driver --
@@ -106,6 +76,7 @@ fn spawn_yamux_driver(
 
 /// Client-side TCP+yamux connection
 pub struct ManagedConnection {
+    pub link_session: Option<fp_transport::link::Session>,
     pub id: usize,
     pub health: Arc<ConnHealth>,
     open_tx: tokio::sync::mpsc::Sender<OpenStreamReq>,
@@ -118,6 +89,8 @@ pub struct AcceptedConnection {
     pub yamux_conn: ServerYamuxConn,
     pub bond_id: [u8; 16],
     pub bond_total: u8,
+    pub link_index: u32,
+    pub link_session: Option<fp_transport::link::Session>,
     pub peer_addr: SocketAddr,
 }
 
@@ -128,11 +101,12 @@ impl AcceptedConnection {
 }
 
 impl ManagedConnection {
-    pub async fn connect(
+    pub async fn connect_authenticated(
         id: usize,
         addr: SocketAddr,
         config: &TcpBondConfig,
         bond_id: &[u8; 16],
+        authenticator: Option<fp_transport::link::Authenticator>,
     ) -> Result<Self, fp_transport::Error> {
         let health = Arc::new(ConnHealth::new(config));
         let total = config.effective_bond_connections() as u8;
@@ -154,9 +128,13 @@ impl ManagedConnection {
         let mut tcp = TcpStream::from_std(std_tcp).map_err(fp_transport::Error::IO)?;
 
         // Write bond header directly on raw TCP
-        write_bond_header(&mut tcp, bond_id, total)
+        fp_transport::link::write_header(&mut tcp, bond_id, total, id, authenticator.is_some())
             .await
             .map_err(fp_transport::Error::IO)?;
+
+        let link_session = if let Some(auth) = &authenticator {
+            Some(auth.client(&mut tcp, *bond_id, u32::try_from(id).map_err(|_| fp_transport::Error::IO(fp_transport::link::denied("link index exhausted")))?).await.map_err(fp_transport::Error::IO)?)
+        } else { None };
 
         let compat_stream = tcp.compat();
         let yamux_conn = yamux::Connection::new(compat_stream, yamux::Config::default(), yamux::Mode::Client);
@@ -171,6 +149,7 @@ impl ManagedConnection {
             health,
             open_tx,
             _driver: driver,
+            link_session,
         })
     }
 
@@ -213,11 +192,12 @@ impl ManagedConnection {
     }
 }
 
-pub async fn accept_server_connection(mut tcp: TcpStream) -> Result<AcceptedConnection, fp_transport::Error> {
+pub async fn accept_server_connection(mut tcp: TcpStream, authenticator: Option<&fp_transport::link::Authenticator>) -> Result<AcceptedConnection, fp_transport::Error> {
     let peer_addr = tcp.peer_addr().map_err(fp_transport::Error::IO)?;
     tcp.set_nodelay(true).map_err(fp_transport::Error::IO)?;
 
-    let (bond_id, bond_total) = read_bond_header(&mut tcp).await.map_err(fp_transport::Error::IO)?;
+    let (bond_id, bond_total, link_index) = fp_transport::link::read_header(&mut tcp, authenticator.is_some()).await.map_err(fp_transport::Error::IO)?;
+    let link_session = if let Some(auth) = authenticator { Some(auth.server(&mut tcp, bond_id, link_index).await.map_err(fp_transport::Error::IO)?) } else { None };
 
     let compat_stream = tcp.compat();
     let yamux_conn = yamux::Connection::new(compat_stream, yamux::Config::default(), yamux::Mode::Server);
@@ -226,6 +206,8 @@ pub async fn accept_server_connection(mut tcp: TcpStream) -> Result<AcceptedConn
         yamux_conn,
         bond_id,
         bond_total,
+        link_index,
+        link_session,
         peer_addr,
     })
 }
