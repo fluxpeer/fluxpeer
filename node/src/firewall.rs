@@ -5,6 +5,7 @@ use crate::apply::{self, ApplyError, Result};
 
 #[cfg(any(target_os = "linux", test))]
 mod forwarding;
+pub(crate) mod client;
 
 pub trait Firewall: Send + Sync {
     fn name(&self) -> &'static str;
@@ -288,7 +289,16 @@ fn iptables_killswitch_on(runner: &mut impl apply::Runner, bin: &str, phys: &str
         iptables_ensure_with(runner, bin, &[], "-A", &[&chain, "-i", interface, "-m", "comment", "--comment", &tag, "-j", "RETURN"])?;
     }
     iptables_ensure_with(runner, bin, &[], "-A", &[&chain, "-m", "comment", "--comment", &tag, "-j", "DROP"])?;
-    iptables_ensure_with(runner, bin, &[], "-A", &["FORWARD", "-o", phys, "-m", "comment", "--comment", &tag, "-j", &chain])
+    let jump = ["FORWARD", "-o", phys, "-m", "comment", "--comment", &tag, "-j", &chain];
+    let rules = iptables_run(runner, &[bin, "-S", "FORWARD"])?;
+    let leading = rules.lines().filter(|line| line.starts_with("-A "))
+        .take_while(|line| line.contains("-j FPKS_"))
+        .any(|line| line.split_whitespace().skip(1).map(|part| part.trim_matches('"')).eq(jump));
+    if !leading {
+        let mut args = vec![bin, "-I"]; args.extend(jump);
+        iptables_run(runner, &args)?;
+    }
+    Ok(())
 }
 
 /// Read the actual owned rules so crash cleanup does not depend on the old
@@ -500,33 +510,28 @@ fn nft_with(runner: &mut impl apply::Runner, op: Operation, phys: &str, tun: &st
             runner.run(&["nft", "-f", "-"], Some(&script))?;
         }
         Operation::Down => {
-            match runner.run(&["nft", "delete", "table", "inet", id], None) {
-                Err(e) if !permission_denied(&e) && e.exit_code.is_some() && e.missing() => {}
-                result => { result?; }
-            }
+            let guard = format!("{id}_forward_guard");
+            apply::all([id, guard.as_str()].into_iter().map(|table| {
+                match runner.run(&["nft", "delete", "table", "inet", table], None) {
+                    Err(e) if !permission_denied(&e) && e.exit_code.is_some() && e.missing() => Ok(()),
+                    result => result.map(|_| ()),
+                }
+            }))?;
         }
         Operation::KillswitchOn | Operation::KillswitchOff => {
-            if matches!(op, Operation::KillswitchOn) {
-                runner.run(&["nft", "add", "table", "inet", id], None)?;
-                runner.run(&["nft", "add", "chain", "inet", id, "forward", "{", "type", "filter", "hook", "forward", "priority", "filter", ";", "policy", "accept", ";", "}"], None)?;
-            }
-            let command = ["nft", "-j", "-a", "list", "chain", "inet", id, "forward"];
-            let rules = match nft_json(runner, &command) {
-                Err(e) if !permission_denied(&e) && e.exit_code.is_some() && e.missing() => return Ok(()),
-                result => result?,
-            };
-            let tag = format!("{id}:killswitch");
-            let items = rules.get("nftables").and_then(|v| v.as_array()).ok_or_else(|| ApplyError::new(&command, "missing nftables array"))?;
-            for rule in items.iter().filter_map(|v| v.get("rule")) {
-                if rule.get("comment").and_then(|v| v.as_str()) == Some(tag.as_str()) {
-                    let handle = rule.get("handle").and_then(|v| v.as_u64()).ok_or_else(|| ApplyError::new(&command, "missing rule handle"))?.to_string();
-                    runner.run(&["nft", "delete", "rule", "inet", id, "forward", "handle", &handle], None)?;
+            // NAT Up atomically replaces only the NAT/forwarding table. Keep
+            // protection in its own table so an Up cannot silently remove it.
+            let table = format!("{id}_forward_guard");
+            if matches!(op, Operation::KillswitchOff) {
+                match runner.run(&["nft", "delete", "table", "inet", &table], None) {
+                    Err(e) if !permission_denied(&e) && e.exit_code.is_some() && e.missing() => {},
+                    result => { result?; },
                 }
-            }
-            if matches!(op, Operation::KillswitchOn) {
+            } else {
                 let phys = serde_json::to_string(phys).map_err(|e| ApplyError::new(&["nft"], e.to_string()))?;
                 let tun = serde_json::to_string(tun).map_err(|e| ApplyError::new(&["nft"], e.to_string()))?;
-                runner.run(&["nft", "add", "rule", "inet", id, "forward", "oifname", &phys, "iifname", "!=", "\"fp*\"", "iifname", "!=", &tun, "drop", "comment", &format!("\"{tag}\"")], None)?;
+                let script = format!("add table inet {table}\ndelete table inet {table}\ntable inet {table} {{ chain forward {{ type filter hook forward priority -150; policy accept; oifname {phys} iifname != \"fp*\" iifname != {tun} drop; }} }}\n");
+                runner.run(&["nft", "-f", "-"], Some(&script))?;
             }
         }
     }
@@ -1015,11 +1020,15 @@ mod tests {
                 vec![chain, "-i", "fp+", "-m", "comment", "--comment", &tag, "-j", "RETURN"],
                 vec![chain, "-i", "custom0", "-m", "comment", "--comment", &tag, "-j", "RETURN"],
                 vec![chain, "-m", "comment", "--comment", &tag, "-j", "DROP"],
-                vec!["FORWARD", "-o", "wan0", "-m", "comment", "--comment", &tag, "-j", chain],
             ] {
                 replies.extend([Err(error(Some(1), "Bad rule")), Ok(String::new())]);
                 for op in ["-C", "-A"] { expected.push([vec![bin, "-w", "10", op], rule.clone()].concat()); }
             }
+            let jump = vec!["FORWARD", "-o", "wan0", "-m", "comment", "--comment", &tag, "-j", chain];
+            // An existing jump below Docker must be promoted, not just found by -C.
+            replies.extend([Ok(format!("-A FORWARD -j DOCKER-USER\n-A {}", jump.join(" "))), Ok(String::new())]);
+            expected.push(vec![bin, "-w", "10", "-S", "FORWARD"]);
+            expected.push([vec![bin, "-w", "10", "-I"], jump].concat());
             let mut runner = Scripted::new(replies);
             iptables_killswitch_on(&mut runner, bin, "wan0", "custom0", &id).unwrap();
             assert_eq!(runner.commands, expected);
@@ -1027,13 +1036,19 @@ mod tests {
     }
 
     #[test]
-    fn nft_killswitch_exempts_fp_namespace_and_down_removes_its_table() {
+    fn nft_up_preserves_killswitch_and_down_removes_only_its_instance() {
+        let mut host = Host::default();
         let id = instance("custom0").unwrap();
-        let mut runner = Scripted::new(vec![Ok(String::new()), Ok(String::new()), Ok(r#"{"nftables":[]}"#.into()), Ok(String::new()), Ok(String::new())]);
-        nft_with(&mut runner, Operation::KillswitchOn, "wan0", "custom0", &id, "100.72.0.0/24").unwrap();
-        assert_eq!(runner.commands[3], ["nft", "add", "rule", "inet", &id, "forward", "oifname", "\"wan0\"", "iifname", "!=", "\"fp*\"", "iifname", "!=", "\"custom0\"", "drop", "comment", &format!("\"{id}:killswitch\"")]);
-        nft_with(&mut runner, Operation::Down, "wan0", "custom0", &id, "100.72.0.0/24").unwrap();
-        assert_eq!(runner.commands[4], ["nft", "delete", "table", "inet", &id]);
+        let guard = format!("{id}_forward_guard");
+        nft_with(&mut host, Operation::KillswitchOn, "wan0", "custom0", &id, "").unwrap();
+        let original = host.tables[&guard].clone();
+        assert!(original.contains("iifname != \"fp*\" iifname != \"custom0\" drop"));
+        nft_with(&mut host, Operation::Up, "wan0", "custom0", &id, "100.72.0.0/24").unwrap();
+        assert_eq!(host.tables[&guard], original);
+        host.tables.insert("foreign".into(), "keep".into());
+        nft_with(&mut host, Operation::Down, "wan0", "custom0", &id, "").unwrap();
+        assert_eq!(host.tables.len(), 1);
+        assert_eq!(host.tables["foreign"], "keep");
     }
 
     #[test]

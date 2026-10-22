@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 
 mod apply;
 mod bypass;
+mod carriers;
 mod config;
 mod control;
 pub mod mobile;
@@ -67,17 +68,17 @@ type AllowedMap = Arc<arc_swap::ArcSwap<worker::RouteTable>>;
 /// Directory failures must not hold usable local relay/direct connectivity
 /// hostage. Only forced mode without a usable target blocks bootstrap.
 fn relay_candidates(cfg: &Config, directory: &[control::RelayDir]) -> Vec<RelayTarget> {
-    if let Some(addr) = cfg.relay.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()) {
-        let public_key = match cfg.relay_public_key.as_deref() {
-            Some(key) => hex32(key).ok(),
-            None => directory.iter().find(|d| d.addresses.contains(&addr)).and_then(|d| d.public_key),
-        };
-        if public_key.is_none() {
-            tracing::warn!(%addr, "relay protocol v2 requires a valid relay_public_key or matching directory key");
-            return Vec::new();
-        }
-        return vec![RelayTarget { addr, anytls: cfg.relay_anytls, bond: cfg.relay_bond, bond_links: cfg.relay_bond_links,
-            public_key, node_id: cfg.relay_node_id.clone().unwrap_or_else(|| "fluxpeer-relay".into()) }];
+    let explicit = if cfg.resolved_relay.is_empty() { cfg.relay.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()).into_iter().collect::<Vec<_>>() } else { cfg.resolved_relay.clone() };
+    if !explicit.is_empty() {
+        return explicit.into_iter().filter_map(|addr| {
+            let public_key = match cfg.relay_public_key.as_deref() {
+                Some(key) => hex32(key).ok(),
+                None => directory.iter().find(|entry| entry.addresses.contains(&addr)).and_then(|entry| entry.public_key),
+            };
+            if public_key.is_none() { tracing::warn!(%addr, "relay protocol v2 requires a valid relay_public_key or matching directory key"); return None; }
+            Some(RelayTarget { addr, anytls: cfg.relay_anytls, bond: cfg.relay_bond, bond_links: cfg.relay_bond_links,
+                public_key, node_id: cfg.relay_node_id.clone().unwrap_or_else(|| "fluxpeer-relay".into()) })
+        }).collect();
     }
     directory.iter().filter(|d| d.public_key.is_some()).filter(|d| control::relay_transport_matches(cfg.force_relay, d.anytls, cfg.relay_anytls, cfg.relay_bond))
         .flat_map(|d| d.addresses.iter().map(|&addr| RelayTarget { addr, anytls: d.anytls, bond: cfg.relay_bond,
@@ -90,6 +91,11 @@ where F: FnMut() -> Fut, Fut: std::future::Future<Output = std::io::Result<Vec<c
         let (directory, retry) = match fetch().await {
             Ok(directory) => { let empty = directory.is_empty(); (directory, empty) },
             Err(error) if control::terminal_control_error(&error) => return Err(error),
+            Err(error) if cfg.carrier_cache.is_some() => {
+                statusd::record_failure(&cfg.tun_name, &error)?;
+                tracing::warn!(%error, "protected carrier bootstrap blocked; retrying with backoff");
+                backoff.wait().await; continue;
+            }
             Err(error) => {
                 tracing::warn!(%error, "relay directory unavailable; preserving configured relay or direct connectivity");
                 (Vec::new(), true)
@@ -100,6 +106,26 @@ where F: FnMut() -> Fut, Fut: std::future::Future<Output = std::io::Result<Vec<c
         tracing::warn!("forced relay transport unavailable; retrying directory");
         backoff.wait().await;
     }
+}
+/// All directory DNS must complete before first-use OUTPUT installation. A
+/// retained cache is already locked and restored before this function is called.
+async fn bootstrap_carriers_with<F, Fut, I, Installed>(cfg: &Config, fetch: F, install: I)
+    -> std::io::Result<(Vec<control::RelayDir>, Vec<RelayTarget>, bool)>
+where F: FnMut() -> Fut, Fut: std::future::Future<Output = std::io::Result<Vec<control::RelayDir>>>,
+      I: FnOnce(Vec<String>) -> Installed, Installed: std::future::Future<Output = std::io::Result<()>> {
+    let result = bootstrap_directory_with(cfg, fetch).await?;
+    if let Some(cache) = &cfg.carrier_cache {
+        let mut ips = cache.addresses();
+        if let Some(dns) = &cfg.carrier_dns { ips.extend(dns.addresses.read().iter().map(ToString::to_string)); }
+        ips.extend(result.1.iter().map(|target| target.addr.ip().to_string()));
+        ips.extend(result.0.iter().flat_map(|entry| &entry.addresses).map(|addr| addr.ip().to_string()));
+        ips.extend(result.0.iter().filter_map(|entry| entry.stun).map(|addr| addr.ip().to_string()));
+        ips.extend(cfg.resolved_stun.map(|addr| addr.ip().to_string()));
+        ips.sort(); ips.dedup();
+        install(ips).await?;
+        cache.arm();
+    }
+    Ok(result)
 }
 struct DirectoryRefresh {
     config: Config,
@@ -116,7 +142,7 @@ impl DirectoryRefresh {
     async fn refresh_stun(&self, entries: &[control::RelayDir]) -> std::io::Result<()> {
         if !self.config.advertise.is_empty() { return Ok(()); }
         let Some((udp, replies, advertised)) = &self.stun else { return Ok(()); };
-        let server = self.config.stun_server.as_deref().and_then(|s| s.parse().ok()).or_else(|| entries.iter().find_map(|entry| entry.stun));
+        let server = self.config.resolved_stun.or_else(|| self.config.stun_server.as_deref().and_then(|s| s.parse().ok())).or_else(|| entries.iter().find_map(|entry| entry.stun));
         let Some(server) = server else { return Ok(()); };
         let Some(observed) = replies.query(udp, server).await else {
             tracing::warn!(%server, "refreshed STUN query did not yield a reflexive endpoint"); return Ok(());
@@ -168,6 +194,9 @@ struct HostEffects {
     own_cidr: String,
     control_host: String,
     relay_ips: parking_lot::Mutex<Vec<String>>,
+    kill_switch: Option<Arc<parking_lot::Mutex<firewall::client::Guard>>>,
+    carrier_dns: Option<Arc<control::CarrierDns>>,
+    carrier_cache: Option<Arc<carriers::Cache>>,
     exclude_routes: Vec<String>,
     dns_override: parking_lot::Mutex<Vec<String>>,
     local_dns: Vec<String>,
@@ -242,6 +271,7 @@ impl HostEffects {
 
     fn retire(&self, epoch: u64, selected: Option<[u8; 32]>) -> ApplyResult {
         if !self.manage_host_routes || self.exit_state.lock().as_ref().is_none_or(|s| Some(s.exit_peer) == selected && !s.teardown_started.load(std::sync::atomic::Ordering::Relaxed)) { return Ok(()); }
+        if let Some(cache) = &self.carrier_cache { cache.exit_ready(false); }
         let mut runtime = self.runtime.lock();
         runtime.retire_retry.run(epoch, Instant::now(), || self.effect(HostStage::Retire, || retire_exit(&self.exit_state, &self.shutdown, selected)))
     }
@@ -262,6 +292,7 @@ impl HostEffects {
     }
 
     async fn apply(self: &Arc<Self>, epoch: u64, peers: Vec<control::PeerInfo>, self_exit: bool, retain: bool) -> ApplyResult {
+        self.guard_carriers(&peers, retain).await?;
         let bypass = self.prepare_bypass(epoch, &peers, |host| async move {
             tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host.as_str(), 0))).await
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "bypass DNS timeout"))?
@@ -275,8 +306,39 @@ impl HostEffects {
     where F: Fn(String) -> Fut, Fut: std::future::Future<Output = std::io::Result<Vec<std::net::IpAddr>>> {
         if !self.manage_host_routes || *self.shutdown.lock() || (selected_exit(peers).is_none() && self.exit_state.lock().is_none()) { return Ok(Vec::new()); }
         // Re-resolve every cycle, even when the selected exit and epoch are unchanged.
-        let candidates = exit_bypass_candidates(&self.control_host, &self.relay_ips.lock(), peers, &self.exclude_routes);
-        resolve_bypass_candidates(candidates, resolve).await
+        let mut candidates = exit_bypass_candidates(if self.carrier_dns.is_some() { "" } else { &self.control_host }, &self.relay_ips.lock(), peers, &self.exclude_routes);
+        if let Some(dns) = &self.carrier_dns { candidates.extend(dns.addresses.read().iter().map(ToString::to_string)); }
+        if let Some(cache) = &self.carrier_cache {
+            resolve_bypass_candidates(candidates, |host| { let cache = cache.clone(); async move { cache.resolve(&host).await } }).await
+        } else { resolve_bypass_candidates(candidates, resolve).await }
+    }
+
+    async fn guard_carriers(self: &Arc<Self>, peers: &[control::PeerInfo], retain: bool) -> ApplyResult {
+        let Some(guard) = self.kill_switch.clone() else { return Ok(()); };
+        let dns = self.carrier_dns.clone().ok_or_else(|| ApplyError::new(&["kill-switch"], "missing control carrier resolver"))?;
+        let cache = self.carrier_cache.clone().ok_or_else(|| ApplyError::new(&["kill-switch"], "missing carrier cache"))?;
+        let resolved = cache.resolve(&dns.host).await;
+        // User split exclusions are not carrier exceptions to the kill-switch.
+        let mut ips = exit_bypass_candidates("", &self.relay_ips.lock(), peers, &[]);
+        let host = self.clone();
+        apply::blocking(move || {
+            let mut runtime = host.runtime.lock();
+            let stopped = host.shutdown.lock();
+            if *stopped { return Ok(()); }
+            let mut guard = guard.lock();
+            match resolved {
+                Ok(control) => {
+                    ips.extend(control.iter().map(ToString::to_string)); ips.sort(); ips.dedup();
+                    // Permit new carriers and their physical routes before any
+                    // HTTP client starts using the refreshed DNS pins.
+                    guard.sync(&host.tun_name, &ips, true)?;
+                    if host.manage_host_routes { runtime.bypass.sync(&ips, true)?; }
+                    *dns.addresses.write() = control;
+                    guard.sync(&host.tun_name, &ips, retain)
+                },
+                Err(error) => apply::all([guard.check(&host.tun_name), Err(error.into())]),
+            }
+        }).await
     }
 
     fn sync_bypass(&self, bypass: &[String], retain: bool) -> ApplyResult {
@@ -661,15 +723,32 @@ impl Reconciler {
     }
 
     async fn reconcile_tick(&mut self) -> ApplyResult {
+        if let Some(cache) = &self.host.carrier_cache {
+            cache.begin_refresh();
+            let runtime = self.host.runtime.lock();
+            let exit = self.host.exit_state.lock();
+            let ready = exit.as_ref().is_some_and(|exit| selected_exit(&self.desired) == Some(exit.exit_peer)
+                && !exit.teardown_started.load(std::sync::atomic::Ordering::Relaxed)
+                && self.status_reg.read().get(&exit.exit_peer).is_some_and(|stat| {
+                    let handshake = stat.last_handshake_unix.load(std::sync::atomic::Ordering::Relaxed);
+                    handshake > 0 && status::now_unix().saturating_sub(handshake) <= 180
+                        && stat.transport.load(std::sync::atomic::Ordering::Relaxed) != status::T_NONE
+                })) && runtime.dns_full_tunnel && !runtime.dns.dirty && runtime.dns.applied.is_some();
+            cache.exit_ready(ready);
+        }
         let mut control_result = Ok(());
         let applied_epoch = self.apply_status.lock().applied_epoch;
         match control::poll_peers_if_changed(&self.client, &self.device_id, applied_epoch).await {
             Ok(Some(snap)) => {
+                if let (Some(cache), Some(dns)) = (&self.host.carrier_cache, &self.host.carrier_dns) { cache.connected(dns.addresses.read().clone()); }
                 control_result = self.refresh_directory(&snap.platform).await;
                 self.pending = Some(snap);
             }
             Ok(None) => {},
             Err(error) => {
+                let error = match (&self.host.carrier_cache, &self.host.carrier_dns) {
+                    (Some(cache), Some(dns)) => cache.network_error(&dns.host, error), _ => error,
+                };
                 let failure = ApplyError::new(&["control", "device-config"], error.to_string());
                 if control::terminal_control_error(&error) {
                     self.terminal_control = Some(error);
@@ -699,12 +778,15 @@ impl Reconciler {
         if changed && !status.restart_required { tracing::warn!(?desired_mtu, "MTU changed; interface restart required"); }
         status.restart_required = changed;
         let mtu_result = if changed { Err(ApplyError::new(&["MTU", "restart-required"], "MTU changed; restart the interface to apply it")) } else { Ok(()) };
-        apply::all([effects, control_result, mtu_result])
+        let carrier_result = self.host.carrier_cache.as_ref().and_then(|cache| cache.diagnostic())
+            .map_or(Ok(()), |error| Err(ApplyError::new(&["kill-switch", "DNS"], error)));
+        apply::all([effects, control_result, mtu_result, carrier_result])
     }
 
     async fn refresh_directory(&mut self, snapshot: &serde_json::Value) -> ApplyResult {
         let Some(directory) = self.directory.as_mut() else { return Ok(()); };
-        let entries = control::snapshot_relays(snapshot).await
+        refresh_explicit_carriers(&mut directory.config).await.map_err(ApplyError::from)?;
+        let entries = control::directory_for(snapshot, directory.config.carrier_cache.as_ref()).await
             .map_err(|error| ApplyError::new(&["control", "relay-directory"], error.to_string()))?;
         if entries != directory.entries {
             directory.entries = entries.clone();
@@ -714,6 +796,7 @@ impl Reconciler {
         // Retain published dialer addresses until the new targets are applied.
         let mut ips: Vec<_> = entries.iter().flat_map(|r| &r.addresses).map(|a| a.ip().to_string()).collect();
         ips.extend(entries.iter().filter_map(|entry| entry.stun).map(|a| a.ip().to_string()));
+        ips.extend(directory.config.resolved_stun.map(|a| a.ip().to_string()));
         ips.extend(targets.iter().chain(directory.targets.borrow().iter()).map(|t| t.addr.ip().to_string()));
         ips.sort(); ips.dedup();
         *self.host.relay_ips.lock() = ips;
@@ -756,6 +839,8 @@ impl Reconciler {
                     Err(error) => Err(ApplyError::new(&["bypass", "resolve"], error.to_string())),
                 }
             };
+            let guard = self.host.guard_carriers(&desired, true).await;
+            let carriers = apply::all([guard, carriers]);
             let ready = carriers.is_ok();
             let mut errors = vec![retirement, carriers];
             let mut changes = Vec::new();
@@ -918,7 +1003,10 @@ pub async fn run(cfg_path: &str) -> std::io::Result<()> {
     let cfg: Config = serde_json::from_slice(&std::fs::read(cfg_path)?)?;
     if !daemon::valid_iface(&cfg.tun_name) { return Err(std::io::Error::other("invalid interface name")); }
     let iface = cfg.tun_name.clone();
-    let result = run_with(cfg, None, None).await;
+    let result = match firewall::client::ensure_exclusive_at(std::path::Path::new(carriers::ROOT), &iface) {
+        Ok(()) => run_with(cfg, None, None).await,
+        Err(error) => Err(error),
+    };
     if let Err(error) = &result
         && let Err(write_error) = statusd::record_failure(&iface, error)
     { tracing::error!(%write_error, "failed to persist stopped member status"); }
@@ -952,13 +1040,91 @@ pub async fn run_embedded_with_routes(cfg_json: &str, tun_fd: i32, protect: Opti
     run_with(cfg, protect, routes).await
 }
 
-async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile::RoutesFn>) -> std::io::Result<()> {
+async fn refresh_explicit_carriers(cfg: &mut Config) -> std::io::Result<()> {
+    let Some(cache) = &cfg.carrier_cache else { return Ok(()); };
+    if let Some(relay) = &cfg.relay { cfg.resolved_relay = cache.endpoint(relay).await?; }
+    if let Some(stun) = &cfg.stun_server { cfg.resolved_stun = cache.endpoint(stun).await?.into_iter().find(SocketAddr::is_ipv4); }
+    Ok(())
+}
+
+async fn start_client_guard(cfg: &mut Config, shutdown: &Shutdown) -> std::io::Result<Option<Arc<parking_lot::Mutex<firewall::client::Guard>>>> {
+    let active = firewall::client::requested(cfg.kill_switch, cfg.use_exit.as_deref());
+    firewall::client::supported(active)?;
+    let tun = cfg.tun_name.clone();
+    if !active {
+        apply::blocking(move || firewall::client::clear(&tun)).await?;
+        return Ok(None);
+    }
+    if cfg.tun_fd.is_some() { return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "client kill-switch requires an engine-owned host interface")); }
+    let retained = firewall::client::retained(&tun)?;
+    let cache = carriers::Cache::open(std::path::Path::new(carriers::ROOT), &tun, retained)?;
+    let guard = Arc::new(parking_lot::Mutex::new(firewall::client::Guard::default()));
+    if retained {
+        let starting = guard.clone(); let ips = cache.addresses(); let iface = tun.clone(); let gate = shutdown.clone();
+        apply::blocking(move || { let stopped = gate.lock(); if !*stopped { starting.lock().sync(&iface, &ips, true)?; } Ok(()) }).await?;
+    }
+    cfg.carrier_cache = Some(cache.clone());
+    let control = url_host(&cfg.control_server)?;
+    let mut backoff = mobile::Backoff::default();
+    loop {
+        match cache.resolve(&control).await {
+            Ok(addresses) => {
+                cfg.carrier_dns = Some(Arc::new(control::CarrierDns { host: control.clone(), addresses: parking_lot::RwLock::new(addresses) }));
+                match refresh_explicit_carriers(cfg).await {
+                    Ok(()) => break,
+                    Err(error) => { statusd::record_failure(&tun, &error)?; tracing::warn!(%error, "protected carrier bootstrap retry"); }
+                }
+            },
+            Err(error) => { statusd::record_failure(&tun, &error)?; tracing::warn!(%error, "protected control bootstrap retry"); }
+        }
+        backoff.wait().await;
+    }
+    if retained {
+        // A changed literal endpoint needs no DNS but still must be allowed before
+        // the first control request. Cached hostnames were allowed above.
+        let mut ips = cache.addresses();
+        if let Some(dns) = &cfg.carrier_dns { ips.extend(dns.addresses.read().iter().map(ToString::to_string)); }
+        ips.extend(cfg.resolved_relay.iter().map(|addr| addr.ip().to_string()));
+        ips.extend(cfg.resolved_stun.map(|addr| addr.ip().to_string()));
+        let starting = guard.clone(); let iface = tun.clone(); let gate = shutdown.clone();
+        apply::blocking(move || { let stopped = gate.lock(); if !*stopped { starting.lock().sync(&iface, &ips, true)?; } Ok(()) }).await?;
+    }
+    // First-use policy is installed only after the directory's relay/STUN names
+    // are resolved. Retained policy was restored above before any control call.
+    Ok(Some(guard))
+}
+
+async fn run_with(mut cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile::RoutesFn>) -> std::io::Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     // Own the injected fd before parsing keys so early errors also close it.
     #[cfg(unix)]
     let mut fd_guard = cfg.tun_fd.map(|fd| InjectedFdGuard(Some(fd)));
     let own_priv = StaticSecret::from(hex32(&cfg.private_key)?);
     let own_pub = PublicKey::from(&own_priv);
+
+    let shutdown: Shutdown = Arc::new(parking_lot::Mutex::new(false));
+    #[cfg(unix)]
+    let shutdown_host: Arc<parking_lot::Mutex<Option<Arc<HostEffects>>>> = Arc::default();
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())?;
+        let mut intr = signal(SignalKind::interrupt())?;
+        let slot = shutdown_host.clone(); let gate = shutdown.clone(); let tun = cfg.tun_name.clone();
+        tasks.spawn(async move {
+            let down = tokio::select! { _ = term.recv() => false, _ = intr.recv() => true };
+            let result = apply::blocking(move || {
+                let host = slot.lock().clone();
+                if let Some(host) = host { host.cleanup()?; }
+                else { *gate.lock() = true; }
+                if down { firewall::client::clear(&tun)?; }
+                Ok(())
+            }).await;
+            if let Err(error) = &result { tracing::error!(%error, "host shutdown failed"); }
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        });
+    }
+    let kill_switch = start_client_guard(&mut cfg, &shutdown).await?;
 
     // Register the protect callback process-wide so the relay/tcp-direct/bonded
     // transports (which open their own egress sockets) protect them too, not just
@@ -985,11 +1151,16 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
 
     // Pull the relay directory from coordination. Local cfg fields, if set, still
     // override it — so a node needs zero relay/STUN config in the common case.
-    let (relays_dir, relay_targets, _refresh_directory) = bootstrap_directory_with(&cfg, || fetch_relays(&cfg)).await?;
-    let eff_stun: Option<SocketAddr> = cfg
-        .stun_server
-        .as_deref()
-        .and_then(|s| s.parse().ok())
+    let guard = kill_switch.clone(); let tun = cfg.tun_name.clone(); let gate = shutdown.clone();
+    let (relays_dir, relay_targets, _refresh_directory) = bootstrap_carriers_with(&cfg, || fetch_relays(&cfg), move |ips| async move {
+        apply::blocking(move || {
+            let stopped = gate.lock();
+            if *stopped { return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "node stopped during carrier bootstrap").into()); }
+            if let Some(guard) = guard { guard.lock().sync(&tun, &ips, true)?; }
+            Ok(())
+        }).await.map_err(std::io::Error::from)
+    }).await?;
+    let eff_stun = cfg.resolved_stun.or_else(|| cfg.stun_server.as_deref().and_then(|s| s.parse().ok()))
         .or_else(|| relays_dir.iter().find_map(|d| d.stun));
     if !relays_dir.is_empty() {
         tracing::info!(relays = relays_dir.len(), candidates = relay_targets.len(), stun = ?eff_stun, "relay directory from control-server");
@@ -1008,14 +1179,19 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
             a.push(reflexive.to_string());
         }
         // The OS resolver may block; keep it off the cancellable engine future.
-        let control_host = url_host(&cfg.control_server)?;
+        let control_host = cfg.carrier_dns.as_ref().and_then(|dns| dns.addresses.read().first().map(ToString::to_string))
+            .map(Ok).unwrap_or_else(|| url_host(&cfg.control_server))?;
         if let Some(ip) = tokio::task::spawn_blocking(move || local_ipv4_toward(&control_host)).await.map_err(std::io::Error::other)? {
             a.push(format!("{ip}:{}", cfg.listen_port));
         }
         a
     };
 
-    let (r, init_epoch) = mobile::retry_control(true, || resolve_from_control(&cfg, &advertise)).await?;
+    let (r, init_epoch) = mobile::retry_control(true, || async {
+        let result = resolve_from_control(&cfg, &advertise).await;
+        if let Err(error) = &result && carriers::is_blocked(error) { statusd::record_failure(&cfg.tun_name, error)?; }
+        result
+    }).await?;
     let mut platform = mobile::Reporter::new(r.platform.clone(), routes);
 
     // AD-2 (consumer exit contract): split-tunnel BY DEFAULT — strip every
@@ -1083,6 +1259,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     let mut relay_ips: Vec<String> = relay_targets.iter().map(|rt| rt.addr.ip().to_string()).collect();
     relay_ips.extend(relays_dir.iter().flat_map(|entry| &entry.addresses).map(|addr| addr.ip().to_string()));
     relay_ips.extend(relays_dir.iter().filter_map(|entry| entry.stun).map(|addr| addr.ip().to_string()));
+    relay_ips.extend(eff_stun.map(|addr| addr.ip().to_string()));
     relay_ips.sort(); relay_ips.dedup();
 
     // Host route/DNS/exit setup — ONLY when we own the device. With an injected fd
@@ -1090,7 +1267,6 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     // 0.0.0.0/0 full-tunnel), MTU and DNS; touching them from here would fail or
     // fight the platform. The data plane below is identical — the phone is a full
     // peer (disco/relay/multi-peer/exit-as-a-peer), just without host-side routing.
-    let shutdown: Shutdown = Arc::new(parking_lot::Mutex::new(false));
     let exit_state: ExitState = Arc::new(parking_lot::Mutex::new(None));
     let exit_progress = Arc::new(parking_lot::Mutex::new(route::ExitProgress::default()));
     let own_cidr = overlay_cidr(r.own_addr, cfg.prefix_len);
@@ -1100,24 +1276,11 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
         exclude_routes: cfg.exclude_routes.clone(), dns_override: parking_lot::Mutex::new(eff_dns.clone()),
         local_dns: cfg.dns.clone(), local_mtu: cfg.mtu, initial_mtu: cfg.mtu.or(r.mtu),
         exit_state, exit_progress, nat_state: Arc::default(), provider: ProviderPolicy::from_config(&cfg, embedded),
-        manage_host_routes: !embedded, shutdown, runtime: parking_lot::Mutex::new(HostRuntime::default()),
+        manage_host_routes: !embedded, shutdown, runtime: parking_lot::Mutex::new(HostRuntime::default()), kill_switch, carrier_dns: cfg.carrier_dns.clone(), carrier_cache: cfg.carrier_cache.clone(),
         #[cfg(test)] probe: None,
     });
-    // Graceful teardown: restore the default route + DNS (client side) and the NAT
-    // rule (exit side) on SIGTERM/SIGINT before exiting — the daemon sends SIGTERM,
-    // then SIGKILL. Without this a killed full-tunnel node strands the box's routing.
     #[cfg(unix)]
-    {
-        let stopping = host.clone();
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = signal(SignalKind::terminate())?;
-        let mut intr = signal(SignalKind::interrupt())?;
-        tasks.spawn(async move {
-            tokio::select! { _ = term.recv() => {}, _ = intr.recv() => {} }
-            if let Err(error) = apply::blocking(move || stopping.cleanup()).await { tracing::error!(%error, "host shutdown failed"); }
-            std::process::exit(0);
-        });
-    }
+    { *shutdown_host.lock() = Some(host.clone()); }
     // Windows has no SIGTERM/SIGINT; hook Ctrl-C so a foreground node still restores
     // routes/DNS (and the exit-side NAT, when it lands) before exiting.
     #[cfg(windows)]
@@ -1132,6 +1295,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
 
     let initial_host = host.clone();
     let initial_peers = peers.clone();
+    initial_host.guard_carriers(&initial_peers, false).await?;
     let self_exit = r.self_exit;
     let result = initial_host.apply(init_epoch, initial_peers, self_exit, false).await;
     apply_status.lock().complete(init_epoch, result);
@@ -1159,7 +1323,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     let (app_in_tx, app_in_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
     let (app_out_tx, app_out_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(512);
     let relay_sender = RelayOut::new(app_out_tx, targets_rx.clone());
-    tasks.spawn(relay_supervisor(targets_rx, own_priv.clone(), app_out_rx, app_in_tx));
+    tasks.spawn(relay_supervisor(targets_rx, own_priv.clone(), app_out_rx, app_in_tx, cfg.carrier_cache.clone()));
     let (relay_in, relay_out): (Option<RelayIn>, Option<RelayOut>) = (Some(app_in_rx), Some(relay_sender));
 
     // --- Build per-peer state, partition across N workers, send first probe ---
@@ -1459,11 +1623,9 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
     // cumulative + realtime traffic view; realtime = the web's Δbytes/Δt). ---
     {
         let reg = status_reg.clone();
-        let control_server = cfg.control_server.clone();
+        let client = control::mk_client(&cfg);
         let device_id = cfg.device_id.clone();
-        let auth_token = cfg.auth_token.clone().unwrap_or_default();
         tasks.spawn(async move {
-            let client = fluxpeer_sdk::Client::with_password(control_server, &auth_token);
             // 3 s cadence so the web's realtime rate (Δbytes/Δt) feels live without
             // hammering the control-server.
             let mut iv = tokio::time::interval(Duration::from_secs(3));
@@ -1552,7 +1714,7 @@ async fn run_with(cfg: Config, protect: Option<ProtectFn>, routes: Option<mobile
 }
 
 pub use config::keygen;
-pub use daemon::{daemon, set_exit, set_use_exit, veto_exit};
+pub use daemon::{daemon, set_exit, set_use_exit, set_kill_switch, veto_exit};
 pub use join::config_dir;
 pub use join::join;
 pub use show::{list_networks, show};
@@ -1652,11 +1814,52 @@ mod exit_contract_tests {
     }
 
 
+    async fn bootstrap_test_endpoint(cache: Arc<carriers::Cache>, events: Arc<parking_lot::Mutex<Vec<String>>>, endpoint: String) -> std::io::Result<Vec<SocketAddr>> {
+        let (host, port) = carriers::endpoint_parts(&endpoint)?;
+        let ips = cache.resolve_with(&host, |host| {
+            events.lock().push(host.clone());
+            std::future::ready(Ok(vec![if host == "relay.test" { "192.0.2.2" } else { "192.0.2.3" }.parse().unwrap()]))
+        }).await?;
+        Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect())
+    }
+
+    #[tokio::test]
+    async fn protected_bootstrap_installs_only_after_directory_dns_and_reuses_retained_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = directory_config(None, false);
+        let cache = carriers::Cache::open(root.path(), "fp0", false).unwrap();
+        cache.resolve_with("control.test", |_| std::future::ready(Ok(vec!["192.0.2.1".parse().unwrap()]))).await.unwrap();
+        cfg.carrier_cache = Some(cache.clone());
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let fetch = || async {
+            let entries = serde_json::json!({"relays":[{"id":"r", "url":"relay.test:443", "stun_url":"stun.test:3478"}]});
+            control::resolve_directory_for_test(&entries, |endpoint| bootstrap_test_endpoint(cache.clone(), events.clone(), endpoint)).await
+        };
+        bootstrap_carriers_with(&cfg, fetch, |ips| {
+            assert_eq!(ips, ["192.0.2.1", "192.0.2.2", "192.0.2.3"]);
+            assert!(!cache.cache_only());
+            assert_eq!(events.lock().len(), 2); events.lock().push("install".into());
+            std::future::ready(Ok(()))
+        }).await.unwrap();
+        assert!(cache.cache_only()); assert_eq!(events.lock().last().unwrap(), "install");
+        let retained = carriers::Cache::open(root.path(), "fp0", true).unwrap();
+        cfg.carrier_cache = Some(retained.clone());
+        let snapshot = serde_json::json!({"relays":[{"id":"r", "url":"relay.test:443", "stun_url":"stun.test:3478"}]});
+        let (directory, _, _) = bootstrap_carriers_with(&cfg, || control::directory_for(&snapshot, Some(&retained)), |ips| {
+            assert_eq!(ips.len(), 3); std::future::ready(Ok(()))
+        }).await.unwrap();
+        assert_eq!(directory[0].addresses[0].ip().to_string(), "192.0.2.2");
+        assert_eq!(directory[0].stun.unwrap().ip().to_string(), "192.0.2.3");
+        let changed = serde_json::json!({"relays":[{"id":"r", "url":"relay.test:443", "stun_url":"new-stun.test:3478"}]});
+        let error = control::directory_for(&changed, Some(&retained)).await.unwrap_err();
+        assert!(error.to_string().contains("kill_switch_dns_blocked: new-stun.test"));
+    }
+
     fn test_host() -> HostEffects {
         HostEffects { tun_name: "fp-test".into(), own_cidr: "100.72.16.0/24".into(), control_host: String::new(), relay_ips: parking_lot::Mutex::new(vec![]),
             exclude_routes: vec![], dns_override: parking_lot::Mutex::new(vec![]), local_dns: vec![], local_mtu: None, initial_mtu: None, exit_state: Arc::default(), exit_progress: Arc::default(), nat_state: Arc::default(),
             provider: ProviderPolicy { enabled: false, force: None, veto: false, trust_external: false }, manage_host_routes: false,
-            shutdown: Arc::default(), runtime: parking_lot::Mutex::default(), probe: None }
+            shutdown: Arc::default(), runtime: parking_lot::Mutex::default(), kill_switch: None, carrier_dns: None, carrier_cache: None, probe: None }
     }
 
     fn directory_config(relay: Option<&str>, forced: bool) -> Config {

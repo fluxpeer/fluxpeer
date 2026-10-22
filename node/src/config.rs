@@ -88,6 +88,19 @@ pub(crate) struct Config {
     /// `"<pubkey hex>"` = pin that exit peer; unknown/non-exit ⇒ error + split.
     #[serde(default)]
     pub(crate) use_exit: Option<String>,
+    /// Keep local OUTPUT fail-closed while full-tunnel mode is requested.
+    #[serde(default)]
+    pub(crate) kill_switch: bool,
+    /// Engine-owned carrier DNS shared by protected control clients; never read
+    /// from membership JSON or exported as a local setting.
+    #[serde(skip)]
+    pub(crate) carrier_dns: Option<std::sync::Arc<crate::control::CarrierDns>>,
+    #[serde(skip)]
+    pub(crate) carrier_cache: Option<std::sync::Arc<crate::carriers::Cache>>,
+    #[serde(skip)]
+    pub(crate) resolved_relay: Vec<std::net::SocketAddr>,
+    #[serde(skip)]
+    pub(crate) resolved_stun: Option<std::net::SocketAddr>,
     /// Subnets to EXCLUDE from the tunnel (split-exclude). Only meaningful when a
     /// peer is an exit node (AllowedIPs 0.0.0.0/0, full-tunnel): these CIDRs get a
     /// more-specific bypass route via the original physical gateway, so they keep

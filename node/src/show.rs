@@ -90,7 +90,7 @@ fn status_dirs() -> Vec<PathBuf> {
 }
 
 /// Every running network's status endpoint (`*.sock` on unix, `*.port` on Windows).
-fn all_sockets() -> Vec<PathBuf> {
+pub(crate) fn all_sockets() -> Vec<PathBuf> {
     let ext = if cfg!(windows) { "port" } else { "sock" };
     let mut out = Vec::new();
     for dir in status_dirs() {

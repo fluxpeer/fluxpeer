@@ -118,6 +118,19 @@ impl Client {
     /// Explicit bearer for a caller-selected control origin. Redirects are disabled
     /// so credentials cannot follow a redirect to another origin.
     pub fn with_password(base: impl Into<String>, password: &str) -> Self {
+        Self::with_builder(base, password, reqwest::Client::builder())
+    }
+
+    /// Use a caller-owned DNS resolver for direct control connections. The URL,
+    /// TLS hostname and bearer scope remain unchanged; environment proxies are
+    /// disabled because their addresses are outside the caller's carrier policy.
+    pub fn with_password_and_resolver<R: reqwest::dns::Resolve + 'static>(
+        base: impl Into<String>, password: &str, resolver: std::sync::Arc<R>,
+    ) -> Self {
+        Self::with_builder(base, password, reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(10)).dns_resolver(resolver))
+    }
+
+    fn with_builder(base: impl Into<String>, password: &str, builder: reqwest::ClientBuilder) -> Self {
         let http = (|| -> Result<reqwest::Client> {
             let mut headers = reqwest::header::HeaderMap::new();
             if !password.is_empty() {
@@ -125,7 +138,7 @@ impl Client {
                 value.set_sensitive(true);
                 headers.insert(reqwest::header::AUTHORIZATION, value);
             }
-            Ok(reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| attempt.error("control-server redirects are disabled")))
+            Ok(builder.redirect(reqwest::redirect::Policy::custom(|attempt| attempt.error("control-server redirects are disabled")))
                 .default_headers(headers).build()?)
         })().map_err(|error| error.to_string());
         Self { base: base.into().trim_end_matches('/').to_string(), http }

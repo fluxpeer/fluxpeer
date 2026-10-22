@@ -282,6 +282,21 @@ mod tests {
 mod stopped_tests {
     use super::*;
     #[test]
+    fn blocked_carrier_error_survives_bootstrap_and_running_json_status() {
+        let dir = tempfile::tempdir().unwrap(); let socket = dir.path().join("fp0.sock");
+        let error = crate::carriers::blocked("relay.test");
+        write_failure(&socket, "fp0", &error).unwrap();
+        let stopped = read_failure(&socket).unwrap();
+        assert_eq!(stopped["interface"]["last_error"], error.to_string());
+        assert_eq!(stopped["interface"]["terminal_control"], false);
+        let state: crate::apply::SharedStatus = Default::default();
+        state.lock().complete(1, Err(crate::apply::ApplyError::new(&["kill-switch", "DNS"], error.to_string())));
+        let reg: StatusRegistry = Default::default();
+        let running: serde_json::Value = serde_json::from_str(&json_status(&reg, &state, "test", "fp0", 1234, Ipv4Addr::LOCALHOST, "")).unwrap();
+        assert_eq!(running["interface"]["last_error"]["stderr"], error.to_string());
+    }
+
+    #[test]
     fn stopped_member_error_survives_exit_in_private_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("fp0.sock");

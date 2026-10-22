@@ -14,10 +14,37 @@ use crate::util::{DISCO_MAGIC, disco_dgram};
 /// control-server authorizes its `/devices/:id/*` calls (config pull / endpoints /
 /// routes). Empty token → no header (rejected by a token-enforcing server).
 pub(crate) fn mk_client(cfg: &Config) -> Client {
+    if let Some(resolver) = &cfg.carrier_dns {
+        return Client::with_password_and_resolver(cfg.control_server.clone(), cfg.auth_token.as_deref().unwrap_or_default(), resolver.clone());
+    }
     Client::with_password(
         cfg.control_server.clone(),
         cfg.auth_token.as_deref().unwrap_or_default(),
     )
+}
+
+/// Only the configured control hostname can resolve through these pins. Updating
+/// them happens after OUTPUT/bypass policy permits the new addresses.
+pub(crate) struct CarrierDns {
+    pub host: String,
+    pub addresses: parking_lot::RwLock<Vec<std::net::IpAddr>>,
+}
+impl reqwest::dns::Resolve for CarrierDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let addresses = if name.as_str().eq_ignore_ascii_case(&self.host) { self.addresses.read().clone() } else { vec![] };
+        Box::pin(async move {
+            if addresses.is_empty() { return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no authorized control carrier address").into()); }
+            let addrs: reqwest::dns::Addrs = Box::new(addresses.into_iter().map(|ip| SocketAddr::new(ip, 0)));
+            Ok(addrs)
+        })
+    }
+}
+
+pub(crate) fn protected_error(cfg: &Config, error: std::io::Error) -> std::io::Error {
+    match (&cfg.carrier_cache, &cfg.carrier_dns) {
+        (Some(cache), Some(dns)) => cache.network_error(&dns.host, error),
+        _ => error,
+    }
 }
 
 /// Preserve HTTP status classification before wrapping the SDK error in io::Error.
@@ -29,6 +56,8 @@ pub(crate) fn request_error(error: anyhow::Error) -> std::io::Error {
         Some(status) if matches!(status.as_u16(), 401 | 403) => ErrorKind::PermissionDenied,
         Some(status) if matches!(status.as_u16(), 404 | 410) => ErrorKind::NotFound,
         Some(status) if status.is_client_error() && !matches!(status.as_u16(), 408 | 425 | 429) => ErrorKind::InvalidInput,
+        _ if error.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout) => ErrorKind::TimedOut,
+        _ if error.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_connect) => ErrorKind::ConnectionAborted,
         _ => ErrorKind::Other,
     };
     std::io::Error::new(kind, format!("{error:#}"))
@@ -112,8 +141,9 @@ pub(crate) fn fetch_relays(cfg: &Config) -> futures::future::BoxFuture<'_, std::
     use futures::FutureExt;
     async move {
         let client = mk_client(cfg);
-        let conf = client.device_config(&cfg.device_id).await.map_err(request_error)?;
-        resolve_relay_directory(&conf).await
+        let conf = client.device_config(&cfg.device_id).await.map_err(|error| protected_error(cfg, request_error(error)))?;
+        if let (Some(cache), Some(dns)) = (&cfg.carrier_cache, &cfg.carrier_dns) { cache.connected(dns.addresses.read().clone()); }
+        if cfg.carrier_cache.is_some() { directory_for(&conf, cfg.carrier_cache.as_ref()).await } else { resolve_relay_directory(&conf).await }
     }.boxed()
 }
 
@@ -137,7 +167,7 @@ fn order_directory_addresses(addresses: &mut Vec<SocketAddr>) {
     addresses.retain(|addr| seen.insert(*addr));
 }
 
-async fn resolve_relay_entry<F, Fut>(entry: &serde_json::Value, resolve: &F) -> std::io::Result<Option<RelayDir>>
+async fn resolve_relay_entry<F, Fut>(entry: &serde_json::Value, resolve: &F, strict_stun: bool) -> std::io::Result<Option<RelayDir>>
 where F: Fn(String) -> Fut + Sync, Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send {
     let id = entry["id"].as_str().unwrap_or("fluxpeer-relay");
     let Some(url) = entry["url"].as_str() else {
@@ -175,6 +205,7 @@ where F: Fn(String) -> Fut + Sync, Fut: std::future::Future<Output = std::io::Re
                 stun
             }
             Err(error) => {
+                if strict_stun { return Err(error); }
                 tracing::warn!(relay = id, %endpoint, %error, "directory STUN resolution failed; keeping relay without STUN");
                 None
             }
@@ -217,10 +248,27 @@ pub(crate) async fn snapshot_relays(conf: &serde_json::Value) -> std::io::Result
 
 async fn resolve_directory_mode<F, Fut>(conf: &serde_json::Value, resolve: F, strict: bool) -> std::io::Result<Vec<RelayDir>>
 where F: Fn(String) -> Fut + Sync, Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send {
+    resolve_directory_policy(conf, resolve, strict, false).await
+}
+
+pub(crate) async fn directory_for(conf: &serde_json::Value, cache: Option<&std::sync::Arc<crate::carriers::Cache>>) -> std::io::Result<Vec<RelayDir>> {
+    if let Some(cache) = cache {
+        resolve_directory_policy(conf, |endpoint| { let cache = cache.clone(); async move { cache.endpoint(&endpoint).await } }, true, true).await
+    } else { snapshot_relays(conf).await }
+}
+
+#[cfg(test)]
+pub(crate) async fn resolve_directory_for_test<F, Fut>(conf: &serde_json::Value, resolve: F) -> std::io::Result<Vec<RelayDir>>
+where F: Fn(String) -> Fut + Sync, Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send {
+    resolve_directory_policy(conf, resolve, true, true).await
+}
+
+async fn resolve_directory_policy<F, Fut>(conf: &serde_json::Value, resolve: F, strict: bool, strict_stun: bool) -> std::io::Result<Vec<RelayDir>>
+where F: Fn(String) -> Fut + Sync, Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send {
     use futures::{FutureExt, StreamExt};
     let Some(entries) = conf["relays"].as_array() else { return Ok(Vec::new()); };
     let mut pending = Vec::with_capacity(entries.len());
-    for entry in entries { pending.push(resolve_relay_entry(entry, &resolve).boxed()); }
+    for entry in entries { pending.push(resolve_relay_entry(entry, &resolve, strict_stun).boxed()); }
     let results: Vec<_> = futures::stream::iter(pending).buffered(8).collect().await;
     let mut relays = Vec::new();
     let mut dns_failed = false;
@@ -228,6 +276,7 @@ where F: Fn(String) -> Fut + Sync, Fut: std::future::Future<Output = std::io::Re
         match result {
             Ok(Some(relay)) => relays.push(relay),
             Ok(None) => {},
+            Err(error) if strict_stun || crate::carriers::is_blocked(&error) => return Err(error),
             Err(error) => dns_failed |= error.kind() != std::io::ErrorKind::InvalidInput,
         }
     }
@@ -358,7 +407,7 @@ pub(crate) async fn resolve_from_control(cfg: &Config, advertise: &[String]) -> 
     client
         .set_endpoints(&cfg.device_id, advertise)
         .await
-        .map_err(request_error)?;
+        .map_err(|error| protected_error(cfg, request_error(error)))?;
     tracing::info!(?advertise, "reported endpoints to control-server");
 
     // Only `own_addr` is needed to bring the TUN up — so return the moment the
@@ -393,8 +442,8 @@ pub(crate) async fn resolve_from_control(cfg: &Config, advertise: &[String]) -> 
                 // Enrolled but no overlay address yet — retry briefly.
             }
             Err(e) => {
-                let error = request_error(e);
-                if terminal_control_error(&error) {
+                let error = protected_error(cfg, request_error(e));
+                if terminal_control_error(&error) || crate::carriers::is_blocked(&error) {
                     return Err(error);
                 }
                 last_err = Some(error.to_string());
@@ -892,3 +941,7 @@ mod tests {
         assert!(!parse_peers(&conf)[0].exit);
     }
 }
+
+#[cfg(test)]
+#[path = "control_carrier_tests.rs"]
+mod carrier_tests;

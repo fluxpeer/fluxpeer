@@ -159,6 +159,69 @@ entry; Android DNS remains owned by VpnService. This change does not add an exit
 DNS server. The core OpenWrt backend only gains an empty-state cleanup no-op;
 the OpenWrt repository is unchanged.
 
+## Client kill switch (Linux)
+
+`kill_switch` is a local boolean, defaulting to `false`. It takes effect only
+with `use_exit: "auto"` or an explicitly selected exit key. Configure it with
+`fluxpeer kill-switch on|off --iface fp0`, the desktop **Kill switch** checkbox,
+or the daemon `settings` command (`{"iface":"fp0","kill_switch":true}`). The
+CLI edits local configuration and requires a tunnel restart, like `use-exit`;
+daemon/desktop settings restart the member. It never enables full tunnel itself.
+macOS and other unsupported hosts reject an active kill switch explicitly;
+macOS pf integration is deferred to T-0042.
+
+Kill-switch requires a single active membership on the host. Enabling it through
+settings, set-config or `kill-switch on` is rejected while another membership is
+up; disconnect the other memberships first. Starting a different membership is
+rejected while a protected member is starting/running or its OUTPUT journal is
+retained after exit: `kill-switch active on <iface>; disable it first`. Daemon
+conflicts return `status: 409` in its JSON API and the desktop displays the error.
+The check precedes configuration writes and process starts. File-based
+`node run` also rejects another interface's retained guard. Single-member
+operation and restarting the protected member are supported; there is no shared
+allowlist that permits another membership through this guard.
+
+Linux protects local OUTPUT with an instance-owned nft table or IPv4/IPv6
+iptables chains. Exceptions are loopback, that instance's TUN, resolved control,
+relay/STUN and peer carrier IPs, DHCP, IPv4/IPv6 link-local destinations, and IPv6
+neighbor discovery. Ordinary DNS and user split-exclude CIDRs are not exceptions.
+With no retained guard, bootstrap resolves all control, relay and STUN hostnames
+using system DNS **before** installing OUTPUT protection. This initial resolution
+phase is not protected. With a retained guard, startup restores cached carrier
+addresses before contacting control and never falls back to ordinary DNS.
+Protected HTTP clients use the same carrier cache through an exact-host resolver,
+keep the original URL/Host/TLS identity, and disable environment proxy routing.
+
+While an authenticated exit, its routes and full-tunnel DNS are available, carrier
+names are refreshed through that tunnel. New carrier IPs and physical bypass
+routes are added before old exceptions are removed. Without a usable exit,
+resolution uses only saved pins. A new hostname or unreachable cached carrier
+addresses retain the guard, retry with backoff, and expose
+`kill_switch_dns_blocked: <host>` in `show --json`, daemon status and the desktop.
+Connect an exit or disable kill-switch to resolve new carrier names. An outage
+combined with a carrier hostname/IP change can require this explicit recovery;
+there is no DNS exception, public resolver fallback, or new enrollment metadata.
+
+Exit revocation, an unreachable exit, engine failure and configuration restarts
+retain OUTPUT protection. A normal daemon/desktop disconnect or foreground
+Ctrl-C releases it. Applying `use_exit: "off"` or `kill_switch: false` also
+releases retained rules. Daemon shutdown releases guards for its memberships,
+including stopped members. Failed cleanup is reported and its state remains
+available for retry. State files under `/run/fluxpeer-firewall/*.output.json`
+record the actual backend and carrier addresses. Adjacent `<iface>.carriers.json`
+files hold each hostname's last successful IP set and timestamp; they use mode
+0600, reject symlinks with O_NOFOLLOW, and are replaced atomically. Explicit down
+or disabling protection deletes both the guard and its cache. Do not delete these
+files to disable protection. They are runtime state, not reboot-persistent startup policy.
+
+The node and daemon check unchanged policies every 30 seconds and restore missing
+rules with a warning. The daemon also maintains guards after member failure.
+After a standalone engine exits, retained rules remain, but reconciliation needs
+a running daemon or a restarted engine. External firewall reloads can create a
+gap until the next check; native firewall reload integration is not provided.
+NAT updates use separate tables, and iptables guard jumps precede external jumps.
+Neither backend changes the global OUTPUT policy or flushes unrelated rules.
+
 ## Contributing & security
 
 Contributions welcome under the licenses above. Please report security issues

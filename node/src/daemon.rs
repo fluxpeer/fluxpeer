@@ -28,6 +28,9 @@ struct Daemon {
     dir: PathBuf,
     token: String,
     processes: Processes,
+    admission: tokio::sync::Mutex<()>,
+    guard_root: PathBuf,
+    protected_members: parking_lot::Mutex<std::collections::HashSet<String>>,
     exit: tokio::sync::Notify,
 }
 
@@ -44,6 +47,13 @@ async fn cleanup_link_with(
 
 fn lifecycle_error(error: std::io::Error) -> serde_json::Value {
     serde_json::json!({"status":if error.kind() == std::io::ErrorKind::WouldBlock { 409 } else { 500 }, "error":error.to_string()})
+}
+
+fn config_error(error: std::io::Error) -> serde_json::Value {
+    if error.kind() == std::io::ErrorKind::WouldBlock { lifecycle_error(error) } else { invalid_iface(error) }
+}
+fn other_membership_up(iface: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::WouldBlock, format!("cannot enable kill-switch while membership {iface} is up; disconnect it first"))
 }
 
 fn admin_api_allowed() -> bool {
@@ -78,10 +88,18 @@ pub async fn daemon(dir: String, addr: Option<String>) -> std::io::Result<()> {
         "→ fluxpeer daemon: {} network(s) up; control API on {addr}",
         d.processes.ifaces().len()
     );
+    let mut guard_check = tokio::time::interval(crate::firewall::client::CHECK_INTERVAL);
+    guard_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let (stream, _) = tokio::select! {
             accepted = listener.accept() => accepted?,
             _ = d.exit.notified() => return Ok(()),
+            _ = guard_check.tick() => {
+                if let Err(error) = crate::apply::blocking(crate::firewall::client::repair_all).await {
+                    tracing::warn!(%error, "client kill-switch reconciliation failed");
+                }
+                continue;
+            }
         };
         let d = d.clone();
         tokio::spawn(async move {
@@ -92,7 +110,7 @@ pub async fn daemon(dir: String, addr: Option<String>) -> std::io::Result<()> {
 
 /// Validate a `use_exit` mode string: `off`/`auto`/`<64-hex pubkey>`.
 /// Returns the canonical string to store (`off` → caller removes the key).
-fn normalize_use_exit(mode: &str) -> Result<String, String> {
+pub(crate) fn normalize_use_exit(mode: &str) -> Result<String, String> {
     let m = mode.trim();
     if m.is_empty() || m == "off" {
         return Ok("off".to_string());
@@ -163,6 +181,11 @@ pub fn set_use_exit(dir: &str, iface: Option<&str>, mode: &str) -> std::io::Resu
     })
 }
 
+/// Configure protection locally. Like use-exit, a running member needs restart.
+pub fn set_kill_switch(dir: &str, iface: Option<&str>, enabled: bool) -> std::io::Result<usize> {
+    edit_configs(Path::new(dir), iface, |obj| { obj.insert("kill_switch".into(), serde_json::json!(enabled)); })
+}
+
 /// Apply `edit` to every matching membership config (`*.json`) under `dir` —
 /// filtered to one interface when `iface` is given. Returns the edit count.
 fn edit_configs(
@@ -170,7 +193,35 @@ fn edit_configs(
     iface: Option<&str>,
     edit: impl Fn(&mut serde_json::Map<String, serde_json::Value>),
 ) -> std::io::Result<usize> {
-    let mut updated = 0usize;
+    edit_configs_with(dir, iface, edit, live_member_ifaces)
+}
+
+fn live_member_ifaces() -> std::io::Result<Vec<String>> { live_member_paths(crate::show::all_sockets()) }
+
+fn live_member_paths(paths: Vec<PathBuf>) -> std::io::Result<Vec<String>> {
+    let mut up = Vec::new();
+    #[cfg(unix)]
+    for path in paths {
+        match std::os::unix::net::UnixStream::connect(&path) {
+            Ok(_) => if let Some(iface) = path.file_stem().and_then(|name| name.to_str()) { up.push(iface.to_string()); },
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {},
+            Err(error) => return Err(error),
+        }
+    }
+    #[cfg(windows)]
+    for path in paths {
+        let port: u16 = std::fs::read_to_string(&path)?.trim().parse().map_err(std::io::Error::other)?;
+        if std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), std::time::Duration::from_secs(1)).is_ok()
+            && let Some(iface) = path.file_stem().and_then(|name| name.to_str()) { up.push(iface.to_string()); }
+    }
+    Ok(up)
+}
+
+fn edit_configs_with(
+    dir: &Path, iface: Option<&str>, edit: impl Fn(&mut serde_json::Map<String, serde_json::Value>),
+    live: impl FnOnce() -> std::io::Result<Vec<String>>,
+) -> std::io::Result<usize> {
+    let mut prepared = Vec::new();
     for path in configs(dir) {
         if let Some(want) = iface
             && read_iface(&path).as_deref() != Some(want)
@@ -190,11 +241,26 @@ fn edit_configs(
                 format!("{}: config root is not an object", path.display()),
             ));
         };
+        let was_enabled = obj.get("kill_switch").is_some_and(|value| value == true);
         edit(obj);
+        let enabling = cfg["kill_switch"] == true && (!was_enabled || crate::firewall::client::requested(true, cfg["use_exit"].as_str()));
+        prepared.push((path, cfg, enabling));
+    }
+    if prepared.iter().any(|(_, _, enabling)| *enabling) {
+        let up = live()?;
+        for (_, cfg, enabling) in &prepared {
+            if *enabling
+                && let Some(other) = up.iter().find(|other| cfg["tun_name"].as_str() != Some(other.as_str())) {
+                return Err(other_membership_up(other));
+            }
+        }
+    }
+    for (_, cfg, _) in &prepared { crate::firewall::client::validate_config(cfg)?; }
+    let updated = prepared.len();
+    for (path, cfg, _) in prepared {
         let mut serialized = serde_json::to_string_pretty(&cfg).map_err(std::io::Error::other)?;
         serialized.push('\n');
         open_output(&path, false)?.write_all(serialized.as_bytes())?;
-        updated += 1;
     }
     if updated == 0
         && let Some(want) = iface
@@ -343,19 +409,43 @@ fn reserve_member(dir: &Path) -> std::io::Result<MemberSlot> {
 
 impl Daemon {
     fn new(dir: PathBuf, token: String) -> Self {
-        Self { dir, token, processes: Processes::default(), exit: tokio::sync::Notify::new() }
+        Self { dir, token, processes: Processes::default(), admission: tokio::sync::Mutex::new(()), guard_root: PathBuf::from(crate::carriers::ROOT), protected_members: parking_lot::Mutex::default(), exit: tokio::sync::Notify::new() }
+    }
+
+    // Cover validation, config writes, stop/restart and spawn registration with
+    // one admission reservation: a second iface must not pass before a newly
+    // started protected member has written its firewall journal.
+    fn admission(&self) -> std::io::Result<tokio::sync::MutexGuard<'_, ()>> {
+        self.admission.try_lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::WouldBlock, "network admission busy; retry"))
+    }
+
+    fn check_member(&self, iface: &str, cfg: &serde_json::Value) -> std::io::Result<()> {
+        crate::firewall::client::ensure_exclusive_at(&self.guard_root, iface)?;
+        for other in self.processes.ifaces().into_iter().filter(|other| other != iface) {
+            if cfg["kill_switch"] == true { return Err(other_membership_up(&other)); }
+            let path = member_config(&self.dir, &other)?;
+            let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?).map_err(std::io::Error::other)?;
+            if self.protected_members.lock().contains(&other) || crate::firewall::client::requested(config["kill_switch"] == true, config["use_exit"].as_str()) {
+                return Err(crate::firewall::client::exclusive_error(&other));
+            }
+        }
+        Ok(())
     }
 
     /// Spawn a node task for one config (idempotent per interface).
     fn spawn_net(&self, cfg: &Path) -> std::io::Result<()> {
         let iface = read_iface(cfg).ok_or_else(|| std::io::Error::other("invalid membership config"))?;
         let _operation = self.processes.operation(&iface)?;
+        let _admission = self.admission()?;
         self.spawn_net_locked(cfg, &iface)
     }
 
     fn spawn_net_locked(&self, cfg: &Path, iface: &str) -> std::io::Result<()> {
         let registered = member_config(&self.dir, iface)?;
         if cfg.canonicalize()? != registered { return Err(std::io::Error::other("unregistered config path")); }
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(&registered)?).map_err(std::io::Error::other)?;
+        self.check_member(iface, &config)?;
+        crate::firewall::client::validate_config(&config)?;
         if self.processes.running(iface)? { return Ok(()); }
         let exe = std::env::current_exe()?;
         let log_path = confined_path(&self.dir, iface, "log", true)?;
@@ -364,13 +454,27 @@ impl Daemon {
         let mut cmd = Command::new(exe);
         cmd.arg("node").arg("run").arg(&registered).stdout(log).stderr(err).kill_on_drop(true);
         if std::env::var_os("RUST_LOG").is_none() { cmd.env("RUST_LOG", "info"); }
-        self.processes.spawn(iface, &mut cmd)
+        self.processes.spawn(iface, &mut cmd)?;
+        let mut protected = self.protected_members.lock();
+        if crate::firewall::client::requested(config["kill_switch"] == true, config["use_exit"].as_str()) { protected.insert(iface.to_string()); }
+        else { protected.remove(iface); }
+        Ok(())
     }
 
     /// Wait for the owning supervisor to reap the child before removing leftovers.
     /// Callers hold an interface operation or the global shutdown reservation.
     async fn stop_iface(&self, iface: &str) -> std::io::Result<()> {
+        self.stop_iface_with_policy(iface, true).await
+    }
+
+    async fn stop_iface_with_policy(&self, iface: &str, release: bool) -> std::io::Result<()> {
         let stopped = self.processes.stop(iface).await;
+        // stop() has reaped the member even if it reports failed host cleanup.
+        // Only explicit down/disable releases OUTPUT, never a restart or crash.
+        if release && !self.processes.contains(iface) {
+            let iface = iface.to_string();
+            crate::apply::blocking(move || crate::firewall::client::clear(&iface)).await?;
+        }
         if let Err(error) = std::fs::remove_file(crate::statusd::socket_path(iface))
             && error.kind() != std::io::ErrorKind::NotFound { return Err(error); }
         #[cfg(target_os = "linux")]
@@ -389,7 +493,10 @@ impl Daemon {
             Ok(reservation) => reservation, Err(error) => return lifecycle_error(error),
         };
         let mut errors = Vec::new();
-        for iface in self.processes.cleanup_ifaces() {
+        let mut ifaces = self.processes.cleanup_ifaces();
+        ifaces.extend(configs(&self.dir).iter().filter_map(|path| read_iface(path)));
+        ifaces.sort(); ifaces.dedup();
+        for iface in ifaces {
             if let Err(error) = self.stop_iface(&iface).await { errors.push(format!("{iface}: {error}")); }
         }
         if !errors.is_empty() { return serde_json::json!({"error":errors.join("; ")}); }
@@ -519,6 +626,7 @@ impl Daemon {
                     "firewall_trust_external": v["firewall_trust_external"].as_bool().unwrap_or(false),
                     // Consumer exit selection (AD-2); absent = split-tunnel.
                     "use_exit": v["use_exit"].as_str().unwrap_or("off"),
+                    "kill_switch": v["kill_switch"].as_bool().unwrap_or(false),
                     "force_relay": v["force_relay"].as_bool().unwrap_or(false),
                     "relay_anytls": v["relay_anytls"].as_bool().unwrap_or(false),
                     "relay_bond": v["relay_bond"].as_bool().unwrap_or(false),
@@ -544,6 +652,7 @@ impl Daemon {
     }
 
     fn install_member(&self, cfg: &serde_json::Value, spawn: impl FnOnce(&Path) -> std::io::Result<()>) -> serde_json::Value {
+        if let Err(error) = crate::firewall::client::validate_config(cfg) { return invalid_iface(error); }
         Self::start_member(reserve_member(&self.dir).and_then(|slot| slot.save(cfg)), spawn)
     }
 
@@ -551,7 +660,10 @@ impl Daemon {
         match saved {
             Ok((path, iface)) => match spawn(&path) {
                 Ok(()) => serde_json::json!({"ok":true, "iface":iface}),
-                Err(error) => serde_json::json!({"error":format!("membership saved but start failed: {error}"), "iface":iface}),
+                Err(error) => {
+                    let message = format!("membership saved but start failed: {error}");
+                    let mut response = lifecycle_error(error); response["error"] = message.into(); response["iface"] = iface.into(); response
+                },
             },
             Err(error) => serde_json::json!({"error":format!("membership save failed: {error}")}),
         }
@@ -579,10 +691,13 @@ impl Daemon {
         let _operation = match self.processes.operation(iface) {
             Ok(operation) => operation, Err(error) => return lifecycle_error(error),
         };
-        let path = match self.store_config(req) {
-            Ok(path) => path, Err(error) => return invalid_iface(error),
+        let _admission = match self.admission() {
+            Ok(admission) => admission, Err(error) => return lifecycle_error(error),
         };
-        if let Err(error) = self.restart(iface, &path).await { return serde_json::json!({"error":error.to_string()}); }
+        let path = match self.store_config(req) {
+            Ok(path) => path, Err(error) => return config_error(error),
+        };
+        if let Err(error) = self.restart(iface, &path).await { return lifecycle_error(error); }
         serde_json::json!({ "ok": true, "iface": iface })
     }
 
@@ -609,6 +724,8 @@ impl Daemon {
                 .ok_or_else(|| Error::new(ErrorKind::InvalidData, "existing private key is unavailable"))?;
             obj.insert("private_key".into(), serde_json::Value::String(key.to_string()));
         }
+        self.check_member(iface, &cfg)?;
+        crate::firewall::client::validate_config(&cfg)?;
         write_json(&path, &cfg, false)?;
         Ok(path)
     }
@@ -669,7 +786,9 @@ impl Daemon {
 
     /// Restart one network (down + up) to apply a config change.
     async fn restart(&self, iface: &str, path: &Path) -> std::io::Result<()> {
-        self.stop_iface(iface).await?;
+        let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?).map_err(std::io::Error::other)?;
+        let active = crate::firewall::client::validate_config(&cfg)?;
+        self.stop_iface_with_policy(iface, !active).await?;
         self.spawn_net_locked(path, iface)
     }
 
@@ -678,6 +797,9 @@ impl Daemon {
         let iface = req["iface"].as_str().unwrap_or("");
         let _operation = match self.processes.operation(iface) {
             Ok(operation) => operation, Err(error) => return lifecycle_error(error),
+        };
+        let _admission = match self.admission() {
+            Ok(admission) => admission, Err(error) => return lifecycle_error(error),
         };
         let path = match member_config(&self.dir, iface) {
             Ok(path) => path, Err(error) => return invalid_iface(error),
@@ -731,6 +853,11 @@ impl Daemon {
             }
         }
         // Connection mode (transport policy): force-relay + relay flavor.
+        if let Some(value) = req.get("kill_switch") { cfg["kill_switch"] = value.clone(); }
+        if let Err(error) = self.check_member(iface, &cfg) { return lifecycle_error(error); }
+        if let Err(error) = crate::firewall::client::validate_config(&cfg) {
+            return serde_json::json!({"error": error.to_string()});
+        }
         for k in ["force_relay", "relay_anytls", "relay_bond"] {
             if let Some(b) = req.get(k).and_then(|x| x.as_bool()) {
                 cfg[k] = serde_json::json!(b);
@@ -739,7 +866,7 @@ impl Daemon {
         if write_json(&path, &cfg, false).is_err() {
             return serde_json::json!({ "error": "write failed" });
         }
-        if let Err(error) = self.restart(iface, &path).await { return serde_json::json!({"error":error.to_string()}); } // MTU/DNS/endpoint take effect on restart
+        if let Err(error) = self.restart(iface, &path).await { return lifecycle_error(error); } // MTU/DNS/endpoint take effect on restart
         serde_json::json!({ "ok": true, "iface": iface })
     }
 
@@ -748,6 +875,9 @@ impl Daemon {
         if let Err(error) = self.validate_operation(iface, !up) { return invalid_iface(error); }
         let _operation = match self.processes.operation(iface) {
             Ok(operation) => operation, Err(error) => return lifecycle_error(error),
+        };
+        let _admission = match self.admission() {
+            Ok(admission) => admission, Err(error) => return lifecycle_error(error),
         };
         if up {
             let cfg = match member_config(&self.dir, iface) { Ok(path) => path, Err(error) => return invalid_iface(error) };
@@ -879,6 +1009,40 @@ mod tests {
         assert!(paths.iter().all(|path| !path.exists()));
     }
 
+    #[test]
+    fn kill_switch_cli_defaults_false_and_scopes_local_configuration() {
+        let temp = TempDir::new(&["fp0", "fp1"]);
+        let dir = temp.path.to_str().unwrap();
+        let config: crate::Config = serde_json::from_value(temp.read("fp0")).unwrap();
+        assert!(!config.kill_switch);
+        assert_eq!(set_kill_switch(dir, Some("fp0"), true).unwrap(), 1);
+        assert_eq!(temp.read("fp0")["kill_switch"], true);
+        assert!(temp.read("fp1").get("kill_switch").is_none());
+        assert!(temp.read("fp0").get("use_exit").is_none());
+        assert_eq!(set_kill_switch(dir, Some("fp0"), false).unwrap(), 1);
+        assert_eq!(temp.read("fp0")["kill_switch"], false);
+        assert!(set_kill_switch(dir, Some("fp9"), true).is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_or_unsupported_guard_settings_leave_config_and_processes_unchanged() {
+        let temp = TempDir::new(&["fp0"]);
+        let daemon = Daemon::new(temp.path.clone(), String::new());
+        let original = temp.read("fp0");
+        let mut values = vec![serde_json::json!({"iface":"fp0", "kill_switch":"true"}),
+            serde_json::json!({"iface":"fp0", "kill_switch":null})];
+        if !cfg!(target_os = "linux") { values.push(serde_json::json!({"iface":"fp0", "kill_switch":true, "use_exit":"auto"})); }
+        for request in values {
+            assert!(daemon.settings(&request).await.get("error").is_some());
+            assert_eq!(temp.read("fp0"), original);
+            assert!(daemon.processes.ifaces().is_empty());
+        }
+        let mut invalid = original.clone(); invalid["kill_switch"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<crate::Config>(invalid.clone()).is_err());
+        assert!(daemon.store_config(&serde_json::json!({"iface":"fp0", "config":invalid})).is_err());
+        assert_eq!(temp.read("fp0"), original);
+    }
+
     #[tokio::test]
     async fn daemon_rejects_invalid_use_exit_without_writing_or_starting_a_node() {
         let temp = TempDir::new(&["fp0"]);
@@ -993,3 +1157,7 @@ mod security_tests;
 #[cfg(test)]
 #[path = "daemon_lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "daemon_killswitch_tests.rs"]
+mod killswitch_tests;

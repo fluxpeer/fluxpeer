@@ -271,8 +271,10 @@ pub(crate) async fn relay_supervisor(
     own_priv: StaticSecret,
     mut app_out_rx: mpsc::Receiver<([u8; 32], Vec<u8>)>,
     app_in_tx: mpsc::Sender<([u8; 32], Vec<u8>)>,
+    carriers: Option<std::sync::Arc<crate::carriers::Cache>>,
 ) {
     let mut idx = 0usize;
+    let mut retry_delay = Duration::from_millis(500);
     loop {
         let target = {
             let snapshot = targets.borrow_and_update();
@@ -289,6 +291,8 @@ pub(crate) async fn relay_supervisor(
         idx = idx.wrapping_add(1);
         let (mut conn_in, conn_out) = match dial_relay(&t, &own_priv).await {
             Ok(c) => {
+                retry_delay = Duration::from_millis(500);
+                if let Some(cache) = &carriers { cache.connected(targets.borrow().iter().map(|target| target.addr.ip())); }
                 let transport = if t.anytls {
                     "anytls/443"
                 } else if t.bond {
@@ -301,7 +305,11 @@ pub(crate) async fn relay_supervisor(
             }
             Err(e) => {
                 tracing::warn!(addr = %t.addr, error = %e, "relay dial failed; trying next");
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                if let Some(cache) = &carriers {
+                    cache.failed_addresses([t.addr.ip()]);
+                    if cache.cache_only() && cache.diagnostic().is_some() { retry_delay = (retry_delay * 2).min(Duration::from_secs(30)); }
+                }
+                tokio::time::sleep(retry_delay).await;
                 continue;
             }
         };
@@ -362,7 +370,7 @@ mod tests {
         let (targets, updates) = tokio::sync::watch::channel(vec![]);
         let (app_out, outgoing) = mpsc::channel(8);
         let (incoming, mut app_in) = mpsc::channel(8);
-        let supervisor = tokio::spawn(relay_supervisor(updates, StaticSecret::from([1; 32]), outgoing, incoming));
+        let supervisor = tokio::spawn(relay_supervisor(updates, StaticSecret::from([1; 32]), outgoing, incoming, None));
         tokio::task::yield_now().await;
         assert!(!supervisor.is_finished());
         targets.send_replace(vec![RelayTarget { addr, anytls: false, bond: false, bond_links: None, node_id: "edge".into(), public_key: Some(PublicKey::from(&StaticSecret::from([123; 32])).to_bytes()) }]);

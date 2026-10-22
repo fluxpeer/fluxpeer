@@ -62,6 +62,15 @@ enum Cmd {
         #[arg(long)]
         config_dir: Option<String>,
     },
+    /// Keep internet traffic blocked if a full-tunnel exit fails (Linux only).
+    KillSwitch {
+        #[arg(value_parser = ["on", "off"])]
+        mode: String,
+        #[arg(long)]
+        iface: Option<String>,
+        #[arg(long)]
+        config_dir: Option<String>,
+    },
     /// Show live status of a running node (fluxpeer's `wg show`): per-peer
     /// transport, endpoint, latest handshake, transfer (rx/tx), rtt.
     Show {
@@ -250,6 +259,11 @@ async fn main() -> anyhow::Result<()> {
             let dir = config_dir.unwrap_or_else(fluxpeer_node::config_dir);
             let updated = fluxpeer_node::set_use_exit(&dir, iface.as_deref(), &mode)?;
             println!("use_exit={mode} updated {updated} config(s); restart the tunnel to apply");
+        }
+        Cmd::KillSwitch { mode, iface, config_dir } => {
+            let dir = config_dir.unwrap_or_else(fluxpeer_node::config_dir);
+            let updated = fluxpeer_node::set_kill_switch(&dir, iface.as_deref(), mode == "on")?;
+            println!("kill_switch={mode} updated {updated} config(s); restart the tunnel to apply (use-exit must be enabled)");
         }
         Cmd::FwSelftest { cmd } => match cmd {
             FwSelftestCmd::Detect => fluxpeer_node::fw_selftest("detect", "", "", "")?,
