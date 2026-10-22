@@ -627,6 +627,68 @@ try:
     scenario('S7', s7)
     scenario('S8-dns-bind-mount', lambda: dns_lifecycle(False))
     scenario('S9-dns-dead-owner', lambda: dns_lifecycle(True))
+    # S10 (T-0041): client kill-switch. The client has no direct public path in
+    # this topology, so a non-carrier host on the mesh segment stands in for
+    # "physical network": reachable without the guard, blocked with it.
+    def s10():
+        new_network('killswitch')
+        containers.append('fpe-meshprobe')
+        try:
+            need(P + ['run', '-d', '--pull=never', '--name', 'fpe-meshprobe',
+                      '--network', f'fpe-mesh:ip={MESH}.50', IMAGE, 'sleep', 'infinity'])
+            pair()
+            check('ks-off-physical-reachable', px('fpe-cli', 'ping', '-c', '2', '-W', '2', f'{MESH}.50'))
+            stop_pair()
+            e, c = settings()
+            c['kill_switch'] = True
+            need(px('fpe-exit', 'sysctl', '-w', 'net.ipv4.ip_forward=1'))
+            start('fpe-exit', e); start('fpe-cli', c)
+            time.sleep(12)
+            rc, out, _, ev = record('ks-guard-ruleset', px('fpe-cli', 'nft', 'list', 'ruleset'))
+            require_observation('ks-guard-installed', rc == 0 and 'hook output' in out and 'policy drop' in out, ev)
+            probes(True)
+            check('ks-on-physical-blocked', px('fpe-cli', 'ping', '-c', '2', '-W', '2', f'{MESH}.50'), False)
+            check('ks-on-control-carrier-allowed', px('fpe-cli', 'curl', '-fsS', '--max-time', '5',
+                                                      f'http://{MESH}.10:18080/api/v1/health'))
+            # Exit loss keeps the client fail-closed; restoring the exit recovers.
+            stop('fpe-exit'); time.sleep(10)
+            public_probe('ks-exit-down-public-blocked', success=False, max_time=5)
+            check('ks-exit-down-physical-blocked', px('fpe-cli', 'ping', '-c', '2', '-W', '2', f'{MESH}.50'), False)
+            start('fpe-exit', e); time.sleep(16)
+            public_probe('ks-exit-restored-public', max_time=10)
+            # A crashed client retains the guard; a restart with kill_switch off releases it.
+            run(px('fpe-cli', 'sh', '-c', 'kill -KILL "$(cat /run/fpe/node.pid)"; rm -f /run/fpe/node.pid'))
+            time.sleep(2)
+            check('ks-crash-retains-guard', px('fpe-cli', 'ping', '-c', '2', '-W', '2', f'{MESH}.50'), False)
+            c_off = dict(c); c_off['kill_switch'] = False
+            start('fpe-cli', c_off); time.sleep(12)
+            stop('fpe-cli'); time.sleep(2)
+            rc, out, _, ev = record('ks-released-ruleset', px('fpe-cli', 'nft', 'list', 'ruleset'))
+            # The harness scaffold table (fpe_guard) uses `policy accept`; only
+            # the client kill-switch table carries `policy drop`.
+            require_observation('ks-guard-released', rc == 0 and 'policy drop' not in out, ev)
+            check('ks-released-physical-reachable', px('fpe-cli', 'ping', '-c', '2', '-W', '2', f'{MESH}.50'))
+            capture('after-killswitch')
+        finally:
+            stop_pair()
+            run(P + ['rm', '-f', '-t', '0', 'fpe-meshprobe'])
+            containers.remove('fpe-meshprobe')
+    scenario('S10-client-killswitch', s10)
+    # S11 (T-0039): a client pinned to the wrong relay key must not use the relay.
+    def s11():
+        new_network('relay-pin')
+        stop_pair()
+        e, c = settings(transport='tcp')
+        c['relay_public_key'] = '00' * 31 + '01'
+        need(px('fpe-exit', 'sysctl', '-w', 'net.ipv4.ip_forward=1'))
+        start('fpe-exit', e); start('fpe-cli', c)
+        time.sleep(16)
+        exit_cfg = api('GET', f'/devices/{state["e"]["device_id"]}/config', token=state['e']['auth_token'])
+        check('wrong-pin-relay-overlay-fails', px('fpe-cli', 'ping', '-c', '2', '-W', '2', exit_cfg['address_v4']), False)
+        rc, out, _, ev = record('wrong-pin-client-log', px('fpe-cli', 'tail', '-n', '200', '/run/fpe/node.log'))
+        require_observation('wrong-pin-rejected-in-log', rc == 0 and 'invalid relay key confirmation' in out, ev)
+        stop_pair()
+    scenario('S11-relay-wrong-pin', s11)
     def sysctl_failure():
         # Deliberately fail the real sysctl command without modifying its binary
         # or node sources. This bind mount is private to the exit container.
