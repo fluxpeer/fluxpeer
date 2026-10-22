@@ -121,6 +121,23 @@ enum RelayCmd {
 
 #[derive(Subcommand)]
 enum NodeCmd {
+    /// Register a pending route using this membership's device token.
+    Advertise {
+        prefix: String,
+        #[arg(long)] iface: String,
+        #[arg(long)] config_dir: Option<String>,
+    },
+    /// Withdraw a pending route (approved routes require administrator removal).
+    Unadvertise {
+        prefix: String,
+        #[arg(long)] iface: String,
+        #[arg(long)] config_dir: Option<String>,
+    },
+    /// Fetch this membership's authoritative route approval state.
+    Routes {
+        #[arg(long)] iface: String,
+        #[arg(long)] config_dir: Option<String>,
+    },
     /// Bring up the tunnels from a config file (needs root for the TUN device).
     Run { config: String },
     /// Print a fresh hex keypair.
@@ -220,6 +237,18 @@ async fn main() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?,
         Cmd::Node { cmd } => match cmd {
+            NodeCmd::Advertise { prefix, iface, config_dir } => {
+                let result = fluxpeer_node::member_routes::advertise(&config_dir.unwrap_or_else(fluxpeer_node::config_dir), &iface, &prefix).await?;
+                println!("{result}");
+            }
+            NodeCmd::Unadvertise { prefix, iface, config_dir } => {
+                let result = fluxpeer_node::member_routes::unadvertise(&config_dir.unwrap_or_else(fluxpeer_node::config_dir), &iface, &prefix).await?;
+                println!("{result}");
+            }
+            NodeCmd::Routes { iface, config_dir } => {
+                let result = fluxpeer_node::member_routes::list(&config_dir.unwrap_or_else(fluxpeer_node::config_dir), &iface).await?;
+                println!("{result}");
+            }
             NodeCmd::Run { config } => fluxpeer_node::run(&config).await?,
             NodeCmd::Keygen => fluxpeer_node::keygen()?,
             NodeCmd::SetExit { state, config_dir } => {

@@ -160,7 +160,7 @@ pub async fn get_route(pool: &AnyPool, id: &str) -> Result<Option<Route>, sqlx::
         .map(|r| row_to_route(&r)))
 }
 
-pub async fn list_routes_for_device(pool: &AnyPool, device_id: &str) -> Result<Vec<Route>, sqlx::Error> {
+pub async fn list_routes_for_device(pool: impl sqlx::Executor<'_, Database = sqlx::Any>, device_id: &str) -> Result<Vec<Route>, sqlx::Error> {
     let rows = sqlx::query("SELECT id, network_id, device_id, prefix, approved FROM route WHERE device_id = $1")
         .bind(device_id)
         .fetch_all(pool)

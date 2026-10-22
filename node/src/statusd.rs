@@ -21,6 +21,11 @@ use tokio::net::UnixListener;
 
 use crate::status::{self, StatusRegistry};
 
+pub(crate) struct Identity {
+    pub device_id: String,
+    pub control: String,
+}
+
 /// Base dir for status endpoints. Unix mirrors wg's `/var/run/wireguard`
 /// (`/run/fluxpeer`, `/tmp` fallback); Windows uses `%LOCALAPPDATA%\fluxpeer`.
 pub(crate) fn status_dir() -> PathBuf {
@@ -80,7 +85,7 @@ pub(crate) async fn serve(
     iface: String,
     listen_port: u16,
     address: Ipv4Addr,
-    control_server: String,
+    identity: Identity,
 ) {
     let _ = std::fs::remove_file(sock_path.with_extension("error"));
     if let Some(dir) = sock_path.parent() {
@@ -112,7 +117,7 @@ pub(crate) async fn serve(
                         &iface,
                         listen_port,
                         address,
-                        &control_server,
+                        &identity,
                     )
                     .await
                 }
@@ -146,7 +151,7 @@ pub(crate) async fn serve(
                         &iface,
                         listen_port,
                         address,
-                        &control_server,
+                        &identity,
                     )
                     .await
                 }
@@ -168,7 +173,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     iface: &str,
     listen_port: u16,
     address: Ipv4Addr,
-    control_server: &str,
+    identity: &Identity,
 ) {
     let mut buf = [0u8; 64];
     let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -176,7 +181,7 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     let resp = if req.starts_with("get=") {
         wg_uapi_get(reg, own_priv_hex, listen_port)
     } else {
-        json_status(reg, apply_status, own_pub_hex, iface, listen_port, address, control_server)
+        json_status(reg, apply_status, own_pub_hex, iface, listen_port, address, identity)
     };
     let _ = stream.write_all(resp.as_bytes()).await;
 }
@@ -214,7 +219,7 @@ fn json_status(
     iface: &str,
     listen_port: u16,
     address: Ipv4Addr,
-    control_server: &str,
+    identity: &Identity,
 ) -> String {
     let peers: Vec<serde_json::Value> = status::snapshot(reg)
         .into_iter()
@@ -239,7 +244,9 @@ fn json_status(
             "public_key": own_pub_hex,
             "listen_port": listen_port,
             "address": address.to_string(),
-            "control_server": control_server,
+            "control_server": identity.control,
+            "control": identity.control,
+            "device_id": identity.device_id,
             "peers": peers.len(),
             "last_error": applied.last_error,
             "applied_epoch": applied.applied_epoch,
@@ -261,7 +268,7 @@ mod tests {
         let state: crate::apply::SharedStatus = Default::default();
         for (approved, active) in [(false, false), (true, false), (true, true), (false, true)] {
             { let mut status = state.lock(); status.self_exit = approved; status.exit_active = active; }
-            let doc: serde_json::Value = serde_json::from_str(&json_status(&Default::default(), &state, "test", "fp0", 1234, Ipv4Addr::LOCALHOST, "")).unwrap();
+            let doc: serde_json::Value = serde_json::from_str(&json_status(&Default::default(), &state, "test", "fp0", 1234, Ipv4Addr::LOCALHOST, &Identity { device_id: "device-test".into(), control: "https://control.example".into() })).unwrap();
             assert_eq!(doc["interface"]["self_exit"], approved);
             assert_eq!(doc["interface"]["exit_active"], active);
         }
@@ -277,10 +284,13 @@ mod tests {
             stderr: "Operation not permitted".into(), kind: std::io::ErrorKind::PermissionDenied,
         };
         state.lock().complete(8, Err(error));
-        let render = || serde_json::from_str::<serde_json::Value>(&json_status(&reg, &state, "test", "fp0", 1234, Ipv4Addr::LOCALHOST, "")).unwrap();
+        let render = || serde_json::from_str::<serde_json::Value>(&json_status(&reg, &state, "test", "fp0", 1234, Ipv4Addr::LOCALHOST, &Identity { device_id: "device-test".into(), control: "https://control.example".into() })).unwrap();
         state.lock().restart_required = true;
         let doc = render();
         assert_eq!(doc["interface"]["restart_required"], true);
+        assert_eq!(doc["interface"]["device_id"], "device-test");
+        assert_eq!(doc["interface"]["control"], "https://control.example");
+        assert!(doc["interface"].get("auth_token").is_none());
         assert_eq!(doc["interface"]["applied_epoch"], 7);
         assert_eq!(doc["interface"]["last_error"]["exit_code"], 2);
         assert_eq!(doc["interface"]["last_error"]["stderr"], "Operation not permitted");
@@ -305,7 +315,7 @@ mod stopped_tests {
         let state: crate::apply::SharedStatus = Default::default();
         state.lock().complete(1, Err(crate::apply::ApplyError::new(&["kill-switch", "DNS"], error.to_string())));
         let reg: StatusRegistry = Default::default();
-        let running: serde_json::Value = serde_json::from_str(&json_status(&reg, &state, "test", "fp0", 1234, Ipv4Addr::LOCALHOST, "")).unwrap();
+        let running: serde_json::Value = serde_json::from_str(&json_status(&reg, &state, "test", "fp0", 1234, Ipv4Addr::LOCALHOST, &Identity { device_id: "device-test".into(), control: "https://control.example".into() })).unwrap();
         assert_eq!(running["interface"]["last_error"]["stderr"], error.to_string());
     }
 

@@ -327,7 +327,7 @@ fn confined_file(dir: &Path, name: &std::ffi::OsStr, optional: bool) -> std::io:
     }
 }
 
-fn member_config(dir: &Path, iface: &str) -> std::io::Result<PathBuf> {
+pub(crate) fn member_config(dir: &Path, iface: &str) -> std::io::Result<PathBuf> {
     use std::io::{Error, ErrorKind};
     if !valid_iface(iface) { return Err(Error::new(ErrorKind::InvalidInput, "invalid iface")); }
     // Membership is the on-disk config, even while its child is disconnected.

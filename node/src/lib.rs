@@ -35,6 +35,7 @@ mod member_stop;
 mod apply;
 mod bypass;
 mod carriers;
+pub mod member_routes;
 mod config;
 mod control;
 pub mod mobile;
@@ -1661,7 +1662,7 @@ async fn run_with(mut cfg: Config, protect: Option<ProtectFn>, routes: Option<mo
         cfg.tun_name.clone(),
         cfg.listen_port,
         r.own_addr,
-        cfg.control_server.clone(),
+        statusd::Identity { device_id: cfg.device_id.clone(), control: cfg.control_server.clone() },
     ));
 
     // --- Periodic traffic-stats report to the control-server (powers the web's

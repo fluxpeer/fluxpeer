@@ -470,7 +470,9 @@ fn sql_status(e: SqlStoreError) -> StatusCode {
         }
         SqlStoreError::InvalidPrefix | SqlStoreError::InvalidKey | SqlStoreError::InvalidAddress => StatusCode::BAD_REQUEST,
         SqlStoreError::InvalidInvite => StatusCode::FORBIDDEN,
-        SqlStoreError::PoolExhausted => StatusCode::CONFLICT,
+        SqlStoreError::DeviceUnauthorized => StatusCode::UNAUTHORIZED,
+        SqlStoreError::DeviceForbidden => StatusCode::FORBIDDEN,
+        SqlStoreError::PoolExhausted | SqlStoreError::RouteApproved => StatusCode::CONFLICT,
         SqlStoreError::Db(ref error) if error.as_database_error().is_some_and(|e| e.is_unique_violation()) => StatusCode::CONFLICT,
         SqlStoreError::BadPool(_) | SqlStoreError::Db(_) => internal_error(e),
     }
@@ -540,6 +542,24 @@ async fn sql_advertise_route(
         .await
         .map(|r| (StatusCode::CREATED, Json(r)))
         .map_err(sql_status)
+}
+
+// Device-owned advertisements are distinct from administrator route management.
+// Authentication is rechecked inside the same transaction as the mutation.
+async fn sql_device_advertise(
+    State(s): State<Arc<SqlStore>>, Path(device_id): Path<String>,
+    headers: axum::http::HeaderMap, Json(req): Json<AdvertiseRouteReq>,
+) -> Result<Json<Vec<domain::Route>>, StatusCode> {
+    let token = bearer_token(&headers).filter(|v| !v.is_empty()).ok_or(StatusCode::UNAUTHORIZED)?;
+    s.device_route_change(&device_id, token, &req.prefix, false).await.map(Json).map_err(sql_status)
+}
+
+async fn sql_device_unadvertise(
+    State(s): State<Arc<SqlStore>>, Path(device_id): Path<String>,
+    headers: axum::http::HeaderMap, Json(req): Json<AdvertiseRouteReq>,
+) -> Result<Json<Vec<domain::Route>>, StatusCode> {
+    let token = bearer_token(&headers).filter(|v| !v.is_empty()).ok_or(StatusCode::UNAUTHORIZED)?;
+    s.device_route_change(&device_id, token, &req.prefix, true).await.map(Json).map_err(sql_status)
 }
 
 async fn sql_list_device_routes(
@@ -926,6 +946,7 @@ pub fn sql_router(store: Arc<SqlStore>) -> Router {
         .route("/devices/:id/stats", post(sql_report_stats).get(sql_get_device_stats))
         .route("/devices/:id/settings", get(sql_get_device_settings))
         .route("/devices/:id/routes", get(sql_list_device_routes))
+        .route("/devices/:id/route-advertisements", post(sql_device_advertise).delete(sql_device_unadvertise))
         .route("/devices/:id/watch", get(sql_watch_device))
         .route("/networks/:id/relays", get(sql_list_relays))
         .route("/networks/:id/resolve/:name", get(sql_resolve_name))

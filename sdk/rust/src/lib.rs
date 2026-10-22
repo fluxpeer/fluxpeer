@@ -429,6 +429,19 @@ impl Client {
             .map_err(Into::into)
     }
 
+    /// Submit an idempotent pending route request using this device's bearer.
+    /// The response contains the device's current route approval state.
+    pub async fn request_device_route(&self, device_id: &str, prefix: &str) -> Result<Value> {
+        self.http()?.post(self.segment_url(&["devices", device_id, "route-advertisements"])?)
+            .json(&json!({"prefix":prefix})).send().await?.error_for_status()?.json().await.map_err(Into::into)
+    }
+
+    /// Withdraw this device's pending prefix; approved routes require an administrator.
+    pub async fn withdraw_device_route(&self, device_id: &str, prefix: &str) -> Result<Value> {
+        self.http()?.delete(self.segment_url(&["devices", device_id, "route-advertisements"])?)
+            .json(&json!({"prefix":prefix})).send().await?.error_for_status()?.json().await.map_err(Into::into)
+    }
+
     pub async fn approve_route(&self, route_id: &str) -> Result<()> {
         self.http()?
             .post(self.url(&format!("/routes/{route_id}/approve")))
@@ -440,7 +453,7 @@ impl Client {
 
     pub async fn list_device_routes(&self, device_id: &str) -> Result<Value> {
         self.http()?
-            .get(self.url(&format!("/devices/{device_id}/routes")))
+            .get(self.segment_url(&["devices", device_id, "routes"])?)
             .send()
             .await?
             .error_for_status()?

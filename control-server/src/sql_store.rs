@@ -22,6 +22,9 @@ use crate::ipam::{DEVICE_HOST_MAX, DEVICE_HOST_MIN};
 use crate::persistence as db;
 use sqlx::Row;
 
+#[path = "device_routes.rs"]
+mod device_routes;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SqlStoreError {
     #[error("network not found")]
@@ -32,6 +35,12 @@ pub enum SqlStoreError {
     RelayNotFound,
     #[error("route not found")]
     RouteNotFound,
+    #[error("device authentication required")]
+    DeviceUnauthorized,
+    #[error("device token belongs to another device")]
+    DeviceForbidden,
+    #[error("approved routes must be withdrawn by an administrator")]
+    RouteApproved,
     #[error("invalid route prefix")]
     InvalidPrefix,
     #[error("invalid 32-byte public key")]

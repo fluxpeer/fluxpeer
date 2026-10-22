@@ -229,8 +229,19 @@ paths:
       responses:
         "101": { description: switching protocols (websocket) }
   /devices/{id}/routes:
+    get:
+      summary: Read a device's authoritative route approval state
+      description: Requires this device's own bearer, an admin session or master bearer.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: Current routes, including pending and approved prefixes
+          content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Route" } } } }
+        "401": { description: missing or invalid bearer }
+        "403": { description: token belongs to another device }
     post:
-      summary: Advertise a subnet route from a device (Subnet Router)
+      summary: Administrator advertisement of a subnet route (unapproved)
+      description: Requires an administrator bearer; device tokens cannot use this management endpoint.
       parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
       requestBody:
         required: true
@@ -245,6 +256,56 @@ paths:
           description: created (unapproved)
           content: { application/json: { schema: { $ref: "#/components/schemas/Route" } } }
         "404": { description: device not found }
+  /devices/{id}/route-advertisements:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+    post:
+      summary: Advertise a device-owned pending prefix
+      description: >
+        Register this device's pending prefix idempotently; an existing approved route is preserved.
+        Requires this active device's enroll-issued bearer. No administrator
+        credential fallback. Authentication and mutation share one transaction.
+        CIDRs are canonicalized. The response is the current route list.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prefix]
+              properties: { prefix: { type: string, example: 192.168.1.0/24 } }
+      responses:
+        "200":
+          description: Current route approval state after the committed operation
+          content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Route" } } } }
+        "400": { description: invalid prefix }
+        "401": { description: absent, invalid or revoked device token }
+        "403": { description: token belongs to another active device }
+        "409": { description: cannot withdraw an approved prefix }
+        "503": { description: SQLite contention exhausted retries; retry with backoff }
+    delete:
+      summary: Withdraw a device-owned pending prefix
+      description: >
+        Withdraw this device's pending prefix idempotently; approved prefixes require administrator removal and return 409 unchanged.
+        Requires this active device's enroll-issued bearer. No administrator
+        credential fallback. Authentication and mutation share one transaction.
+        CIDRs are canonicalized. The response is the current route list.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prefix]
+              properties: { prefix: { type: string, example: 192.168.1.0/24 } }
+      responses:
+        "200":
+          description: Current route approval state after the committed operation
+          content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Route" } } } }
+        "400": { description: invalid prefix }
+        "401": { description: absent, invalid or revoked device token }
+        "403": { description: token belongs to another active device }
+        "409": { description: cannot withdraw an approved prefix }
+        "503": { description: SQLite contention exhausted retries; retry with backoff }
   /routes/{id}/approve:
     post:
       summary: Approve a subnet route (distributes it in peer allowed-ips)
