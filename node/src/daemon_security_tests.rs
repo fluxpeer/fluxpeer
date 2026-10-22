@@ -8,7 +8,7 @@ fn fixture() -> (tempfile::TempDir, Daemon) {
     std::fs::create_dir(&dir).unwrap();
     std::fs::write(dir.join("fp0.json"), json!({"tun_name":"fp0", "private_key":"secret", "device_id":"d0"}).to_string()).unwrap();
     std::fs::write(dir.join("fp0.log"), "registered log\n").unwrap();
-    let daemon = Daemon { dir, token: "local-token".into(), nets: Mutex::new(HashMap::new()) };
+    let daemon = Daemon::new(dir, "local-token".into());
     (root, daemon)
 }
 
@@ -21,7 +21,7 @@ async fn rejects_every_api(daemon: &Daemon, iface: &str) {
         // Exercise admin handler validation independently of the feature gate.
         if cmd == "set-config" { assert_eq!(daemon.set_config(&request).await["status"], 400); }
     }
-    assert!(daemon.nets.lock().is_empty());
+    assert!(daemon.processes.ifaces().is_empty());
 }
 
 #[tokio::test]
@@ -142,7 +142,7 @@ async fn daemon_join_skips_dangling_slot_and_reports_start_or_save_failure_witho
     // The daemon must never invoke the CLI fallback on a save failure.
     let cwd_fallback = std::env::current_dir().unwrap().join("fluxpeer-node.json");
     let before = std::fs::read(&cwd_fallback).ok();
-    let failed = Daemon { dir: root.path().join("missing-dir"), token: String::new(), nets: Mutex::new(HashMap::new()) };
+    let failed = Daemon::new(root.path().join("missing-dir"), String::new());
     let response = failed.join_with(&token, |_| panic!("failed save cannot spawn")).await;
     assert!(response.get("ok").is_none());
     assert!(response["error"].as_str().unwrap().contains("save failed"));
@@ -155,7 +155,7 @@ async fn daemon_join_skips_dangling_slot_and_reports_start_or_save_failure_witho
     // Root bypasses directory permissions; this branch runs for the native user.
     // SAFETY: geteuid has no arguments or memory preconditions.
     if unsafe { libc::geteuid() } != 0 {
-        let failed = Daemon { dir: blocked.clone(), token: String::new(), nets: Mutex::new(HashMap::new()) };
+        let failed = Daemon::new(blocked.clone(), String::new());
         let response = failed.join_with(&token, |_| panic!("failed preflight cannot spawn")).await;
         assert!(response["error"].as_str().unwrap().contains("preflight"));
         assert_eq!(store.list_invites(&network.id).await.unwrap()[0].uses, 1);
@@ -210,8 +210,7 @@ async fn running_iface_can_stop_or_leave_with_missing_or_duplicate_membership() 
             let iface = format!("fpt30{:x}", std::process::id());
             std::fs::write(daemon.dir.join("fp0.json"), json!({"tun_name":iface,"private_key":"fixture"}).to_string()).unwrap();
             // A harmless child fixture, never a real node or tunnel.
-            let child = Command::new("/bin/sleep").arg("60").kill_on_drop(true).spawn().unwrap();
-            daemon.nets.lock().insert(iface.clone(), child);
+            daemon.processes.spawn(&iface, Command::new("/bin/sleep").arg("60")).unwrap();
             if duplicate {
                 std::fs::copy(daemon.dir.join("fp0.json"), daemon.dir.join("copy.json")).unwrap();
                 let statuses = daemon.annotate_status(json!([]));
@@ -219,7 +218,7 @@ async fn running_iface_can_stop_or_leave_with_missing_or_duplicate_membership() 
                 assert_eq!(daemon.networks()[0]["membership_error"], "multiple membership configs");
             } else { std::fs::remove_file(daemon.dir.join("fp0.json")).unwrap(); }
             let response = daemon.dispatch(&json!({"cmd":command,"iface":iface})).await;
-            assert!(daemon.nets.lock().is_empty());
+            assert!(daemon.processes.ifaces().is_empty());
             if command == "leave" {
                 assert_eq!(response["left"], false); assert_eq!(response["up"], false);
                 assert!(response["error"].is_string()); assert!(response.get("ok").is_none());
@@ -254,7 +253,7 @@ fn set_config_preserves_disk_private_key_when_redacted_or_omitted() {
     daemon.store_config(&json!({"iface":"fp0", "config":{"tun_name":"fp0", "private_key":"explicit-new-key"}})).unwrap();
     let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(stored["private_key"], "explicit-new-key");
-    assert!(daemon.nets.lock().is_empty());
+    assert!(daemon.processes.ifaces().is_empty());
 }
 
 #[test]

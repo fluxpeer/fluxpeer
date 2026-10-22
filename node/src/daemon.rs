@@ -13,10 +13,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
+
+#[path = "daemon_process.rs"]
+mod process;
+use process::Processes;
 
 /// Default loopback control endpoint for the GUI ↔ daemon.
 pub const DAEMON_ADDR: &str = "127.0.0.1:41999";
@@ -24,11 +27,8 @@ pub const DAEMON_ADDR: &str = "127.0.0.1:41999";
 struct Daemon {
     dir: PathBuf,
     token: String,
-    // iface → child process (`fluxpeer node run <cfg>`). A child process — not an
-    // in-process task — because the node's run() fans out many detached tasks
-    // (workers, relay, tcp-direct, statusd) that aborting a JoinHandle can't reach;
-    // killing the process lets the OS reclaim the TUN, sockets and ports cleanly.
-    nets: Mutex<HashMap<String, Child>>,
+    processes: Processes,
+    exit: tokio::sync::Notify,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -40,6 +40,10 @@ async fn cleanup_link_with(
         Err(error) if error.exit_code.is_some() && error.missing() => Ok(()),
         result => result,
     }).await
+}
+
+fn lifecycle_error(error: std::io::Error) -> serde_json::Value {
+    serde_json::json!({"status":if error.kind() == std::io::ErrorKind::WouldBlock { 409 } else { 500 }, "error":error.to_string()})
 }
 
 fn admin_api_allowed() -> bool {
@@ -62,11 +66,7 @@ pub async fn daemon(dir: String, addr: Option<String>) -> std::io::Result<()> {
     let dir = PathBuf::from(dir);
     std::fs::create_dir_all(&dir).ok();
     let token = ensure_token(&dir)?;
-    let d = Arc::new(Daemon {
-        dir: dir.clone(),
-        token,
-        nets: Mutex::new(HashMap::new()),
-    });
+    let d = Arc::new(Daemon::new(dir.clone(), token));
     for cfg in configs(&dir) {
         if read_iface(&cfg).and_then(|iface| crate::statusd::read_failure(&crate::statusd::socket_path(&iface)))
             .is_some_and(|status| status["interface"]["terminal_control"] == true) { continue; }
@@ -76,10 +76,13 @@ pub async fn daemon(dir: String, addr: Option<String>) -> std::io::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     println!(
         "→ fluxpeer daemon: {} network(s) up; control API on {addr}",
-        d.nets.lock().len()
+        d.processes.ifaces().len()
     );
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            _ = d.exit.notified() => return Ok(()),
+        };
         let d = d.clone();
         tokio::spawn(async move {
             let _ = d.handle(stream).await;
@@ -339,73 +342,58 @@ fn reserve_member(dir: &Path) -> std::io::Result<MemberSlot> {
 }
 
 impl Daemon {
+    fn new(dir: PathBuf, token: String) -> Self {
+        Self { dir, token, processes: Processes::default(), exit: tokio::sync::Notify::new() }
+    }
+
     /// Spawn a node task for one config (idempotent per interface).
     fn spawn_net(&self, cfg: &Path) -> std::io::Result<()> {
         let iface = read_iface(cfg).ok_or_else(|| std::io::Error::other("invalid membership config"))?;
-        let registered = member_config(&self.dir, &iface)?;
+        let _operation = self.processes.operation(&iface)?;
+        self.spawn_net_locked(cfg, &iface)
+    }
+
+    fn spawn_net_locked(&self, cfg: &Path, iface: &str) -> std::io::Result<()> {
+        let registered = member_config(&self.dir, iface)?;
         if cfg.canonicalize()? != registered { return Err(std::io::Error::other("unregistered config path")); }
-        if self.nets.lock().contains_key(&iface) { return Ok(()); }
+        if self.processes.running(iface)? { return Ok(()); }
         let exe = std::env::current_exe()?;
-        let log_path = confined_path(&self.dir, &iface, "log", true)?;
+        let log_path = confined_path(&self.dir, iface, "log", true)?;
         let log = open_output(&log_path, false)?;
         let err = log.try_clone()?;
         let mut cmd = Command::new(exe);
         cmd.arg("node").arg("run").arg(&registered).stdout(log).stderr(err).kill_on_drop(true);
         if std::env::var_os("RUST_LOG").is_none() { cmd.env("RUST_LOG", "info"); }
-        let child = cmd.spawn()?;
-        self.nets.lock().insert(iface, child);
+        self.processes.spawn(iface, &mut cmd)
+    }
+
+    /// Wait for the owning supervisor to reap the child before removing leftovers.
+    /// Callers hold an interface operation or the global shutdown reservation.
+    async fn stop_iface(&self, iface: &str) -> std::io::Result<()> {
+        let stopped = self.processes.stop(iface).await;
+        if let Err(error) = std::fs::remove_file(crate::statusd::socket_path(iface))
+            && error.kind() != std::io::ErrorKind::NotFound { return Err(error); }
+        #[cfg(target_os = "linux")]
+        cleanup_link_with(iface.to_string(), |iface| {
+            crate::apply::run(&["ip", "link", "del", "dev", &iface])
+        }).await.map_err(std::io::Error::other)?;
+        stopped?;
+        self.processes.cleaned(iface);
         Ok(())
     }
 
-    /// Stop one network: kill its process and WAIT for it to exit, so the OS
-    /// reclaims the TUN (the fd closes → the non-persistent device is removed),
-    /// the UDP/listen ports, and every detached task. Then remove the leftover
-    /// status socket file and (belt-and-suspenders) any lingering interface.
-    async fn stop_iface(&self, iface: &str) {
-        let child = self.nets.lock().remove(iface);
-        if let Some(mut c) = child {
-            // Graceful first: SIGTERM lets a full-tunnel (exit-node) child restore
-            // the default route + DNS before dying. Force-kill only if it doesn't
-            // exit promptly. (SIGKILL alone would strand the box's routing.)
-            #[cfg(unix)]
-            {
-                if let Some(pid) = c.id() {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
-                    }
-                }
-                if tokio::time::timeout(std::time::Duration::from_secs(3), c.wait())
-                    .await
-                    .is_err()
-                {
-                    let _ = c.kill().await;
-                }
-            }
-            #[cfg(not(unix))]
-            let _ = c.kill().await; // SIGKILL + reap
-        }
-        let _ = std::fs::remove_file(crate::statusd::socket_path(iface));
-        #[cfg(target_os = "linux")]
-        if let Err(error) = cleanup_link_with(iface.to_string(), |iface| {
-            crate::apply::run(&["ip", "link", "del", "dev", &iface])
-        }).await { tracing::warn!(%error, "daemon interface cleanup failed"); }
-    }
-
-    /// Bring every running network down — each `stop_iface` SIGTERMs its node so a
-    /// full-tunnel/exit child restores routes + DNS, and a split-tunnel child's TUN
-    /// closes (dropping its overlay/intranet routes) — then exit the daemon process.
-    /// We reply BEFORE exiting (brief delay so the ack flushes) so the caller knows
-    /// teardown is done.
+    /// Stop all members with new lifecycle operations excluded. Only a successful
+    /// teardown authorizes handle() to end the accept loop after flushing its ack.
     async fn shutdown(&self) -> serde_json::Value {
-        let ifaces: Vec<String> = self.nets.lock().keys().cloned().collect();
-        for iface in ifaces {
-            self.stop_iface(&iface).await;
+        let reservation = match self.processes.quiesce() {
+            Ok(reservation) => reservation, Err(error) => return lifecycle_error(error),
+        };
+        let mut errors = Vec::new();
+        for iface in self.processes.cleanup_ifaces() {
+            if let Err(error) = self.stop_iface(&iface).await { errors.push(format!("{iface}: {error}")); }
         }
-        tokio::spawn(async {
-            // Let `handle` write the response below before the process dies.
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            std::process::exit(0);
-        });
+        if !errors.is_empty() { return serde_json::json!({"error":errors.join("; ")}); }
+        reservation.commit();
         serde_json::json!({ "ok": true, "shutdown": true })
     }
 
@@ -420,9 +408,13 @@ impl Daemon {
             self.dispatch(&req).await
         };
         let mut s = reader.into_inner();
-        s.write_all(serde_json::to_string(&resp).unwrap_or_default().as_bytes())
-            .await?;
-        s.write_all(b"\n").await
+        let sent = async {
+            s.write_all(serde_json::to_string(&resp).unwrap_or_default().as_bytes()).await?;
+            s.write_all(b"\n").await?;
+            s.flush().await
+        }.await;
+        if resp["shutdown"] == true && resp["ok"] == true { self.exit.notify_one(); }
+        sent
     }
 
     async fn dispatch(&self, req: &serde_json::Value) -> serde_json::Value {
@@ -467,13 +459,7 @@ impl Daemon {
             // The desktop GUI calls this on Quit so closing the app actually
             // disconnects, instead of leaving this (detached) daemon — and its
             // TUN/routes — alive and the overlay/intranet still reachable.
-            "shutdown" => {
-                if admin_api_allowed() {
-                    self.shutdown().await
-                } else {
-                    admin_api_disabled()
-                }
-            }
+            "shutdown" => self.shutdown().await,
             // Tail a network's node log (for the GUI diagnostics panel).
             "logs" => self.logs(
                 req["iface"].as_str().unwrap_or(""),
@@ -485,7 +471,7 @@ impl Daemon {
 
     fn validate_operation(&self, iface: &str, stopping: bool) -> std::io::Result<()> {
         if !valid_iface(iface) { return Err(std::io::Error::other("invalid iface")); }
-        if stopping && self.nets.lock().contains_key(iface) { return Ok(()); }
+        if stopping && (self.processes.contains(iface) || self.processes.needs_cleanup(iface)) { return Ok(()); }
         member_config(&self.dir, iface).map(|_| ())
     }
 
@@ -502,7 +488,7 @@ impl Daemon {
         if let Some(entries) = status.as_array_mut() {
             for iface in self.duplicate_ifaces() {
                 entries.push(serde_json::json!({"iface":iface, "membership_error":"multiple membership configs",
-                    "up":self.nets.lock().contains_key(&iface)}));
+                    "up":self.processes.contains(&iface)}));
             }
         }
         status
@@ -510,19 +496,24 @@ impl Daemon {
 
     fn networks(&self) -> serde_json::Value {
         let duplicates = self.duplicate_ifaces();
-        let mut running = self.nets.lock();
         let mut arr = Vec::new();
         for cfg in configs(&self.dir) {
             if let Ok(s) = std::fs::read_to_string(&cfg)
                 && let Ok(v) = serde_json::from_str::<serde_json::Value>(&s)
             {
                 let iface = v["tun_name"].as_str().unwrap_or("?").to_string();
+                let (up, exited) = self.processes.snapshot(&iface);
+                let last_error = crate::statusd::read_failure(&crate::statusd::socket_path(&iface))
+                    .and_then(|v| v["interface"]["last_error"].as_str().map(String::from))
+                    .or_else(|| exited.as_ref().and_then(|info| info.last_error.clone()));
                 arr.push(serde_json::json!({
                     "iface": iface,
                     "membership_error": if duplicates.contains(&iface) { Some("multiple membership configs") } else { None },
                     "control_server": v["control_server"].as_str().unwrap_or(""),
-                    "up": running.get_mut(&iface).is_some_and(|child| matches!(child.try_wait(), Ok(None))),
-                    "last_error": crate::statusd::read_failure(&crate::statusd::socket_path(&iface)).and_then(|v| v["interface"]["last_error"].as_str().map(String::from)),
+                    "up": up,
+                    "last_exit_code": exited.as_ref().and_then(|info| info.code),
+                    "forced_termination": exited.as_ref().is_some_and(|info| info.forced),
+                    "last_error": last_error,
                     "exit_node": v["exit_node"].as_bool().unwrap_or(false),
                     "exit_veto": v["exit_veto"].as_bool().unwrap_or(false),
                     "firewall_trust_external": v["firewall_trust_external"].as_bool().unwrap_or(false),
@@ -585,6 +576,9 @@ impl Daemon {
     /// Overwrite a network's config from manually-edited JSON, then restart it.
     async fn set_config(&self, req: &serde_json::Value) -> serde_json::Value {
         let iface = req["iface"].as_str().unwrap_or("");
+        let _operation = match self.processes.operation(iface) {
+            Ok(operation) => operation, Err(error) => return lifecycle_error(error),
+        };
         let path = match self.store_config(req) {
             Ok(path) => path, Err(error) => return invalid_iface(error),
         };
@@ -637,8 +631,11 @@ impl Daemon {
     /// (Control-server membership is left intact — re-joining just needs the token.)
     async fn leave(&self, iface: &str) -> serde_json::Value {
         if let Err(error) = self.validate_operation(iface, true) { return invalid_iface(error); }
+        let _operation = match self.processes.operation(iface) {
+            Ok(operation) => operation, Err(error) => return lifecycle_error(error),
+        };
         let cfg = member_config(&self.dir, iface);
-        self.stop_iface(iface).await;
+        if let Err(error) = self.stop_iface(iface).await { return lifecycle_error(error); }
         let cfg = match cfg {
             Ok(path) => path,
             Err(_) => return serde_json::json!({"iface":iface, "up":false, "left":false,
@@ -672,13 +669,16 @@ impl Daemon {
 
     /// Restart one network (down + up) to apply a config change.
     async fn restart(&self, iface: &str, path: &Path) -> std::io::Result<()> {
-        self.stop_iface(iface).await;
-        self.spawn_net(path)
+        self.stop_iface(iface).await?;
+        self.spawn_net_locked(path, iface)
     }
 
     /// Edit a network's own wg settings in its local config + restart it to apply.
     async fn settings(&self, req: &serde_json::Value) -> serde_json::Value {
         let iface = req["iface"].as_str().unwrap_or("");
+        let _operation = match self.processes.operation(iface) {
+            Ok(operation) => operation, Err(error) => return lifecycle_error(error),
+        };
         let path = match member_config(&self.dir, iface) {
             Ok(path) => path, Err(error) => return invalid_iface(error),
         };
@@ -746,16 +746,16 @@ impl Daemon {
     /// Connect (`up=true`) or disconnect (`up=false`) one network.
     async fn set_iface(&self, iface: &str, up: bool) -> serde_json::Value {
         if let Err(error) = self.validate_operation(iface, !up) { return invalid_iface(error); }
+        let _operation = match self.processes.operation(iface) {
+            Ok(operation) => operation, Err(error) => return lifecycle_error(error),
+        };
         if up {
             let cfg = match member_config(&self.dir, iface) { Ok(path) => path, Err(error) => return invalid_iface(error) };
-            // Defensive: make sure any prior task for this iface is fully stopped
-            // (and its device/port released) before recreating it.
-            self.stop_iface(iface).await;
-            if let Err(error) = self.spawn_net(&cfg) { return serde_json::json!({"error":error.to_string()}); }
+            if let Err(error) = self.spawn_net_locked(&cfg, iface) { return lifecycle_error(error); }
         } else {
-            self.stop_iface(iface).await;
+            if let Err(error) = self.stop_iface(iface).await { return lifecycle_error(error); }
         }
-        serde_json::json!({ "ok": true, "iface": iface, "up": up })
+        serde_json::json!({ "ok": true, "iface": iface, "up": self.processes.contains(iface) })
     }
 }
 
@@ -882,25 +882,25 @@ mod tests {
     #[tokio::test]
     async fn daemon_rejects_invalid_use_exit_without_writing_or_starting_a_node() {
         let temp = TempDir::new(&["fp0"]);
-        let daemon = Daemon { dir: temp.path.clone(), token: String::new(), nets: Mutex::new(HashMap::new()) };
+        let daemon = Daemon::new(temp.path.clone(), String::new());
         let original = temp.read("fp0");
         for mode in [serde_json::json!(true), serde_json::json!("bad-key")] {
             let result = daemon.settings(&serde_json::json!({"iface": "fp0", "use_exit": mode})).await;
             assert!(result.get("error").is_some());
             assert_eq!(temp.read("fp0"), original);
-            assert!(daemon.nets.lock().is_empty());
+            assert!(daemon.processes.ifaces().is_empty());
         }
     }
 
     #[tokio::test]
     async fn daemon_rejects_non_boolean_firewall_trust_without_writing_or_restart() {
         let temp = TempDir::new(&["fp0"]);
-        let daemon = Daemon { dir: temp.path.clone(), token: String::new(), nets: Mutex::new(HashMap::new()) };
+        let daemon = Daemon::new(temp.path.clone(), String::new());
         let original = temp.read("fp0");
         for value in [serde_json::json!("true"), serde_json::json!(1), serde_json::Value::Null] {
             let result = daemon.settings(&serde_json::json!({"iface":"fp0", "firewall_trust_external":value})).await;
             assert!(result.get("error").is_some()); assert_eq!(temp.read("fp0"), original);
-            assert!(daemon.nets.lock().is_empty());
+            assert!(daemon.processes.ifaces().is_empty());
         }
     }
 
@@ -989,3 +989,7 @@ mod tests {
 #[cfg(test)]
 #[path = "daemon_security_tests.rs"]
 mod security_tests;
+
+#[cfg(test)]
+#[path = "daemon_lifecycle_tests.rs"]
+mod lifecycle_tests;
